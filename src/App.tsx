@@ -801,9 +801,11 @@ export default function App() {
     // Find the React mount point. main.tsx mounts to #root.
     const root = document.getElementById('root');
     if (!root) return;
-    // The translating element is the first child of #root — that's the
-    // top-level <div style={S.appBg}> of the current view.
-    const target = root.firstElementChild as HTMLElement | null;
+    // The UI lives in the .sinister-view-enter div (sibling to <FireEffect />,
+    // which is the FIRST child of #root). Translating FireEffect would only
+    // move the fire/ember background — we want the actual UI wrapper.
+    const target = (root.querySelector('.sinister-view-enter') as HTMLElement | null) ||
+                   (root.lastElementChild as HTMLElement | null);
     if (!target) return;
 
     // Save original styles so we can restore them on cleanup.
