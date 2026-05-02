@@ -799,8 +799,10 @@ export default function App() {
     const onStart = (e: TouchEvent) => {
       if (!e.touches || e.touches.length !== 1) return;
       const tch = e.touches[0];
-      // Edge-only: must start within 50px of the left edge.
-      if (tch.clientX > 50) { tracking = false; return; }
+      // Anywhere-on-screen: iOS reserves the left edge for system
+      // gestures and may swallow them before we see them. Trigger
+      // from anywhere; the horizontal-vs-vertical thresholds below
+      // are what keep this from firing on normal taps and scrolls.
       startX = tch.clientX;
       startY = tch.clientY;
       tracking = true;
@@ -812,8 +814,8 @@ export default function App() {
       if (!tch) return;
       const dx = tch.clientX - startX;
       const dy = Math.abs(tch.clientY - startY);
-      if (dx < 80) return;          // not enough horizontal travel
-      if (dy > 40) return;           // too vertical, treat as scroll
+      if (dx < 100) return;         // not enough horizontal travel
+      if (dy > 60) return;           // too vertical, treat as scroll
       // Don't swipe-back from home — there's nothing behind it.
       if (view.name === 'home') return;
       // On submit view, confirm if any input has text.
