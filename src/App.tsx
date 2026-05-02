@@ -798,7 +798,6 @@ export default function App() {
           }
         } catch { /* localStorage unavailable — skip */ }
       } catch (err: any) { try { (window as any).__bootError = String(err?.message || err); console.error('[BOOT-ERR]', err); alert('BOOT ERROR: ' + (err?.message || err)); } catch {} }    })();
-  }, []);
 
     // Web-geolocation fallback. Runs in parallel to the native geofencing
     // init above. On iOS TestFlight builds, the native bg-geolocation plugin
