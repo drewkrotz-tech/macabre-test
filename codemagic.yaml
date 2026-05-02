@@ -77,11 +77,9 @@ workflows:
       node: 22
       xcode: 26.2
       cocoapods: default
-      ios_signing:
-        distribution_type: app_store
-        bundle_identifier: com.sinistertrivia.macabretest
       vars:
         APP_STORE_APP_ID: "6765894869"
+        BUNDLE_ID: "com.sinistertrivia.macabretest"
     scripts:
       - name: Install npm dependencies
         script: |
@@ -114,6 +112,11 @@ workflows:
       - name: Install CocoaPods dependencies
         script: |
           cd ios/App && pod install
+      - name: Fetch signing files from App Store Connect
+        script: |
+          app-store-connect fetch-signing-files "$BUNDLE_ID" \
+            --type IOS_APP_STORE \
+            --create
       - name: Set up signing
         script: |
           keychain initialize
