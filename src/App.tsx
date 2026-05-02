@@ -788,51 +788,153 @@ export default function App() {
     };
   }, []);
 
-  // Swipe-right-to-go-back. Triggers when a touch starts within ~50px of
-  // the left edge, moves at least 80px to the right, and stays mostly
-  // horizontal (vertical drift < 40px). Skips the home view since there
-  // is nothing to go back to. On the submit view, confirms first if the
-  // user has typed anything into the form.
+  // ----- iOS-style swipe-back drag -----
+  // Real drag: the rendered view follows the user's thumb. We don't change
+  // JSX (which has 7 different view-branches each with their own root div);
+  // instead we find the topmost rendered div in the React-mounted root and
+  // mutate its transform style during the drag. On release: animate off-
+  // screen + goBack() if past 35% width or quick flick, otherwise snap back.
   useEffect(() => {
-    if (typeof window === 'undefined') return;
-    let startX = 0, startY = 0, tracking = false;
+    if (typeof window === 'undefined' || typeof document === 'undefined') return;
+    if (view.name === 'home') return; // nothing to drag back to from home
+
+    // Find the React mount point. main.tsx mounts to #root.
+    const root = document.getElementById('root');
+    if (!root) return;
+    // The translating element is the first child of #root — that's the
+    // top-level <div style={S.appBg}> of the current view.
+    const target = root.firstElementChild as HTMLElement | null;
+    if (!target) return;
+
+    // Save original styles so we can restore them on cleanup.
+    const orig = {
+      transform: target.style.transform,
+      transition: target.style.transition,
+      willChange: target.style.willChange,
+    };
+    const origRootOverflow = root.style.overflowX;
+    root.style.overflowX = 'hidden';
+    target.style.willChange = 'transform';
+
+    let startX = 0, startY = 0, startT = 0;
+    let tracking = false;
+    let axis: 'none' | 'h' | 'v' = 'none';
+    let dragging = false;
+    let currentDx = 0;
+    const screenW = () => Math.max(window.innerWidth || 320, 320);
+
+    const setX = (px: number, animate: boolean) => {
+      target.style.transition = animate ? 'transform 240ms cubic-bezier(0.22, 0.61, 0.36, 1)' : 'none';
+      target.style.transform = px === 0 ? '' : 'translateX(' + px + 'px)';
+    };
+
     const onStart = (e: TouchEvent) => {
       if (!e.touches || e.touches.length !== 1) return;
       const tch = e.touches[0];
-      // Anywhere-on-screen: iOS reserves the left edge for system
-      // gestures and may swallow them before we see them. Trigger
-      // from anywhere; the horizontal-vs-vertical thresholds below
-      // are what keep this from firing on normal taps and scrolls.
       startX = tch.clientX;
       startY = tch.clientY;
+      startT = Date.now();
       tracking = true;
+      axis = 'none';
+      dragging = false;
+      currentDx = 0;
     };
-    const onEnd = (e: TouchEvent) => {
+
+    const onMove = (e: TouchEvent) => {
       if (!tracking) return;
-      tracking = false;
-      const tch = (e.changedTouches && e.changedTouches[0]);
-      if (!tch) return;
+      if (!e.touches || e.touches.length !== 1) return;
+      const tch = e.touches[0];
       const dx = tch.clientX - startX;
-      const dy = Math.abs(tch.clientY - startY);
-      if (dx < 100) return;         // not enough horizontal travel
-      if (dy > 60) return;           // too vertical, treat as scroll
-      // Don't swipe-back from home — there's nothing behind it.
-      if (view.name === 'home') return;
-      // On submit view, confirm if any input has text.
-      if (view.name === 'submit') {
-        try {
-          const inputs = Array.from(document.querySelectorAll('input, textarea')) as Array<HTMLInputElement | HTMLTextAreaElement>;
-          const dirty = inputs.some((el) => (el.value && el.value.trim().length > 0));
-          if (dirty && !window.confirm('Discard this submission and go back?')) return;
-        } catch { /* if confirm or query fails, just proceed */ }
+      const dy = tch.clientY - startY;
+
+      if (axis === 'none') {
+        // Lock axis once movement exceeds 8px in either direction.
+        if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return;
+        if (Math.abs(dy) > Math.abs(dx)) {
+          axis = 'v';
+          tracking = false; // give up; user is scrolling
+          return;
+        }
+        axis = 'h';
+        dragging = true;
       }
-      goBack();
+
+      if (!dragging) return;
+      // Only allow rightward drag. Light rubber-band on leftward.
+      currentDx = dx <= 0 ? Math.max(dx / 4, -40) : dx;
+      setX(currentDx, false);
     };
+
+    const finish = (shouldFire: boolean) => {
+      if (shouldFire) {
+        // Submit-form dirty check.
+        if (view.name === 'submit') {
+          try {
+            const inputs = Array.from(document.querySelectorAll('input, textarea')) as Array<HTMLInputElement | HTMLTextAreaElement>;
+            const dirty = inputs.some((el) => (el.value && el.value.trim().length > 0));
+            if (dirty && !window.confirm('Discard this submission and go back?')) {
+              setX(0, true);
+              return;
+            }
+          } catch { /* proceed */ }
+        }
+        // Animate off-screen, then call goBack. Use a shorter duration so
+        // the new view appears quickly.
+        setX(screenW(), true);
+        window.setTimeout(() => {
+          // Reset transform so the next view doesn't render shifted.
+          target.style.transition = 'none';
+          target.style.transform = '';
+          goBack();
+        }, 220);
+      } else {
+        setX(0, true);
+      }
+    };
+
+    const onEnd = (e: TouchEvent) => {
+      if (!tracking && !dragging) return;
+      tracking = false;
+      if (!dragging) return;
+      dragging = false;
+
+      const tch = (e.changedTouches && e.changedTouches[0]);
+      const endX = tch ? tch.clientX : startX + currentDx;
+      const dx = endX - startX;
+      const dt = Date.now() - startT;
+      const w = screenW();
+      const distPass = dx >= w * 0.35;
+      const flickPass = dt <= 300 && dx >= 80;
+      finish(distPass || flickPass);
+    };
+
+    const onCancel = () => {
+      if (!dragging) {
+        tracking = false;
+        return;
+      }
+      tracking = false;
+      dragging = false;
+      finish(false);
+    };
+
     window.addEventListener('touchstart', onStart, { passive: true });
+    window.addEventListener('touchmove', onMove, { passive: true });
     window.addEventListener('touchend', onEnd, { passive: true });
+    window.addEventListener('touchcancel', onCancel, { passive: true });
+
     return () => {
       window.removeEventListener('touchstart', onStart);
+      window.removeEventListener('touchmove', onMove);
       window.removeEventListener('touchend', onEnd);
+      window.removeEventListener('touchcancel', onCancel);
+      // Restore styles
+      try {
+        target.style.transform = orig.transform;
+        target.style.transition = orig.transition;
+        target.style.willChange = orig.willChange;
+        root.style.overflowX = origRootOverflow;
+      } catch { /* element may have unmounted */ }
     };
   }, [view]);
 
