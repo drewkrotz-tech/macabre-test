@@ -74,6 +74,8 @@ workflows:
     integrations:
       app_store_connect: Codemagic TestFlight
     environment:
+      groups:
+        - code-signing
       node: 22
       xcode: 26.2
       cocoapods: default
@@ -112,15 +114,19 @@ workflows:
       - name: Install CocoaPods dependencies
         script: |
           cd ios/App && pod install
+      - name: Initialize keychain
+        script: |
+          keychain initialize
       - name: Fetch signing files from App Store Connect
         script: |
           app-store-connect fetch-signing-files "$BUNDLE_ID" \
             --type IOS_APP_STORE \
             --create
-      - name: Set up signing
+      - name: Add certificates to keychain
         script: |
-          keychain initialize
           keychain add-certificates
+      - name: Set up code signing on Xcode project
+        script: |
           xcode-project use-profiles
       - name: Increment build number
         script: |
