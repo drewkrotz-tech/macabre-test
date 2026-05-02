@@ -133,7 +133,7 @@ function playBack() {
 //
 // Falls back to HTMLAudioElement if Web Audio fails to init (older
 // browsers, very locked-down WebViews).
-const SLIDE_VOLUME = 0.105;
+const SLIDE_VOLUME = 0.05;
 let _slideAudioCtx: AudioContext | null = null;
 let _slideAudioBuffer: AudioBuffer | null = null;
 let _slideAudioGain: GainNode | null = null;
@@ -1504,19 +1504,21 @@ function AboutView({ onBack }: { onBack: () => void }) {
   // why a drive-by notification didn't fire on TestFlight.
   const [showDebug, setShowDebug] = useState(false);
   const [debugLines, setDebugLines] = useState<string[]>([]);
-  const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  function startLongPress() {
-    if (longPressTimer.current) clearTimeout(longPressTimer.current);
-    longPressTimer.current = setTimeout(() => {
+  // 5-tap-fast on the title to open the debug log. iOS WebView hijacks
+  // long-press for text selection (showing a Copy menu), so a tap counter
+  // is the only reliable hidden-trigger pattern. 1500ms window between taps.
+  const tapCountRef = useRef(0);
+  const tapResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  function handleTitleTap() {
+    if (tapResetRef.current) clearTimeout(tapResetRef.current);
+    tapCountRef.current += 1;
+    if (tapCountRef.current >= 5) {
+      tapCountRef.current = 0;
       setDebugLines(getDebugLog());
       setShowDebug(true);
-    }, 1000);
-  }
-  function cancelLongPress() {
-    if (longPressTimer.current) {
-      clearTimeout(longPressTimer.current);
-      longPressTimer.current = null;
+      return;
     }
+    tapResetRef.current = setTimeout(() => { tapCountRef.current = 0; }, 1500);
   }
   return (
     <div style={S.appBg}>
@@ -1528,13 +1530,8 @@ function AboutView({ onBack }: { onBack: () => void }) {
           ← Run Home
         </button>
         <div
-          style={{ ...S.categoryViewTitle, color: WHITE, textShadow: `0 0 14px ${WHITE}cc`, userSelect: 'none', WebkitUserSelect: 'none' }}
-          onMouseDown={startLongPress}
-          onMouseUp={cancelLongPress}
-          onMouseLeave={cancelLongPress}
-          onTouchStart={startLongPress}
-          onTouchEnd={cancelLongPress}
-          onTouchCancel={cancelLongPress}
+          style={{ ...S.categoryViewTitle, color: WHITE, textShadow: `0 0 14px ${WHITE}cc`, userSelect: 'none', WebkitUserSelect: 'none', cursor: 'pointer' }}
+          onClick={handleTitleTap}
         >
           About
         </div>
@@ -2064,9 +2061,9 @@ function SubmitView({ currentLocation, onBack }: {
           {locMode === 'manual' && (
             <div style={S.manualRow}>
               <input type="text" inputMode="text" value={manualLat} onChange={(e) => setManualLat(e.target.value)}
-                     placeholder="Latitude  (e.g. 36.8534)" style={{ ...S.input, flex: 1 }} />
+                     placeholder="Latitude  (e.g. 36.8534)" style={{ ...S.input, flex: 1, minWidth: 0 }} />
               <input type="text" inputMode="text" value={manualLng} onChange={(e) => setManualLng(e.target.value)}
-                     placeholder="Longitude  (e.g. -75.9760)" style={{ ...S.input, flex: 1 }} />
+                     placeholder="Longitude  (e.g. -75.9760)" style={{ ...S.input, flex: 1, minWidth: 0 }} />
             </div>
           )}
         </Field>
@@ -2129,6 +2126,8 @@ const S: Record<string, React.CSSProperties> = {
   appBg: {
     minHeight: '100vh',
     width: '100%',
+    maxWidth: '100vw',
+    overflowX: 'hidden',
     backgroundColor: 'transparent',
     color: BONE,
     fontFamily: 'system-ui, -apple-system, sans-serif',
@@ -2802,6 +2801,9 @@ const S: Record<string, React.CSSProperties> = {
     outline: 'none',
     width: '100%',
     boxSizing: 'border-box',
+    wordBreak: 'break-word',
+    overflowWrap: 'anywhere',
+    minWidth: 0,
   },
   textarea: { resize: 'vertical', minHeight: 110, lineHeight: 1.5 },
   locModeRow: { display: 'flex', gap: 8 },

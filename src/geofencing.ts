@@ -187,6 +187,7 @@ async function ensureAndroidChannel(): Promise<void> {
 }
 
 export async function requestPermissions(): Promise<Permissions> {
+  dlog('requestPermissions ENTRY, isNative=' + isNative());
   if (!isNative()) {
     return { location: 'unknown', notifications: false };
   }
@@ -253,6 +254,7 @@ export async function requestPermissions(): Promise<Permissions> {
 }
 
 export async function startGeofencing(onPosition: (lat: number, lng: number) => void): Promise<void> {
+  dlog('startGeofencing ENTRY, isNative=' + isNative());
   _onPosition = onPosition;
 
   if (!isNative()) {
@@ -280,7 +282,11 @@ export async function startGeofencing(onPosition: (lat: number, lng: number) => 
       {
         backgroundMessage: 'The Dread Directory is watching for nearby sites.',
         backgroundTitle: 'Nearby Sites',
-        requestPermissions: false,
+        // Belt-and-suspenders: re-request here too. If requestPermissions()
+        // earlier didn't fully grant (or returned before the prompt was
+        // answered), this still gets us a working watcher once the user
+        // grants. iOS won't show a duplicate prompt if already granted.
+        requestPermissions: true,
         stale: false,
         distanceFilter: 50,
       },
