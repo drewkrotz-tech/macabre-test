@@ -175,29 +175,11 @@ let _slidePrimed = false;
 function playSlide() {
   try {
     ensureSlideAudio();
-    // Only play through the Web Audio path. If the buffer isn't decoded
-    // yet (very first scrolls right after app launch), drop this scroll
-    // entirely — playing through the HTMLAudio fallback at this point
-    // would blast at full volume because iOS ignores HTMLAudio.volume.
     if (!_slideAudioCtx || !_slideAudioBuffer || !_slideAudioGain) {
       return;
     }
     if (_slideAudioCtx.state === 'suspended') {
       _slideAudioCtx.resume().catch(() => { /* silent */ });
-    }
-    if (!_slidePrimed) {
-      _slidePrimed = true;
-      // Send a silent 100ms buffer through the gain chain. Skip the real
-      // sound this first call — better to miss one click than to blast.
-      try {
-        const sr = _slideAudioCtx.sampleRate;
-        const silent = _slideAudioCtx.createBuffer(1, Math.floor(sr * 0.1), sr);
-        const primer = _slideAudioCtx.createBufferSource();
-        primer.buffer = silent;
-        primer.connect(_slideAudioGain);
-        primer.start(0);
-      } catch { /* silent */ }
-      return; // Don't play the real sound on the priming call.
     }
     const src = _slideAudioCtx.createBufferSource();
     src.buffer = _slideAudioBuffer;
@@ -745,6 +727,46 @@ export default function App() {
   // After the fetch completes, `sites` is replaced with the live data.
   const [sites, setSitesState] = useState<SinisterSite[]>(FALLBACK_SITES);
   const [sitesLoaded, setSitesLoaded] = useState(false);
+
+  // Eagerly start decoding all audio buffers + prime gain chains on first touch
+  useEffect(() => {
+    try { ensureSlideAudio(); } catch { /* silent */ }
+    try { ensureButtonAudio(); } catch { /* silent */ }
+    try { ensureBackAudio(); } catch { /* silent */ }
+    try { ensureBellAudio(); } catch { /* silent */ }
+    let primed = false;
+    const primeOnFirstTouch = () => {
+      if (primed) return;
+      primed = true;
+      const ctxs: Array<{ ctx: AudioContext | null; gain: GainNode | null }> = [
+        { ctx: _slideAudioCtx, gain: _slideAudioGain },
+        { ctx: _buttonAudioCtx, gain: _buttonAudioGain },
+        { ctx: _backAudioCtx, gain: _backAudioGain },
+        { ctx: _bellAudioCtx, gain: _bellAudioGain },
+      ];
+      for (const { ctx, gain } of ctxs) {
+        if (!ctx || !gain) continue;
+        try {
+          if (ctx.state === 'suspended') ctx.resume().catch(() => { /* silent */ });
+          const sr = ctx.sampleRate;
+          const silent = ctx.createBuffer(1, Math.floor(sr * 0.05), sr);
+          const primer = ctx.createBufferSource();
+          primer.buffer = silent;
+          primer.connect(gain);
+          primer.start(0);
+        } catch { /* silent */ }
+      }
+      try { _slidePrimed = true; } catch { /* silent */ }
+      window.removeEventListener('pointerdown', primeOnFirstTouch);
+      window.removeEventListener('touchstart', primeOnFirstTouch);
+    };
+    window.addEventListener('pointerdown', primeOnFirstTouch, { passive: true });
+    window.addEventListener('touchstart', primeOnFirstTouch, { passive: true });
+    return () => {
+      window.removeEventListener('pointerdown', primeOnFirstTouch);
+      window.removeEventListener('touchstart', primeOnFirstTouch);
+    };
+  }, []);
 
   // Scroll-bleed fix: every time the view changes, snap the page back to the
   // top. Without this, scrolling deep into a state list and then hitting Run
