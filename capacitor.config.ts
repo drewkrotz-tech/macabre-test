@@ -17,6 +17,11 @@ const config: CapacitorConfig = {
       // No web-side config required here; iOS plist strings are what matter.
     },
   },
+
+  // Disable iOS's native swipe-back so our in-app drag gesture isn't hijacked.
+  ios: {
+    allowsBackForwardNavigationGestures: false,
+  },
 };
 
 export default config;
