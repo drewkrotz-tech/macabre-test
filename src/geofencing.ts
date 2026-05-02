@@ -103,9 +103,12 @@ async function loadBgGeo(): Promise<BgGeoPlugin | null> {
   if (_bgGeoMod) return _bgGeoMod;
   if (!isNative()) return null;
   try {
+    // Capacitor's registerPlugin returns a Proxy. Methods aren't always
+    // enumerable until called, so we trust any truthy return and let real
+    // errors surface at addWatcher() call time.
     const proxy = registerPlugin<BgGeoPlugin>('BackgroundGeolocation');
-    if (!proxy || typeof proxy.addWatcher !== 'function') {
-      dlog('BackgroundGeolocation registerPlugin returned no addWatcher');
+    if (!proxy) {
+      dlog('BackgroundGeolocation registerPlugin returned null');
       return null;
     }
     _bgGeoMod = proxy;
@@ -122,8 +125,8 @@ async function loadLocalNotif(): Promise<LocalNotifPlugin | null> {
   if (!isNative()) return null;
   try {
     const proxy = registerPlugin<LocalNotifPlugin>('LocalNotifications');
-    if (!proxy || typeof proxy.schedule !== 'function') {
-      dlog('LocalNotifications registerPlugin returned no schedule');
+    if (!proxy) {
+      dlog('LocalNotifications registerPlugin returned null');
       return null;
     }
     _localNotifMod = proxy;

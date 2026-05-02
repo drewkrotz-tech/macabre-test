@@ -167,8 +167,10 @@ function ensureSlideAudio() {
 }
 // Tracks whether we've played the priming silent buffer through the slide
 // audio chain. iOS's first start(0) after AudioContext resume can ignore
-// the GainNode for one frame (loud first scroll). Sending a silent buffer
-// through first warms up the path so the real play obeys the gain.
+// the GainNode for one frame (loud first scroll). The first call to
+// playSlide primes the audio path with a silent buffer and skips actually
+// playing the real sound — by the second scroll, iOS has established the
+// gain stage and the real sound plays at the correct volume.
 let _slidePrimed = false;
 function playSlide() {
   try {
@@ -177,21 +179,19 @@ function playSlide() {
       if (_slideAudioCtx.state === 'suspended') {
         _slideAudioCtx.resume().catch(() => { /* silent */ });
       }
-      // Prime the audio path with a 50ms silent buffer the first time, so
-      // iOS fully establishes the GainNode chain before the real play. The
-      // 1-sample prime tried earlier was too short — iOS was still in
-      // gain-warmup at the time the real buffer played, causing the
-      // first-scroll-loud bug.
       if (!_slidePrimed) {
         _slidePrimed = true;
+        // Send a silent 100ms buffer through the gain chain. Skip the real
+        // sound this first call — better to miss one click than to blast.
         try {
           const sr = _slideAudioCtx.sampleRate;
-          const silent = _slideAudioCtx.createBuffer(1, Math.floor(sr * 0.05), sr);
+          const silent = _slideAudioCtx.createBuffer(1, Math.floor(sr * 0.1), sr);
           const primer = _slideAudioCtx.createBufferSource();
           primer.buffer = silent;
           primer.connect(_slideAudioGain);
           primer.start(0);
         } catch { /* silent */ }
+        return; // Don't play the real sound on the priming call.
       }
       const src = _slideAudioCtx.createBufferSource();
       src.buffer = _slideAudioBuffer;
