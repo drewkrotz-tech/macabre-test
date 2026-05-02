@@ -137,7 +137,7 @@ interface LocalNotifPlugin {
 let _bgGeoMod: BgGeoPlugin | null = null;
 let _localNotifMod: LocalNotifPlugin | null = null;
 
-async function loadBgGeo(): Promise<BgGeoPlugin | null> {
+function loadBgGeo(): BgGeoPlugin | null {
   dlog('loadBgGeo: enter');
   if (_bgGeoMod) {
     dlog('loadBgGeo: returning cached');
@@ -167,7 +167,7 @@ async function loadBgGeo(): Promise<BgGeoPlugin | null> {
   return _bgGeoMod;
 }
 
-async function loadLocalNotif(): Promise<LocalNotifPlugin | null> {
+function loadLocalNotif(): LocalNotifPlugin | null {
   if (_localNotifMod) return _localNotifMod;
   if (!isNative()) return null;
   try {
@@ -211,7 +211,7 @@ export function setSites(sites: SinisterSite[]) {
 
 async function attachNotifListeners(): Promise<void> {
   if (_notifListenersAttached) return;
-  const LN = await loadLocalNotif();
+  const LN = loadLocalNotif();
   if (!LN) return;
   try {
     if (typeof LN.removeAllListeners === 'function') {
@@ -237,7 +237,7 @@ async function attachNotifListeners(): Promise<void> {
 
 async function ensureAndroidChannel(): Promise<void> {
   if (getPlatform() !== 'android') return;
-  const LN = await loadLocalNotif();
+  const LN = loadLocalNotif();
   if (!LN || typeof LN.createChannel !== 'function') return;
   try {
     await LN.createChannel({
@@ -267,7 +267,7 @@ export async function requestPermissions(): Promise<Permissions> {
   // hangs (observed in v1.5/v1.6 logs — never resolved), we don't want it
   // blocking the BackgroundGeolocation flow that comes after.
   dlog('RP-2 before loadLocalNotif');
-  const LN = await loadLocalNotif();
+  const LN = loadLocalNotif();
   dlog('RP-3 after loadLocalNotif, LN=' + (LN ? 'truthy' : 'falsy'));
   if (LN) {
     try {
@@ -290,7 +290,7 @@ export async function requestPermissions(): Promise<Permissions> {
   }
 
   dlog('RP-7 about to call loadBgGeo');
-  const BG = await loadBgGeo();
+  const BG = loadBgGeo();
   dlog('RP-8 after loadBgGeo, BG=' + (BG ? 'truthy' : 'falsy'));
   if (BG) {
     dlog('RP-9 BG truthy, about to call addWatcher');
@@ -356,7 +356,7 @@ export async function startGeofencing(onPosition: (lat: number, lng: number) => 
   await attachNotifListeners();
   await ensureAndroidChannel();
 
-  const BG = await loadBgGeo();
+  const BG = loadBgGeo();
   if (!BG) {
     dlog('startGeofencing: BG module unavailable, aborting native path');
     return;
@@ -409,7 +409,7 @@ export async function stopGeofencing(): Promise<void> {
   }
 
   if (_nativeWatchHandle && isNative()) {
-    const BG = await loadBgGeo();
+    const BG = loadBgGeo();
     if (BG) {
       try {
         await BG.removeWatcher({ id: _nativeWatchHandle });
@@ -462,7 +462,7 @@ function checkFenceTriggers(lat: number, lng: number): void {
 
 async function fireNotification(site: SinisterSite): Promise<void> {
   if (!isNative()) return;
-  const LN = await loadLocalNotif();
+  const LN = loadLocalNotif();
   if (!LN) {
     dlog('fireNotification: LN unavailable');
     return;
