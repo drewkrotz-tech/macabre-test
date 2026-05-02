@@ -72,45 +72,64 @@ export function clearDebugLog() {
   _debugLog.length = 0;
 }
 
-// ---------- Cached plugin modules ----------
-let _bgGeoMod: any = null;
-let _localNotifMod: any = null;
+// ---------- Cached plugin proxies ----------
+// We use registerPlugin from @capacitor/core (the documented Capacitor
+// pattern) instead of dynamic imports of the plugin packages directly.
+// Why: dynamic imports of native-only plugin packages fail at runtime in
+// the iOS WebView ("Module name does not resolve to a valid URL"), which
+// is exactly what blocked geofencing in v1.1-v1.3. registerPlugin returns
+// a proxy that routes method calls to the native plugin via Capacitor's
+// JSBridge — no JS module resolution required.
+import { registerPlugin } from '@capacitor/core';
 
-async function loadBgGeo(): Promise<any> {
+// Type-only shapes — we don't import the runtime types from the plugin
+// packages because that would force a bundle dependency we want to avoid.
+interface BgGeoPlugin {
+  addWatcher(opts: any, cb: (location: any, error: any) => void): Promise<string>;
+  removeWatcher(opts: { id: string }): Promise<void>;
+}
+interface LocalNotifPlugin {
+  schedule(opts: { notifications: any[] }): Promise<any>;
+  requestPermissions(): Promise<{ display: string }>;
+  createChannel?(opts: any): Promise<void>;
+  removeAllListeners?(): Promise<void>;
+  addListener(eventName: string, cb: (data: any) => void): { remove: () => void } | Promise<any>;
+}
+
+let _bgGeoMod: BgGeoPlugin | null = null;
+let _localNotifMod: LocalNotifPlugin | null = null;
+
+async function loadBgGeo(): Promise<BgGeoPlugin | null> {
   if (_bgGeoMod) return _bgGeoMod;
-  // Web preview (StackBlitz) doesn't have native plugins installed — only
-  // try the import on actual native platforms. The @vite-ignore comment
-  // also tells Vite's import-analysis to skip this string at preview time
-  // so the dev overlay doesn't crash with "package not found." On iOS,
-  // Codemagic's build machine has the package installed and the import
-  // resolves normally at runtime.
   if (!isNative()) return null;
   try {
-    const mod: any = await import(/* @vite-ignore */ '@capacitor-community/background-geolocation');
-    _bgGeoMod = mod.BackgroundGeolocation || mod.default?.BackgroundGeolocation || mod.default || mod;
-    if (!_bgGeoMod || typeof _bgGeoMod.addWatcher !== 'function') {
-      dlog('bg-geolocation module loaded but addWatcher missing; keys=' + Object.keys(mod || {}).join(','));
-      _bgGeoMod = null;
+    const proxy = registerPlugin<BgGeoPlugin>('BackgroundGeolocation');
+    if (!proxy || typeof proxy.addWatcher !== 'function') {
+      dlog('BackgroundGeolocation registerPlugin returned no addWatcher');
+      return null;
     }
+    _bgGeoMod = proxy;
+    dlog('BackgroundGeolocation plugin registered');
   } catch (err: any) {
-    dlog('bg-geolocation import failed: ' + (err?.message || err));
+    dlog('BackgroundGeolocation registerPlugin failed: ' + (err?.message || err));
     _bgGeoMod = null;
   }
   return _bgGeoMod;
 }
 
-async function loadLocalNotif(): Promise<any> {
+async function loadLocalNotif(): Promise<LocalNotifPlugin | null> {
   if (_localNotifMod) return _localNotifMod;
   if (!isNative()) return null;
   try {
-    const mod: any = await import(/* @vite-ignore */ '@capacitor/local-notifications');
-    _localNotifMod = mod.LocalNotifications || mod.default?.LocalNotifications || mod.default || mod;
-    if (!_localNotifMod || typeof _localNotifMod.schedule !== 'function') {
-      dlog('local-notifications module loaded but schedule missing; keys=' + Object.keys(mod || {}).join(','));
-      _localNotifMod = null;
+    const proxy = registerPlugin<LocalNotifPlugin>('LocalNotifications');
+    if (!proxy || typeof proxy.schedule !== 'function') {
+      dlog('LocalNotifications registerPlugin returned no schedule');
+      return null;
     }
+    _localNotifMod = proxy;
+    dlog('LocalNotifications plugin registered');
   } catch (err: any) {
-    dlog('local-notifications import failed: ' + (err?.message || err));
+    dlog('LocalNotifications registerPlugin failed: ' + (err?.message || err));
     _localNotifMod = null;
   }
   return _localNotifMod;

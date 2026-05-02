@@ -177,12 +177,16 @@ function playSlide() {
       if (_slideAudioCtx.state === 'suspended') {
         _slideAudioCtx.resume().catch(() => { /* silent */ });
       }
-      // Prime path with a 1-sample silent buffer the first time, so iOS
-      // applies the gain correctly to the very next real play.
+      // Prime the audio path with a 50ms silent buffer the first time, so
+      // iOS fully establishes the GainNode chain before the real play. The
+      // 1-sample prime tried earlier was too short — iOS was still in
+      // gain-warmup at the time the real buffer played, causing the
+      // first-scroll-loud bug.
       if (!_slidePrimed) {
         _slidePrimed = true;
         try {
-          const silent = _slideAudioCtx.createBuffer(1, 1, _slideAudioCtx.sampleRate);
+          const sr = _slideAudioCtx.sampleRate;
+          const silent = _slideAudioCtx.createBuffer(1, Math.floor(sr * 0.05), sr);
           const primer = _slideAudioCtx.createBufferSource();
           primer.buffer = silent;
           primer.connect(_slideAudioGain);
