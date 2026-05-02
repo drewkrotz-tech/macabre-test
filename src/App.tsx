@@ -165,15 +165,29 @@ function ensureSlideAudio() {
     _slideAudio.volume = SLIDE_VOLUME;
   } catch { /* silent */ }
 }
+// Tracks whether we've played the priming silent buffer through the slide
+// audio chain. iOS's first start(0) after AudioContext resume can ignore
+// the GainNode for one frame (loud first scroll). Sending a silent buffer
+// through first warms up the path so the real play obeys the gain.
+let _slidePrimed = false;
 function playSlide() {
   try {
     ensureSlideAudio();
-    // Preferred path: Web Audio API. Honors volume on iOS, fires instantly.
     if (_slideAudioCtx && _slideAudioBuffer && _slideAudioGain) {
-      // iOS suspends the AudioContext until a user gesture. Calling resume()
-      // here is harmless if it's already running and unlocks it on first tap.
       if (_slideAudioCtx.state === 'suspended') {
         _slideAudioCtx.resume().catch(() => { /* silent */ });
+      }
+      // Prime path with a 1-sample silent buffer the first time, so iOS
+      // applies the gain correctly to the very next real play.
+      if (!_slidePrimed) {
+        _slidePrimed = true;
+        try {
+          const silent = _slideAudioCtx.createBuffer(1, 1, _slideAudioCtx.sampleRate);
+          const primer = _slideAudioCtx.createBufferSource();
+          primer.buffer = silent;
+          primer.connect(_slideAudioGain);
+          primer.start(0);
+        } catch { /* silent */ }
       }
       const src = _slideAudioCtx.createBufferSource();
       src.buffer = _slideAudioBuffer;
@@ -181,8 +195,6 @@ function playSlide() {
       src.start(0);
       return;
     }
-    // Fallback: HTMLAudio (note: volume may not apply on iOS, but at least
-    // it plays — only used if Web Audio init failed entirely).
     if (_slideAudio) {
       _slideAudio.currentTime = 0;
       void _slideAudio.play();
@@ -1499,26 +1511,14 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
 
 
 function AboutView({ onBack }: { onBack: () => void }) {
-  // Hidden debug log viewer — long-press the About title for 1s to open.
-  // Shows the geofencing module's debug ring buffer, useful for diagnosing
-  // why a drive-by notification didn't fire on TestFlight.
+  // Geofencing debug log viewer — accessed via a labeled button below.
+  // We tried hidden 5-tap and long-press patterns; iOS WebView interferes
+  // with both. A plain visible button is unambiguous and reliable.
   const [showDebug, setShowDebug] = useState(false);
   const [debugLines, setDebugLines] = useState<string[]>([]);
-  // 5-tap-fast on the title to open the debug log. iOS WebView hijacks
-  // long-press for text selection (showing a Copy menu), so a tap counter
-  // is the only reliable hidden-trigger pattern. 1500ms window between taps.
-  const tapCountRef = useRef(0);
-  const tapResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  function handleTitleTap() {
-    if (tapResetRef.current) clearTimeout(tapResetRef.current);
-    tapCountRef.current += 1;
-    if (tapCountRef.current >= 5) {
-      tapCountRef.current = 0;
-      setDebugLines(getDebugLog());
-      setShowDebug(true);
-      return;
-    }
-    tapResetRef.current = setTimeout(() => { tapCountRef.current = 0; }, 1500);
+  function openDebug() {
+    setDebugLines(getDebugLog());
+    setShowDebug(true);
   }
   return (
     <div style={S.appBg}>
@@ -1530,8 +1530,7 @@ function AboutView({ onBack }: { onBack: () => void }) {
           ← Run Home
         </button>
         <div
-          style={{ ...S.categoryViewTitle, color: WHITE, textShadow: `0 0 14px ${WHITE}cc`, userSelect: 'none', WebkitUserSelect: 'none', cursor: 'pointer' }}
-          onClick={handleTitleTap}
+          style={{ ...S.categoryViewTitle, color: WHITE, textShadow: `0 0 14px ${WHITE}cc` }}
         >
           About
         </div>
@@ -1562,6 +1561,12 @@ function AboutView({ onBack }: { onBack: () => void }) {
             onClick={() => { playForward(); window.open(YOUTUBE_URL, '_blank', 'noopener,noreferrer'); }}
           >
             ▶️ Subscribe on YouTube
+          </button>
+          <button
+            style={{ ...S.aboutLinkBtn, border: `2px solid ${BLUE}`, color: BLUE, marginTop: 12 }}
+            onClick={openDebug}
+          >
+            🔍 View Geofencing Log
           </button>
         </div>
       </div>
