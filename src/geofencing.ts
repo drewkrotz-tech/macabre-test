@@ -1,23 +1,34 @@
-// geofencing.ts — Sinister Locales geofencing layer
+// geofencing.ts — Sinister Locales geofencing layer (v2)
 //
 // On NATIVE (iOS/Android via Capacitor):
-//   - Requests "Always" location + notification permissions on first run
-//   - Watches user position in the background
-//   - Maintains a registered set of geofences for the 20 closest sites
-//     (Apple's per-app limit). Recomputes the set when the user moves
-//     more than RECALC_THRESHOLD_M from the last anchor point.
+//   - Requests notification + location permissions on demand
+//   - Watches user position in the background (foreground service on Android,
+//     iOS background-location mode)
+//   - Maintains an active set of the 20 closest sites (Apple's per-app fence
+//     limit). Recomputes when the user moves > RECALC_THRESHOLD_M.
 //   - On region enter: fires a local notification "You're near {title}"
-//   - When the user taps the notification: dispatches a window 'sinister:open-site'
-//     event that App.tsx listens to and uses to open the detail view.
+//   - Notification tap (foreground OR background) dispatches a window
+//     'sinister:open-site' event that App.tsx listens to.
 //
 // On WEB (StackBlitz preview):
 //   - Falls back to navigator.geolocation.watchPosition for the location
-//     dot in the UI. No notifications, no background. This is intentional —
-//     real geofencing requires native code.
+//     dot in the UI. No notifications, no background.
 //
-// Runtime detection: window.Capacitor.isNativePlatform(). NO static imports
-// of @capacitor/* packages so the web preview doesn't choke on missing native
-// modules. We dynamically import them only inside the isNative() branch.
+// Changes vs v1:
+//   - REPLACED `new Function('s', 'return import(s)')` with real dynamic
+//     `await import()` calls. The Function-constructor hack was bypassing
+//     Vite's module resolution AND failing silently inside Capacitor on
+//     iOS, which was the root cause of the Submit button never enabling
+//     (no permission prompt -> no Settings entry -> currentLocation null).
+//   - Cached imported plugin modules at module scope so we don't re-import
+//     on every fence check.
+//   - Added a debug log ring buffer (getDebugLog()) so App.tsx can show
+//     what's actually happening on TestFlight without us rebuilding.
+//   - Added foreground notification listener (localNotificationReceived)
+//     so taps work whether the app is open or backgrounded.
+//   - Added an Android notification channel init (no-op on iOS).
+//   - Permission response now distinguishes "always" vs "whileInUse" so
+//     App.tsx can show a one-time "Enable Always for drive-by alerts" UI.
 
 import type { SinisterSite } from './locations';
 
@@ -26,6 +37,7 @@ const GEOFENCE_RADIUS_M = 800;        // 0.5 mile per site
 const MAX_FENCES = 20;                // Apple's per-app limit
 const RECALC_THRESHOLD_M = 1500;      // recompute fence set when user moves > this from anchor
 const NOTIFICATION_COOLDOWN_MS = 30 * 60 * 1000; // don't re-notify same site within 30 min
+const ANDROID_CHANNEL_ID = 'sinister_proximity';
 
 // ---------- Tiny shim around Capacitor runtime ----------
 function isNative(): boolean {
@@ -34,76 +46,207 @@ function isNative(): boolean {
   return !!(cap && typeof cap.isNativePlatform === 'function' && cap.isNativePlatform());
 }
 
-// ---------- Public API consumed by App.tsx ----------
+function getPlatform(): 'ios' | 'android' | 'web' {
+  if (typeof window === 'undefined') return 'web';
+  const cap = (window as any).Capacitor;
+  const p = cap?.getPlatform?.();
+  if (p === 'ios' || p === 'android') return p;
+  return 'web';
+}
 
-export type Permissions = { location: boolean; notifications: boolean };
+// ---------- Debug log (ring buffer) ----------
+const DEBUG_LOG_MAX = 200;
+const _debugLog: string[] = [];
+function dlog(msg: string) {
+  const ts = new Date().toISOString().slice(11, 19);
+  const line = `[${ts}] ${msg}`;
+  _debugLog.push(line);
+  if (_debugLog.length > DEBUG_LOG_MAX) _debugLog.shift();
+  // eslint-disable-next-line no-console
+  console.log('[geofencing]', msg);
+}
+export function getDebugLog(): string[] {
+  return _debugLog.slice();
+}
+export function clearDebugLog() {
+  _debugLog.length = 0;
+}
 
-let _watchId: number | null = null;     // web: navigator.geolocation watch id
-let _nativeWatchHandle: any = null;     // native: BackgroundGeolocation watcher handle
-let _siteList: SinisterSite[] = [];     // current full site list (set by setSites)
+// ---------- Cached plugin modules ----------
+let _bgGeoMod: any = null;
+let _localNotifMod: any = null;
+
+async function loadBgGeo(): Promise<any> {
+  if (_bgGeoMod) return _bgGeoMod;
+  // Web preview (StackBlitz) doesn't have native plugins installed — only
+  // try the import on actual native platforms. The @vite-ignore comment
+  // also tells Vite's import-analysis to skip this string at preview time
+  // so the dev overlay doesn't crash with "package not found." On iOS,
+  // Codemagic's build machine has the package installed and the import
+  // resolves normally at runtime.
+  if (!isNative()) return null;
+  try {
+    const mod: any = await import(/* @vite-ignore */ '@capacitor-community/background-geolocation');
+    _bgGeoMod = mod.BackgroundGeolocation || mod.default?.BackgroundGeolocation || mod.default || mod;
+    if (!_bgGeoMod || typeof _bgGeoMod.addWatcher !== 'function') {
+      dlog('bg-geolocation module loaded but addWatcher missing; keys=' + Object.keys(mod || {}).join(','));
+      _bgGeoMod = null;
+    }
+  } catch (err: any) {
+    dlog('bg-geolocation import failed: ' + (err?.message || err));
+    _bgGeoMod = null;
+  }
+  return _bgGeoMod;
+}
+
+async function loadLocalNotif(): Promise<any> {
+  if (_localNotifMod) return _localNotifMod;
+  if (!isNative()) return null;
+  try {
+    const mod: any = await import(/* @vite-ignore */ '@capacitor/local-notifications');
+    _localNotifMod = mod.LocalNotifications || mod.default?.LocalNotifications || mod.default || mod;
+    if (!_localNotifMod || typeof _localNotifMod.schedule !== 'function') {
+      dlog('local-notifications module loaded but schedule missing; keys=' + Object.keys(mod || {}).join(','));
+      _localNotifMod = null;
+    }
+  } catch (err: any) {
+    dlog('local-notifications import failed: ' + (err?.message || err));
+    _localNotifMod = null;
+  }
+  return _localNotifMod;
+}
+
+// ---------- Public API ----------
+
+export type Permissions = {
+  location: 'always' | 'whileInUse' | 'denied' | 'unknown';
+  notifications: boolean;
+};
+
+let _watchId: number | null = null;
+let _nativeWatchHandle: any = null;
+let _siteList: SinisterSite[] = [];
 let _activeFenceIds: Set<string> = new Set();
 let _lastAnchor: { lat: number; lng: number } | null = null;
 let _lastNotifiedAt: Map<string, number> = new Map();
 let _onPosition: ((lat: number, lng: number) => void) | null = null;
+let _notifListenersAttached = false;
 
-// Set by App.tsx after fetching from server (or from bundled locations.ts).
-// Calling this re-evaluates which sites should be registered as geofences
-// based on the latest known position.
 export function setSites(sites: SinisterSite[]) {
   _siteList = sites;
+  dlog(`setSites: ${sites.length} sites loaded`);
   if (_lastAnchor && isNative()) {
     void recomputeFences(_lastAnchor.lat, _lastAnchor.lng);
   }
 }
 
-export async function requestPermissions(): Promise<Permissions> {
-  if (!isNative()) {
-    // On web we just attempt geolocation when starting the watch. No
-    // separate permission flow needed. Notifications aren't supported.
-    return { location: false, notifications: false };
-  }
-
-  const result: Permissions = { location: false, notifications: false };
-
+async function attachNotifListeners(): Promise<void> {
+  if (_notifListenersAttached) return;
+  const LN = await loadLocalNotif();
+  if (!LN) return;
   try {
-    const { LocalNotifications } = await (new Function('s', 'return import(s)'))('@capacitor/' + 'local-notifications');
-    const notifPerm = await LocalNotifications.requestPermissions();
-    result.notifications = notifPerm.display === 'granted';
-
-    // Listen for notification taps: deep-link the user into the matching site.
-    // Native notification action object includes the extra data we attached
-    // when scheduling. siteId is what App.tsx uses to switch views.
-    LocalNotifications.removeAllListeners?.();
-    LocalNotifications.addListener('localNotificationActionPerformed', (action) => {
+    if (typeof LN.removeAllListeners === 'function') {
+      await LN.removeAllListeners();
+    }
+    LN.addListener('localNotificationActionPerformed', (action: any) => {
       const siteId = action?.notification?.extra?.siteId;
+      dlog('tap (background): siteId=' + siteId);
       if (siteId && typeof window !== 'undefined') {
         window.dispatchEvent(new CustomEvent('sinister:open-site', { detail: { siteId } }));
       }
     });
-  } catch (err) {
-    console.warn('[geofencing] notification permission setup failed:', err);
+    LN.addListener('localNotificationReceived', (n: any) => {
+      const siteId = n?.extra?.siteId;
+      dlog('received (foreground): siteId=' + siteId);
+    });
+    _notifListenersAttached = true;
+    dlog('notification listeners attached');
+  } catch (err: any) {
+    dlog('attachNotifListeners failed: ' + (err?.message || err));
+  }
+}
+
+async function ensureAndroidChannel(): Promise<void> {
+  if (getPlatform() !== 'android') return;
+  const LN = await loadLocalNotif();
+  if (!LN || typeof LN.createChannel !== 'function') return;
+  try {
+    await LN.createChannel({
+      id: ANDROID_CHANNEL_ID,
+      name: 'Nearby Sites',
+      description: 'Alerts when you approach a sinister location',
+      importance: 4,
+      visibility: 1,
+      sound: 'default',
+      vibration: true,
+    });
+    dlog('android channel created');
+  } catch (err: any) {
+    dlog('createChannel failed: ' + (err?.message || err));
+  }
+}
+
+export async function requestPermissions(): Promise<Permissions> {
+  if (!isNative()) {
+    return { location: 'unknown', notifications: false };
   }
 
-  try {
-    const { BackgroundGeolocation } = await (new Function('s', 'return import(s)'))('@capacitor-community/' + 'background-geolocation') as any;
-    // BackgroundGeolocation.addWatcher returns a handle and starts streaming.
-    // Calling here primarily to surface the permission prompt; the actual
-    // streaming starts again in startGeofencing() below.
-    const id = await BackgroundGeolocation.addWatcher(
-      {
-        backgroundMessage: 'Sinister Locales is tracking nearby sites.',
-        backgroundTitle: 'Tracking active',
-        requestPermissions: true,
-        stale: false,
-        distanceFilter: 50,
-      },
-      () => { /* one-shot to trigger prompt; real handler attached in startGeofencing */ }
-    );
-    // Tear down — startGeofencing will create the long-lived watcher.
-    await BackgroundGeolocation.removeWatcher({ id });
-    result.location = true;
-  } catch (err) {
-    console.warn('[geofencing] location permission setup failed:', err);
+  const result: Permissions = { location: 'unknown', notifications: false };
+
+  const LN = await loadLocalNotif();
+  if (LN) {
+    try {
+      const perm = await LN.requestPermissions();
+      result.notifications = perm?.display === 'granted';
+      dlog('notification permission: ' + perm?.display);
+      await ensureAndroidChannel();
+      await attachNotifListeners();
+    } catch (err: any) {
+      dlog('requestPermissions(LN) failed: ' + (err?.message || err));
+    }
+  } else {
+    dlog('LocalNotifications module not available');
+  }
+
+  const BG = await loadBgGeo();
+  if (BG) {
+    try {
+      let promptFiredId: string | null = null;
+      const watcherId = await BG.addWatcher(
+        {
+          backgroundMessage: 'The Dread Directory is watching for nearby sites.',
+          backgroundTitle: 'Nearby Sites',
+          requestPermissions: true,
+          stale: false,
+          distanceFilter: 50,
+        },
+        (location: any, error: any) => {
+          if (error) {
+            dlog('initial watcher error: code=' + error.code + ' msg=' + error.message);
+            if (error.code === 'NOT_AUTHORIZED' || error.code === 'PERMISSION_DENIED') {
+              result.location = 'denied';
+            }
+            return;
+          }
+          if (location) {
+            if (result.location === 'unknown') result.location = 'whileInUse';
+            dlog('initial fix: ' + location.latitude.toFixed(4) + ',' + location.longitude.toFixed(4));
+          }
+        }
+      );
+      promptFiredId = watcherId;
+      try {
+        await BG.removeWatcher({ id: promptFiredId });
+        dlog('priming watcher removed');
+      } catch (err: any) {
+        dlog('removeWatcher (priming) failed: ' + (err?.message || err));
+      }
+    } catch (err: any) {
+      dlog('requestPermissions(BG) failed: ' + (err?.message || err));
+      result.location = 'denied';
+    }
+  } else {
+    dlog('BackgroundGeolocation module not available');
   }
 
   return result;
@@ -113,50 +256,56 @@ export async function startGeofencing(onPosition: (lat: number, lng: number) => 
   _onPosition = onPosition;
 
   if (!isNative()) {
-    // Web fallback — just keep the UI's "current location" dot fresh.
     if (typeof navigator === 'undefined' || !navigator.geolocation) return;
     _watchId = navigator.geolocation.watchPosition(
       (pos) => onPosition(pos.coords.latitude, pos.coords.longitude),
-      () => { /* permission denied / no signal — silent */ },
+      () => { /* silent */ },
       { enableHighAccuracy: true, maximumAge: 30000, timeout: 60000 }
     );
+    dlog('web watchPosition started, id=' + _watchId);
     return;
   }
 
-  // Native path: start the long-lived position watcher.
-  const { BackgroundGeolocation } = await (new Function('s', 'return import(s)'))('@capacitor-community/' + 'background-geolocation') as any;
-  _nativeWatchHandle = await BackgroundGeolocation.addWatcher(
-    {
-      backgroundMessage: 'Sinister Locales is tracking nearby sites.',
-      backgroundTitle: 'Tracking active',
-      requestPermissions: false, // already requested above
-      stale: false,
-      distanceFilter: 50,
-    },
-    async (location: any, error: any) => {
-      if (error) {
-        console.warn('[geofencing] watcher error:', error);
-        return;
+  await attachNotifListeners();
+  await ensureAndroidChannel();
+
+  const BG = await loadBgGeo();
+  if (!BG) {
+    dlog('startGeofencing: BG module unavailable, aborting native path');
+    return;
+  }
+
+  try {
+    _nativeWatchHandle = await BG.addWatcher(
+      {
+        backgroundMessage: 'The Dread Directory is watching for nearby sites.',
+        backgroundTitle: 'Nearby Sites',
+        requestPermissions: false,
+        stale: false,
+        distanceFilter: 50,
+      },
+      async (location: any, error: any) => {
+        if (error) {
+          dlog('watcher error: code=' + error.code + ' msg=' + error.message);
+          return;
+        }
+        if (!location) return;
+        const lat: number = location.latitude;
+        const lng: number = location.longitude;
+
+        if (_onPosition) _onPosition(lat, lng);
+
+        if (!_lastAnchor || distanceMeters(lat, lng, _lastAnchor.lat, _lastAnchor.lng) > RECALC_THRESHOLD_M) {
+          _lastAnchor = { lat, lng };
+          await recomputeFences(lat, lng);
+        }
+        checkFenceTriggers(lat, lng);
       }
-      if (!location) return;
-      const lat: number = location.latitude;
-      const lng: number = location.longitude;
-
-      onPosition(lat, lng);
-
-      // Recompute the active geofence set if we've moved far from the last
-      // anchor (or this is the first fix).
-      if (!_lastAnchor || distanceMeters(lat, lng, _lastAnchor.lat, _lastAnchor.lng) > RECALC_THRESHOLD_M) {
-        _lastAnchor = { lat, lng };
-        await recomputeFences(lat, lng);
-      }
-
-      // Even outside the recompute, we still poll-test active fences ourselves
-      // because Capacitor's bg-geo plugin doesn't ship a native region API on
-      // iOS — we approximate geofence-enter by distance check on each fix.
-      checkFenceTriggers(lat, lng);
-    }
-  );
+    );
+    dlog('native watcher started, handle=' + _nativeWatchHandle);
+  } catch (err: any) {
+    dlog('startGeofencing addWatcher failed: ' + (err?.message || err));
+  }
 }
 
 export async function stopGeofencing(): Promise<void> {
@@ -164,26 +313,28 @@ export async function stopGeofencing(): Promise<void> {
 
   if (_watchId !== null && typeof navigator !== 'undefined' && navigator.geolocation) {
     navigator.geolocation.clearWatch(_watchId);
+    dlog('web watchPosition cleared');
     _watchId = null;
   }
 
   if (_nativeWatchHandle && isNative()) {
-    try {
-      const { BackgroundGeolocation } = await (new Function('s', 'return import(s)'))('@capacitor-community/' + 'background-geolocation') as any;
-      await BackgroundGeolocation.removeWatcher({ id: _nativeWatchHandle });
-    } catch { /* ignore */ }
+    const BG = await loadBgGeo();
+    if (BG) {
+      try {
+        await BG.removeWatcher({ id: _nativeWatchHandle });
+        dlog('native watcher removed');
+      } catch (err: any) {
+        dlog('removeWatcher failed: ' + (err?.message || err));
+      }
+    }
     _nativeWatchHandle = null;
   }
 }
 
-// Web preview helper — App.tsx no longer surfaces the simulate buttons in v9+,
-// but we keep this exported so any debug tool that wants to fake a location
-// still can.
 export function simulateLocation(lat: number, lng: number) {
   if (_onPosition) _onPosition(lat, lng);
   if (isNative()) {
-    // On native we don't actually fake the OS position — only the UI hook.
-    // For real testing, drive there.
+    // Native: only fakes the UI hook, not the OS position.
   } else {
     checkFenceTriggers(lat, lng);
   }
@@ -191,24 +342,17 @@ export function simulateLocation(lat: number, lng: number) {
 
 // ---------- Internal helpers ----------
 
-// Pick the MAX_FENCES closest sites to (lat, lng), update active set.
 async function recomputeFences(lat: number, lng: number): Promise<void> {
   if (_siteList.length === 0) return;
-
   const ranked = _siteList
     .map(s => ({ site: s, d: distanceMeters(lat, lng, s.coords.lat, s.coords.lng) }))
     .sort((a, b) => a.d - b.d)
     .slice(0, MAX_FENCES);
-
   const newIds = new Set(ranked.map(r => r.site.id));
   _activeFenceIds = newIds;
-
-  // No native region API in use here — we simulate by distance check on each
-  // fix in checkFenceTriggers(). If we later swap to a real native region
-  // plugin, this is where we'd register/unregister regions with the OS.
+  dlog(`recomputeFences: ${newIds.size} active, nearest=${ranked[0]?.site.title} (${Math.round(ranked[0]?.d || 0)}m)`);
 }
 
-// Per-fix check: any active site within radius? Notify (with cooldown).
 function checkFenceTriggers(lat: number, lng: number): void {
   const now = Date.now();
   for (const site of _siteList) {
@@ -220,31 +364,36 @@ function checkFenceTriggers(lat: number, lng: number): void {
     if (now - lastAt < NOTIFICATION_COOLDOWN_MS) continue;
 
     _lastNotifiedAt.set(site.id, now);
+    dlog(`TRIGGER: ${site.title} at ${Math.round(d)}m`);
     void fireNotification(site);
   }
 }
 
 async function fireNotification(site: SinisterSite): Promise<void> {
   if (!isNative()) return;
+  const LN = await loadLocalNotif();
+  if (!LN) {
+    dlog('fireNotification: LN unavailable');
+    return;
+  }
   try {
-    const { LocalNotifications } = await (new Function('s', 'return import(s)'))('@capacitor/' + 'local-notifications');
-    await LocalNotifications.schedule({
+    await LN.schedule({
       notifications: [
         {
-          id: hashString(site.id) % 2000000000, // notification IDs must be int32
-          title: 'Sinister Locales',
+          id: hashString(site.id) % 2000000000,
+          title: 'The Dread Directory',
           body: `You're near ${site.title}. Tap to see the story.`,
           extra: { siteId: site.id },
-          // No `schedule` field => fires immediately.
+          channelId: ANDROID_CHANNEL_ID,
         },
       ],
     });
-  } catch (err) {
-    console.warn('[geofencing] notification schedule failed:', err);
+    dlog('notification scheduled: ' + site.title);
+  } catch (err: any) {
+    dlog('schedule failed: ' + (err?.message || err));
   }
 }
 
-// Cheap deterministic hash so notification IDs are stable per site.
 function hashString(s: string): number {
   let h = 0;
   for (let i = 0; i < s.length; i++) {
@@ -253,7 +402,6 @@ function hashString(s: string): number {
   return Math.abs(h);
 }
 
-// Haversine — exposed because App.tsx uses it for "X mi from you" labels.
 export function distanceMeters(lat1: number, lng1: number, lat2: number, lng2: number): number {
   const R = 6371000;
   const toRad = (d: number) => d * Math.PI / 180;

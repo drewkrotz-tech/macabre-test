@@ -5,6 +5,7 @@ import {
   requestPermissions,
   distanceMeters,
   setSites,
+  getDebugLog,
 } from './geofencing';
 import { SINISTER_SITES as FALLBACK_SITES, SinisterSite } from './locations';
 
@@ -122,88 +123,224 @@ function playBack() {
   } catch { /* silent */ }
 }
 
-// Single slide audio instance — reset and replay on each scroll step.
-// Using one Audio guarantees no overlap (the same instance can't play
-// twice simultaneously) and removes the rotation logic that was causing
-// fired-but-not-played edge cases.
-let _slideAudio: HTMLAudioElement | null = null;
+// Single slide audio instance — Web Audio API implementation.
+// HTMLAudioElement.volume is IGNORED on iOS WebView, which is why the
+// slide sound was deafening on iPhone despite volume=0.105. Web Audio's
+// GainNode honors volume on iOS. Pre-decoded AudioBuffer also gives
+// instant playback (no decode-on-play delay) and reliable firing on
+// every scroll — the previous symptom of "delayed and inconsistent" is
+// HTMLAudio's mid-decode play() calls being dropped.
+//
+// Falls back to HTMLAudioElement if Web Audio fails to init (older
+// browsers, very locked-down WebViews).
+const SLIDE_VOLUME = 0.105;
+let _slideAudioCtx: AudioContext | null = null;
+let _slideAudioBuffer: AudioBuffer | null = null;
+let _slideAudioGain: GainNode | null = null;
+let _slideAudioInitStarted = false;
+let _slideAudio: HTMLAudioElement | null = null; // fallback only
 function ensureSlideAudio() {
-  if (!_slideAudio) {
-    try {
-      _slideAudio = new Audio(slideSound1);
-      _slideAudio.preload = 'auto';
-      _slideAudio.volume = 0.105;
-    } catch { /* silent */ }
-  }
+  if (_slideAudioInitStarted) return;
+  _slideAudioInitStarted = true;
+  // Try Web Audio path first.
+  try {
+    const Ctx: typeof AudioContext = (window as any).AudioContext || (window as any).webkitAudioContext;
+    if (Ctx) {
+      _slideAudioCtx = new Ctx();
+      _slideAudioGain = _slideAudioCtx.createGain();
+      _slideAudioGain.gain.value = SLIDE_VOLUME;
+      _slideAudioGain.connect(_slideAudioCtx.destination);
+      // Fetch + decode the asset URL into a buffer for instant playback.
+      fetch(slideSound1)
+        .then(r => r.arrayBuffer())
+        .then(ab => _slideAudioCtx!.decodeAudioData(ab))
+        .then(buf => { _slideAudioBuffer = buf; })
+        .catch(() => { /* silent — fallback below covers it */ });
+    }
+  } catch { /* silent */ }
+  // HTMLAudio fallback (only used if Web Audio path fails).
+  try {
+    _slideAudio = new Audio(slideSound1);
+    _slideAudio.preload = 'auto';
+    _slideAudio.volume = SLIDE_VOLUME;
+  } catch { /* silent */ }
 }
 function playSlide() {
   try {
     ensureSlideAudio();
-    if (!_slideAudio) return;
-    _slideAudio.currentTime = 0;
-    void _slideAudio.play();
+    // Preferred path: Web Audio API. Honors volume on iOS, fires instantly.
+    if (_slideAudioCtx && _slideAudioBuffer && _slideAudioGain) {
+      // iOS suspends the AudioContext until a user gesture. Calling resume()
+      // here is harmless if it's already running and unlocks it on first tap.
+      if (_slideAudioCtx.state === 'suspended') {
+        _slideAudioCtx.resume().catch(() => { /* silent */ });
+      }
+      const src = _slideAudioCtx.createBufferSource();
+      src.buffer = _slideAudioBuffer;
+      src.connect(_slideAudioGain);
+      src.start(0);
+      return;
+    }
+    // Fallback: HTMLAudio (note: volume may not apply on iOS, but at least
+    // it plays — only used if Web Audio init failed entirely).
+    if (_slideAudio) {
+      _slideAudio.currentTime = 0;
+      void _slideAudio.play();
+    }
   } catch { /* silent */ }
 }
 
-// Single button click audio instance — same restart-on-call pattern as
-// the slide sound. Used for cell taps, submit button, social bar, etc.
-let _buttonAudio: HTMLAudioElement | null = null;
+// Single button click audio instance — Web Audio API for instant, reliable
+// firing on iOS. Same pattern as the slide sound. HTMLAudio fallback kept
+// for older WebViews. Volume at 0.20 honored by GainNode.
+const BUTTON_VOLUME = 0.20;
+let _buttonAudioCtx: AudioContext | null = null;
+let _buttonAudioBuffer: AudioBuffer | null = null;
+let _buttonAudioGain: GainNode | null = null;
+let _buttonAudioInitStarted = false;
+let _buttonAudio: HTMLAudioElement | null = null; // fallback only
 function ensureButtonAudio() {
-  if (!_buttonAudio) {
-    try {
-      _buttonAudio = new Audio(buttonSound);
-      _buttonAudio.preload = 'auto';
-      _buttonAudio.volume = 0.20;
-    } catch { /* silent */ }
-  }
+  if (_buttonAudioInitStarted) return;
+  _buttonAudioInitStarted = true;
+  try {
+    const Ctx: typeof AudioContext = (window as any).AudioContext || (window as any).webkitAudioContext;
+    if (Ctx) {
+      _buttonAudioCtx = new Ctx();
+      _buttonAudioGain = _buttonAudioCtx.createGain();
+      _buttonAudioGain.gain.value = BUTTON_VOLUME;
+      _buttonAudioGain.connect(_buttonAudioCtx.destination);
+      fetch(buttonSound)
+        .then(r => r.arrayBuffer())
+        .then(ab => _buttonAudioCtx!.decodeAudioData(ab))
+        .then(buf => { _buttonAudioBuffer = buf; })
+        .catch(() => { /* silent */ });
+    }
+  } catch { /* silent */ }
+  try {
+    _buttonAudio = new Audio(buttonSound);
+    _buttonAudio.preload = 'auto';
+    _buttonAudio.volume = BUTTON_VOLUME;
+  } catch { /* silent */ }
 }
 function playButton() {
   try {
     ensureButtonAudio();
-    if (!_buttonAudio) return;
-    _buttonAudio.currentTime = 0;
-    void _buttonAudio.play();
+    if (_buttonAudioCtx && _buttonAudioBuffer && _buttonAudioGain) {
+      if (_buttonAudioCtx.state === 'suspended') {
+        _buttonAudioCtx.resume().catch(() => { /* silent */ });
+      }
+      const src = _buttonAudioCtx.createBufferSource();
+      src.buffer = _buttonAudioBuffer;
+      src.connect(_buttonAudioGain);
+      src.start(0);
+      return;
+    }
+    if (_buttonAudio) {
+      _buttonAudio.currentTime = 0;
+      void _buttonAudio.play();
+    }
   } catch { /* silent */ }
 }
 
-// Single back navigation audio instance — plays on Run Home / Back tap.
-// Same restart-on-call pattern as button and slide.
-let _backAudio: HTMLAudioElement | null = null;
+// Single back navigation audio instance — Web Audio API for instant, reliable
+// firing on iOS. Same pattern as button/slide. HTMLAudio fallback kept.
+const BACK_VOLUME = 0.20;
+let _backAudioCtx: AudioContext | null = null;
+let _backAudioBuffer: AudioBuffer | null = null;
+let _backAudioGain: GainNode | null = null;
+let _backAudioInitStarted = false;
+let _backAudio: HTMLAudioElement | null = null; // fallback only
 function ensureBackAudio() {
-  if (!_backAudio) {
-    try {
-      _backAudio = new Audio(backSound);
-      _backAudio.preload = 'auto';
-      _backAudio.volume = 0.20;
-    } catch { /* silent */ }
-  }
+  if (_backAudioInitStarted) return;
+  _backAudioInitStarted = true;
+  try {
+    const Ctx: typeof AudioContext = (window as any).AudioContext || (window as any).webkitAudioContext;
+    if (Ctx) {
+      _backAudioCtx = new Ctx();
+      _backAudioGain = _backAudioCtx.createGain();
+      _backAudioGain.gain.value = BACK_VOLUME;
+      _backAudioGain.connect(_backAudioCtx.destination);
+      fetch(backSound)
+        .then(r => r.arrayBuffer())
+        .then(ab => _backAudioCtx!.decodeAudioData(ab))
+        .then(buf => { _backAudioBuffer = buf; })
+        .catch(() => { /* silent */ });
+    }
+  } catch { /* silent */ }
+  try {
+    _backAudio = new Audio(backSound);
+    _backAudio.preload = 'auto';
+    _backAudio.volume = BACK_VOLUME;
+  } catch { /* silent */ }
 }
 function playBackSound() {
   try {
     ensureBackAudio();
-    if (!_backAudio) return;
-    _backAudio.currentTime = 0;
-    void _backAudio.play();
+    if (_backAudioCtx && _backAudioBuffer && _backAudioGain) {
+      if (_backAudioCtx.state === 'suspended') {
+        _backAudioCtx.resume().catch(() => { /* silent */ });
+      }
+      const src = _backAudioCtx.createBufferSource();
+      src.buffer = _backAudioBuffer;
+      src.connect(_backAudioGain);
+      src.start(0);
+      return;
+    }
+    if (_backAudio) {
+      _backAudio.currentTime = 0;
+      void _backAudio.play();
+    }
   } catch { /* silent */ }
 }
 
-// Single bell audio instance — plays on submit form completion.
-let _bellAudio: HTMLAudioElement | null = null;
+// Single bell audio instance — Web Audio API for instant, reliable firing
+// on iOS. Same pattern as button/back/slide. HTMLAudio fallback kept.
+const BELL_VOLUME = 0.30;
+let _bellAudioCtx: AudioContext | null = null;
+let _bellAudioBuffer: AudioBuffer | null = null;
+let _bellAudioGain: GainNode | null = null;
+let _bellAudioInitStarted = false;
+let _bellAudio: HTMLAudioElement | null = null; // fallback only
 function ensureBellAudio() {
-  if (!_bellAudio) {
-    try {
-      _bellAudio = new Audio(bellSound);
-      _bellAudio.preload = 'auto';
-      _bellAudio.volume = 0.30;
-    } catch { /* silent */ }
-  }
+  if (_bellAudioInitStarted) return;
+  _bellAudioInitStarted = true;
+  try {
+    const Ctx: typeof AudioContext = (window as any).AudioContext || (window as any).webkitAudioContext;
+    if (Ctx) {
+      _bellAudioCtx = new Ctx();
+      _bellAudioGain = _bellAudioCtx.createGain();
+      _bellAudioGain.gain.value = BELL_VOLUME;
+      _bellAudioGain.connect(_bellAudioCtx.destination);
+      fetch(bellSound)
+        .then(r => r.arrayBuffer())
+        .then(ab => _bellAudioCtx!.decodeAudioData(ab))
+        .then(buf => { _bellAudioBuffer = buf; })
+        .catch(() => { /* silent */ });
+    }
+  } catch { /* silent */ }
+  try {
+    _bellAudio = new Audio(bellSound);
+    _bellAudio.preload = 'auto';
+    _bellAudio.volume = BELL_VOLUME;
+  } catch { /* silent */ }
 }
 function playBell() {
   try {
     ensureBellAudio();
-    if (!_bellAudio) return;
-    _bellAudio.currentTime = 0;
-    void _bellAudio.play();
+    if (_bellAudioCtx && _bellAudioBuffer && _bellAudioGain) {
+      if (_bellAudioCtx.state === 'suspended') {
+        _bellAudioCtx.resume().catch(() => { /* silent */ });
+      }
+      const src = _bellAudioCtx.createBufferSource();
+      src.buffer = _bellAudioBuffer;
+      src.connect(_bellAudioGain);
+      src.start(0);
+      return;
+    }
+    if (_bellAudio) {
+      _bellAudio.currentTime = 0;
+      void _bellAudio.play();
+    }
   } catch { /* silent */ }
 }
 
@@ -582,6 +719,11 @@ type View =
 export default function App() {
   const [view, setView] = useState<View>({ name: 'home' });
   const [currentLocation, setCurrentLocation] = useState<{ lat: number; lng: number } | null>(null);
+  // Tracks whether to show the "Enable Always Location" modal. Shown once
+  // on the second app launch (iOS only escalates "While Using" -> "Always"
+  // on a re-prompt, never on first ask). Persisted decision in localStorage
+  // so we never nag a user who has already accepted or declined.
+  const [showAlwaysModal, setShowAlwaysModal] = useState(false);
   // Sites are loaded from the server at startup. While the network call is
   // pending, we use the bundled FALLBACK_SITES so the app isn't empty.
   // After the fetch completes, `sites` is replaced with the live data.
@@ -618,10 +760,54 @@ export default function App() {
       try {
         // Sites are handed to the geofencing module by the live-fetch effect
         // above; we don't need to set them here.
-        await requestPermissions();
+        const perm = await requestPermissions();
         await startGeofencing((lat, lng) => setCurrentLocation({ lat, lng }));
+
+        // One-time "Enable Always Location" upsell. iOS NEVER escalates
+        // permission on the first prompt — it always offers "While Using"
+        // first, then the user has to either re-prompt or go to Settings
+        // to choose "Always". We show this modal on the 2nd launch only,
+        // and only if the user actually granted While-Using (no point
+        // asking if they denied outright).
+        try {
+          const KEY_LAUNCHES = 'sinister.launchCount';
+          const KEY_DECIDED = 'sinister.alwaysDecided';
+          const launches = parseInt(localStorage.getItem(KEY_LAUNCHES) || '0', 10) + 1;
+          localStorage.setItem(KEY_LAUNCHES, String(launches));
+          const alreadyDecided = localStorage.getItem(KEY_DECIDED) === '1';
+          const grantedWhileInUse = perm?.location === 'whileInUse';
+          if (launches >= 2 && !alreadyDecided && grantedWhileInUse) {
+            // Defer slightly so the home screen has a chance to render first.
+            setTimeout(() => setShowAlwaysModal(true), 1200);
+          }
+        } catch { /* localStorage unavailable — skip */ }
       } catch { /* silent */ }
     })();
+
+    // Web-geolocation fallback. Runs in parallel to the native geofencing
+    // init above. On iOS TestFlight builds, the native bg-geolocation plugin
+    // can throw silently during requestPermissions() and never trigger the
+    // iOS permission prompt — leaving currentLocation null forever and
+    // disabling the Submit Locale button. navigator.geolocation works
+    // reliably in the iOS WebView and uses the standard iOS prompt.
+    let webGeoWatchId: number | null = null;
+    if (typeof navigator !== 'undefined' && navigator.geolocation) {
+      // First fix: try to get a quick position so the form can light up
+      // immediately if the user has already granted permission.
+      navigator.geolocation.getCurrentPosition(
+        (pos) => setCurrentLocation({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
+        () => { /* user denied or timeout — silent */ },
+        { enableHighAccuracy: true, timeout: 10000, maximumAge: 30000 }
+      );
+      // Then keep it fresh so the gpsReadout updates as the user moves.
+      try {
+        webGeoWatchId = navigator.geolocation.watchPosition(
+          (pos) => setCurrentLocation({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
+          () => { /* silent */ },
+          { enableHighAccuracy: true, timeout: 15000, maximumAge: 10000 }
+        );
+      } catch { /* silent */ }
+    }
 
     // Notification deep-link handler. The geofencing module dispatches this
     // window event when the user taps a "you're near {site}" notification.
@@ -638,6 +824,9 @@ export default function App() {
     return () => {
       stopGeofencing();
       window.removeEventListener('sinister:open-site', handleOpenSite);
+      if (webGeoWatchId !== null && typeof navigator !== 'undefined' && navigator.geolocation) {
+        try { navigator.geolocation.clearWatch(webGeoWatchId); } catch { /* silent */ }
+      }
     };
   }, [sites]);
 
@@ -779,7 +968,129 @@ export default function App() {
       <div key={viewKey} className="sinister-view-enter">
         {viewElement}
       </div>
+      {showAlwaysModal && (
+        <AlwaysLocationModal
+          onEnable={async () => {
+            // Re-prompting via addWatcher with requestPermissions:true is
+            // what gives iOS the chance to escalate to Always. The user
+            // still has to choose Always from the iOS dialog — we just
+            // give them the opportunity.
+            try {
+              localStorage.setItem('sinister.alwaysDecided', '1');
+            } catch { /* ignore */ }
+            setShowAlwaysModal(false);
+            try {
+              await requestPermissions();
+            } catch { /* silent */ }
+          }}
+          onDismiss={() => {
+            try {
+              localStorage.setItem('sinister.alwaysDecided', '1');
+            } catch { /* ignore */ }
+            setShowAlwaysModal(false);
+          }}
+        />
+      )}
     </>
+  );
+}
+
+// ---------- Always Location upgrade modal ----------
+// Shown once on the second app launch, only if the user accepted While-Using
+// on the first launch. iOS won't escalate to Always without a re-prompt,
+// and re-prompting blindly is rude. This explains why we want it before
+// triggering the iOS dialog.
+function AlwaysLocationModal({ onEnable, onDismiss }: {
+  onEnable: () => void;
+  onDismiss: () => void;
+}) {
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      style={{
+        position: 'fixed',
+        inset: 0,
+        backgroundColor: 'rgba(0, 0, 0, 0.82)',
+        backdropFilter: 'blur(4px)',
+        zIndex: 9999,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        padding: 24,
+      }}
+    >
+      <div
+        style={{
+          backgroundColor: BLACK,
+          border: `2px solid ${BLUE}`,
+          borderRadius: 18,
+          padding: 24,
+          maxWidth: 380,
+          width: '100%',
+          boxShadow: `0 0 36px ${BLUE}88, inset 0 0 22px ${BLUE}33`,
+          color: BONE,
+          fontFamily: 'system-ui, -apple-system, sans-serif',
+        }}
+      >
+        <div style={{
+          fontFamily: '"Jolly Lodger", system-ui, serif',
+          fontSize: 32,
+          color: '#FFFFFF',
+          textShadow: `0 0 14px ${BLUE}cc`,
+          textAlign: 'center',
+          marginBottom: 12,
+          lineHeight: 1,
+        }}>
+          Drive-by Alerts
+        </div>
+        <p style={{ fontSize: 14, lineHeight: 1.55, margin: '0 0 18px', textAlign: 'center', color: BONE }}>
+          For The Dread Directory to ping you when you drive past a sinister location — even with the app closed — iOS needs <strong>Always</strong> location permission.
+        </p>
+        <p style={{ fontSize: 12, lineHeight: 1.5, margin: '0 0 22px', textAlign: 'center', color: '#9b9b9b' }}>
+          On the next prompt, choose <strong>"Change to Always Allow"</strong>. You can change this anytime in Settings.
+        </p>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          <button
+            type="button"
+            onClick={onEnable}
+            style={{
+              backgroundColor: 'transparent',
+              border: `2px solid ${BLUE}`,
+              borderRadius: 14,
+              color: '#FFFFFF',
+              padding: '14px',
+              fontSize: 13,
+              fontWeight: 700,
+              letterSpacing: '0.15em',
+              fontFamily: 'inherit',
+              cursor: 'pointer',
+              boxShadow: `0 0 14px ${BLUE}66`,
+            }}
+          >
+            ENABLE ALWAYS
+          </button>
+          <button
+            type="button"
+            onClick={onDismiss}
+            style={{
+              backgroundColor: 'transparent',
+              border: `1.5px solid ${GRAY_MID}`,
+              borderRadius: 14,
+              color: GRAY_MID,
+              padding: '12px',
+              fontSize: 12,
+              fontWeight: 600,
+              letterSpacing: '0.15em',
+              fontFamily: 'inherit',
+              cursor: 'pointer',
+            }}
+          >
+            NOT NOW
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -1188,6 +1499,25 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
 
 
 function AboutView({ onBack }: { onBack: () => void }) {
+  // Hidden debug log viewer — long-press the About title for 1s to open.
+  // Shows the geofencing module's debug ring buffer, useful for diagnosing
+  // why a drive-by notification didn't fire on TestFlight.
+  const [showDebug, setShowDebug] = useState(false);
+  const [debugLines, setDebugLines] = useState<string[]>([]);
+  const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  function startLongPress() {
+    if (longPressTimer.current) clearTimeout(longPressTimer.current);
+    longPressTimer.current = setTimeout(() => {
+      setDebugLines(getDebugLog());
+      setShowDebug(true);
+    }, 1000);
+  }
+  function cancelLongPress() {
+    if (longPressTimer.current) {
+      clearTimeout(longPressTimer.current);
+      longPressTimer.current = null;
+    }
+  }
   return (
     <div style={S.appBg}>
       <header style={S.header}>
@@ -1197,7 +1527,15 @@ function AboutView({ onBack }: { onBack: () => void }) {
         >
           ← Run Home
         </button>
-        <div style={{ ...S.categoryViewTitle, color: WHITE, textShadow: `0 0 14px ${WHITE}cc` }}>
+        <div
+          style={{ ...S.categoryViewTitle, color: WHITE, textShadow: `0 0 14px ${WHITE}cc`, userSelect: 'none', WebkitUserSelect: 'none' }}
+          onMouseDown={startLongPress}
+          onMouseUp={cancelLongPress}
+          onMouseLeave={cancelLongPress}
+          onTouchStart={startLongPress}
+          onTouchEnd={cancelLongPress}
+          onTouchCancel={cancelLongPress}
+        >
           About
         </div>
       </header>
@@ -1230,6 +1568,69 @@ function AboutView({ onBack }: { onBack: () => void }) {
           </button>
         </div>
       </div>
+      {showDebug && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          onClick={() => setShowDebug(false)}
+          style={{
+            position: 'fixed', inset: 0, backgroundColor: 'rgba(0, 0, 0, 0.92)',
+            zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center',
+            padding: 16,
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              backgroundColor: BLACK, border: `2px solid ${WHITE}`, borderRadius: 14,
+              padding: 16, maxWidth: 480, width: '100%', maxHeight: '80vh',
+              display: 'flex', flexDirection: 'column', gap: 10,
+            }}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <div style={{ fontSize: 12, color: WHITE, fontWeight: 700, letterSpacing: '0.15em' }}>GEOFENCING LOG</div>
+              <button
+                type="button"
+                onClick={() => setShowDebug(false)}
+                style={{ background: 'transparent', border: 'none', color: WHITE, fontSize: 18, cursor: 'pointer', padding: 4 }}
+              >×</button>
+            </div>
+            <div style={{
+              fontFamily: 'Menlo, monospace', fontSize: 10, color: BONE,
+              backgroundColor: '#111', padding: 10, borderRadius: 8,
+              overflow: 'auto', flex: 1, whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+              border: '1px solid #2a2a2a',
+            }}>
+              {debugLines.length === 0 ? '(empty — no events logged yet)' : debugLines.join('\n')}
+            </div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button
+                type="button"
+                onClick={() => setDebugLines(getDebugLog())}
+                style={{
+                  flex: 1, background: 'transparent', border: `1.5px solid ${WHITE}`,
+                  color: WHITE, padding: '10px', borderRadius: 10, fontSize: 11,
+                  fontWeight: 700, letterSpacing: '0.15em', fontFamily: 'inherit', cursor: 'pointer',
+                }}
+              >REFRESH</button>
+              <button
+                type="button"
+                onClick={() => {
+                  try {
+                    const txt = debugLines.join('\n');
+                    if (navigator.clipboard) navigator.clipboard.writeText(txt);
+                  } catch { /* ignore */ }
+                }}
+                style={{
+                  flex: 1, background: 'transparent', border: `1.5px solid ${WHITE}`,
+                  color: WHITE, padding: '10px', borderRadius: 10, fontSize: 11,
+                  fontWeight: 700, letterSpacing: '0.15em', fontFamily: 'inherit', cursor: 'pointer',
+                }}
+              >COPY</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1446,14 +1847,53 @@ function SubmitView({ currentLocation, onBack }: {
   const [submitting, setSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
+  // Local GPS fix triggered by a user tap on this form. iOS WebView grants
+  // geolocation permission much more reliably when the request comes from a
+  // user gesture than from a useEffect at app launch, so this gives users a
+  // way to recover even if the parent's auto-init never fired.
+  const [gpsLocation, setGpsLocation] = useState<{ lat: number; lng: number } | null>(null);
+  const [gpsRequesting, setGpsRequesting] = useState(false);
+  const [gpsError, setGpsError] = useState<string | null>(null);
+
+  // Effective GPS location: prefer the form's locally-fetched fix (most
+  // recent, user-initiated) and fall back to the app-level currentLocation.
+  const effectiveGps = gpsLocation || currentLocation;
 
   function pinLatLng(): { lat: number; lng: number } | null {
-    if (locMode === 'gps') return currentLocation;
+    if (locMode === 'gps') return effectiveGps;
     const lat = parseFloat(manualLat);
     const lng = parseFloat(manualLng);
     if (!isFinite(lat) || !isFinite(lng)) return null;
     if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return null;
     return { lat, lng };
+  }
+
+  function requestGpsNow() {
+    if (typeof navigator === 'undefined' || !navigator.geolocation) {
+      setGpsError('Geolocation not available on this device.');
+      return;
+    }
+    setGpsRequesting(true);
+    setGpsError(null);
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        setGpsLocation({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+        setGpsRequesting(false);
+      },
+      (err) => {
+        setGpsRequesting(false);
+        if (err.code === err.PERMISSION_DENIED) {
+          setGpsError('Location permission denied. Enable in Settings → The Dread Directory → Location, or use Enter Coords.');
+        } else if (err.code === err.POSITION_UNAVAILABLE) {
+          setGpsError('GPS unavailable right now. Try again or use Enter Coords.');
+        } else if (err.code === err.TIMEOUT) {
+          setGpsError('GPS timed out. Try again or use Enter Coords.');
+        } else {
+          setGpsError('Could not get location. Try again or use Enter Coords.');
+        }
+      },
+      { enableHighAccuracy: true, timeout: 12000, maximumAge: 0 }
+    );
   }
 
   const pin = pinLatLng();
@@ -1488,7 +1928,7 @@ function SubmitView({ currentLocation, onBack }: {
     setSubmitting(true);
     setErrorMsg(null);
 
-    let captureCoords = currentLocation;
+    let captureCoords = effectiveGps;
     if (typeof navigator !== 'undefined' && navigator.geolocation) {
       try {
         const pos: GeolocationPosition = await new Promise((resolve, reject) => {
@@ -1608,14 +2048,24 @@ function SubmitView({ currentLocation, onBack }: {
           </div>
           {locMode === 'gps' && (
             <div style={S.gpsReadout}>
-              {currentLocation ? `📍 ${currentLocation.lat.toFixed(5)}, ${currentLocation.lng.toFixed(5)}` : 'Waiting for GPS… (allow location access)'}
+              {effectiveGps ? (
+                `📍 ${effectiveGps.lat.toFixed(5)}, ${effectiveGps.lng.toFixed(5)}`
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8, alignItems: 'flex-start' }}>
+                  <button type="button" onClick={requestGpsNow} disabled={gpsRequesting}
+                          style={{ ...S.locModeBtn, border: `1.5px solid ${BLUE}`, color: BLUE, opacity: gpsRequesting ? 0.6 : 1 }}>
+                    {gpsRequesting ? 'Getting location…' : '📍 Get my location'}
+                  </button>
+                  {gpsError && <div style={{ color: '#ff6b6b', fontSize: 13 }}>{gpsError}</div>}
+                </div>
+              )}
             </div>
           )}
           {locMode === 'manual' && (
             <div style={S.manualRow}>
-              <input type="text" inputMode="decimal" value={manualLat} onChange={(e) => setManualLat(e.target.value)}
+              <input type="text" inputMode="text" value={manualLat} onChange={(e) => setManualLat(e.target.value)}
                      placeholder="Latitude  (e.g. 36.8534)" style={{ ...S.input, flex: 1 }} />
-              <input type="text" inputMode="decimal" value={manualLng} onChange={(e) => setManualLng(e.target.value)}
+              <input type="text" inputMode="text" value={manualLng} onChange={(e) => setManualLng(e.target.value)}
                      placeholder="Longitude  (e.g. -75.9760)" style={{ ...S.input, flex: 1 }} />
             </div>
           )}
@@ -2334,7 +2784,7 @@ const S: Record<string, React.CSSProperties> = {
   directionsButton: { width: '100%', backgroundColor: 'transparent', padding: '16px', fontSize: 14, fontWeight: 900, letterSpacing: '0.15em', cursor: 'pointer', marginTop: 18, fontFamily: 'inherit', borderRadius: 16 },
   imageCredit: { fontSize: 10, color: GRAY_MID, textAlign: 'center', marginTop: 18, letterSpacing: '0.15em' },
 
-  formBody: { padding: '16px 20px 60px', display: 'flex', flexDirection: 'column', gap: 18, position: 'relative', zIndex: 1 },
+  formBody: { padding: '16px 20px 60px', display: 'flex', flexDirection: 'column', gap: 18, position: 'relative', zIndex: 1, maxWidth: '100%', overflowX: 'hidden', boxSizing: 'border-box' },
   formIntro: { fontSize: 12, color: GRAY_MID, lineHeight: 1.5, letterSpacing: '0.03em', textAlign: 'center', margin: '4px 0 8px' },
   field: { display: 'flex', flexDirection: 'column', gap: 6 },
   fieldLabelRow: { display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' },
