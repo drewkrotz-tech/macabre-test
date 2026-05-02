@@ -1,30 +1,16 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
-// The two Capacitor native plugins below are iOS/Android-only. They have
-// no proper browser entry points in their package.json, so Vite/Rollup
-// cannot include them in the production web bundle. We mark them as
-// 'external' so Rollup leaves the import paths as runtime references.
-//
-// At runtime in the iOS WebView, Capacitor's bridge resolves these
-// imports to their native implementations. The dynamic imports in
-// src/geofencing.ts are also gated by an isNative() check, so they
-// never execute in the StackBlitz / browser preview.
+// Vite config. We intentionally do NOT externalize Capacitor plugin packages
+// here — we used to in v1.1, but that caused runtime URL resolution failures
+// in the iOS WebView. Instead, src/geofencing.ts now uses registerPlugin from
+// @capacitor/core (the documented Capacitor pattern), which doesn't require
+// importing the native plugin packages from the JS bundle at all. The native
+// implementations are wired by Capacitor's iOS bridge via cap sync + pod
+// install on the Codemagic build machine.
 export default defineConfig({
   plugins: [react()],
   build: {
     outDir: 'dist',
-    rollupOptions: {
-      external: [
-        '@capacitor-community/background-geolocation',
-        '@capacitor/local-notifications',
-      ],
-    },
-  },
-  optimizeDeps: {
-    exclude: [
-      '@capacitor-community/background-geolocation',
-      '@capacitor/local-notifications',
-    ],
   },
 });
