@@ -58,6 +58,14 @@ function getPlatform(): 'ios' | 'android' | 'web' {
 const DEBUG_LOG_MAX = 200;
 const _debugLog: string[] = [];
 function dlog(msg: string) {
+  // Drain any pre-buffered messages from module-load time on first call
+  try {
+    const buf = (globalThis as any).__earlyLogBuf as string[] | undefined;
+    if (buf && buf.length) {
+      for (const l of buf) _debugLog.push(l);
+      buf.length = 0;
+    }
+  } catch {}
   const ts = new Date().toISOString().slice(11, 19);
   const line = `[${ts}] ${msg}`;
   _debugLog.push(line);
@@ -81,6 +89,36 @@ export function clearDebugLog() {
 // a proxy that routes method calls to the native plugin via Capacitor's
 // JSBridge — no JS module resolution required.
 import { registerPlugin } from '@capacitor/core';
+
+// --- BREADCRUMB INSTRUMENTATION (added for diagnosis) ---
+(function installGlobalErrorTrap(){
+  if (typeof window === 'undefined') return;
+  if ((window as any).__geoErrTrapInstalled) return;
+  (window as any).__geoErrTrapInstalled = true;
+  try {
+    window.addEventListener('error', (ev: any) => {
+      const msg = ev?.error?.message || ev?.message || String(ev);
+      const stk = ev?.error?.stack ? (' | ' + String(ev.error.stack).split('\n').slice(0,3).join(' :: ')) : '';
+      _modulePushLog('GLOBAL ERROR: ' + msg + stk);
+    });
+    window.addEventListener('unhandledrejection', (ev: any) => {
+      const r = ev?.reason;
+      const msg = r?.message || String(r);
+      const stk = r?.stack ? (' | ' + String(r.stack).split('\n').slice(0,3).join(' :: ')) : '';
+      _modulePushLog('UNHANDLED REJECTION: ' + msg + stk);
+    });
+  } catch {}
+})();
+function _modulePushLog(msg: string) {
+  try {
+    const ts = new Date().toISOString().slice(11, 19);
+    const line = '[' + ts + '] ' + msg;
+    (globalThis as any).__earlyLogBuf = (globalThis as any).__earlyLogBuf || [];
+    (globalThis as any).__earlyLogBuf.push(line);
+  } catch {}
+}
+_modulePushLog('GEOFENCING MODULE LOADED');
+
 
 // Type-only shapes — we don't import the runtime types from the plugin
 // packages because that would force a bundle dependency we want to avoid.
@@ -218,7 +256,7 @@ async function ensureAndroidChannel(): Promise<void> {
 }
 
 export async function requestPermissions(): Promise<Permissions> {
-  dlog('requestPermissions ENTRY, isNative=' + isNative());
+  dlog('RP-1 ENTRY, isNative=' + isNative());
   if (!isNative()) {
     return { location: 'unknown', notifications: false };
   }
@@ -228,16 +266,19 @@ export async function requestPermissions(): Promise<Permissions> {
   // Run notification permission with a hard 5s timeout. If LN.requestPermissions()
   // hangs (observed in v1.5/v1.6 logs — never resolved), we don't want it
   // blocking the BackgroundGeolocation flow that comes after.
+  dlog('RP-2 before loadLocalNotif');
   const LN = await loadLocalNotif();
+  dlog('RP-3 after loadLocalNotif, LN=' + (LN ? 'truthy' : 'falsy'));
   if (LN) {
     try {
-      dlog('about to call LN.requestPermissions');
+      dlog('RP-4 about to call LN.requestPermissions');
       const perm: any = await Promise.race([
         LN.requestPermissions(),
         new Promise((_, reject) => setTimeout(() => reject(new Error('LN.requestPermissions timeout')), 5000)),
       ]);
+      dlog('RP-5 LN.requestPermissions resolved');
       result.notifications = perm?.display === 'granted';
-      dlog('notification permission: ' + perm?.display);
+      dlog('RP-6 notification permission: ' + perm?.display);
       await ensureAndroidChannel();
       await attachNotifListeners();
     } catch (err: any) {
@@ -248,10 +289,11 @@ export async function requestPermissions(): Promise<Permissions> {
     dlog('LocalNotifications module not available');
   }
 
-  dlog('about to call loadBgGeo');
+  dlog('RP-7 about to call loadBgGeo');
   const BG = await loadBgGeo();
+  dlog('RP-8 after loadBgGeo, BG=' + (BG ? 'truthy' : 'falsy'));
   if (BG) {
-    dlog('requestPermissions: BG truthy, about to call addWatcher');
+    dlog('RP-9 BG truthy, about to call addWatcher');
     try {
       let promptFiredId: string | null = null;
       const watcherId = await BG.addWatcher(
@@ -292,6 +334,7 @@ export async function requestPermissions(): Promise<Permissions> {
     dlog('BackgroundGeolocation module not available');
   }
 
+  dlog('RP-12 returning result, location=' + result.location + ' notifs=' + result.notifications);
   return result;
 }
 
