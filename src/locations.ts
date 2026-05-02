@@ -1,64 +1,66 @@
-// =============================================================================
-// MACABRE TEST — LOCATIONS
-// =============================================================================
-// 3 hardcoded Virginia Beach Sinister Sites for proof-of-concept testing.
-// To add more locations as admin, just append to this array.
-// Coordinates are approximate — verified against public records.
-// =============================================================================
+// Hardcoded test locations for v0.1 (Virginia Beach area).
+// Real locations will come from SinisterServer's GET /sites endpoint in v1.0,
+// at which point this file's contents are replaced with a server-fetched array.
+//
+// Each site has a `state` field used by the home-page state picker drilldown.
+// On user submissions, this is auto-derived server-side via the US Census
+// Geocoder (lat/lng -> state) so users don't have to pick it manually.
 
-export interface SinisterSite {
+export type SinisterCategory =
+  | 'crime'
+  | 'film'
+  | 'haunting'
+  | 'cult'
+  | 'disaster'
+  | 'historical';
+
+export type SinisterSite = {
   id: string;
   title: string;
-  category: 'haunting' | 'crime' | 'film' | 'historical' | 'cult' | 'disaster';
+  shortDescription: string;
+  fullDescription: string;
+  category: SinisterCategory;
+  state: string; // full US state name (e.g. "Virginia"), set on submission
   coords: { lat: number; lng: number };
-  radiusMeters: number; // geofence radius for this site
-  shortDescription: string; // shown in notification
-  fullDescription: string; // shown in detail view
   imageUrl: string;
   imageCredit: string;
-}
+};
 
 export const SINISTER_SITES: SinisterSite[] = [
   {
-    id: 'cavalier-hotel',
+    id: 'cavalier',
     title: 'The Cavalier Hotel',
-    category: 'haunting',
-    coords: { lat: 36.8534, lng: -75.9760 },
-    radiusMeters: 800, // ~0.5 miles
-    shortDescription:
-      'Adolph Coors fell to his death from a 6th-floor window in 1929. He never left.',
+    shortDescription: 'Site of Adolph Coors III suicide and decades of reported hauntings.',
     fullDescription:
-      'Built in 1927 as the crown jewel of the Virginia Beach oceanfront, The Cavalier Hotel hosted seven U.S. presidents and earned a reputation that long outlasted its golden age. In 1929, brewing magnate Adolph Coors fell to his death from a sixth-floor window under circumstances that were never satisfactorily explained — ruled a suicide by some accounts, whispered about as something darker by others.\n\nStaff and guests have reported the smell of cigar smoke drifting through unused floors, elevator buttons illuminating without being pressed, and the figure of a man in early-20th-century formal wear glimpsed in mirrors and corridors. Following its 2018 restoration, the Cavalier remains operational — and the reports continue.',
-    imageUrl:
-      'https://upload.wikimedia.org/wikipedia/commons/thumb/4/4c/Cavalier_Hotel_Virginia_Beach.jpg/1280px-Cavalier_Hotel_Virginia_Beach.jpg',
-    imageCredit: 'Wikimedia Commons',
+      'Built in 1927, the Cavalier Hotel hosted ten US presidents and an endless parade of celebrities. In 1929, Adolph Coors III leapt from a sixth-floor window in what was officially ruled a suicide.\n\nStaff and guests have reported apparitions, cold spots, and disembodied voices in the upper hallways for nearly a century. The hotel has been renovated multiple times, but the stories never stop.',
+    category: 'haunting',
+    state: 'Virginia',
+    coords: { lat: 36.8534, lng: -75.9760 },
+    imageUrl: 'https://images.unsplash.com/photo-1564013799919-ab600027ffc6?w=900&q=80',
+    imageCredit: 'Unsplash',
   },
   {
     id: 'ferry-plantation',
     title: 'Ferry Plantation House',
-    category: 'haunting',
-    coords: { lat: 36.892, lng: -76.11 },
-    radiusMeters: 800,
-    shortDescription:
-      'Eleven distinct ghosts. The site of the Witch of Pungo trial.',
+    shortDescription: 'Witch of Pungo trial site — Grace Sherwood was convicted here in 1706.',
     fullDescription:
-      'Ferry Plantation House sits on land that has witnessed nearly four centuries of Virginia history — and, by many accounts, refuses to let any of it go. Built in 1830 atop the foundations of earlier structures dating to 1642, the property has been the site of multiple drownings near the original ferry crossing and at least one murder.\n\nLocal paranormal investigators have catalogued eleven distinct apparitions reported by visitors and staff, including the "Lady in White," a former owner named Sarah, and a young boy who appears in upstairs windows. The site is also tied to one of the darkest chapters in Virginia colonial history: the 1706 trial of Grace Sherwood, the only person in the state ever convicted of witchcraft by water trial. Sherwood\'s ducking pond lies a short distance from the house.',
-    imageUrl:
-      'https://upload.wikimedia.org/wikipedia/commons/thumb/8/8c/Ferry_Plantation_House.jpg/1280px-Ferry_Plantation_House.jpg',
-    imageCredit: 'Wikimedia Commons',
+      'Ferry Plantation House sits on the banks of the Lynnhaven River, where in 1706 Grace Sherwood — the "Witch of Pungo" — was tried by water. Bound and tossed into the river, she floated, which the court took as proof of witchcraft.\n\nGrace served seven years in prison and lived to 80. She was officially exonerated by the governor of Virginia in 2006, three centuries after her conviction. The grounds are said to host her spirit and several others.',
+    category: 'haunting',
+    state: 'Virginia',
+    coords: { lat: 36.8920, lng: -76.1100 },
+    imageUrl: 'https://images.unsplash.com/photo-1518709268805-4e9042af2176?w=900&q=80',
+    imageCredit: 'Unsplash',
   },
   {
-    id: 'cape-henry-lighthouse',
+    id: 'cape-henry',
     title: 'Cape Henry Lighthouse',
-    category: 'historical',
-    coords: { lat: 36.9265, lng: -76.007 },
-    radiusMeters: 800,
-    shortDescription:
-      'The first lighthouse authorized by the U.S. government. Its keeper never left his post.',
+    shortDescription: 'First federal lighthouse, with a long history of unexplained phenomena.',
     fullDescription:
-      'Commissioned by George Washington in 1789 and completed in 1792, Cape Henry Lighthouse was the first public works project authorized by the newly formed U.S. federal government. For nearly a century it guided ships into the Chesapeake Bay through some of the most treacherous waters on the Atlantic coast.\n\nThe original tower, now decommissioned, sits within the grounds of Fort Story military base. Visitors and military personnel have long reported the figure of a former lighthouse keeper still climbing the spiral stairs, particularly during storms. The surrounding Fort Story area carries its own weight of Civil War-era apparitions, and the dunes between the old and new lighthouses have been the site of multiple unexplained sightings over the decades.',
-    imageUrl:
-      'https://upload.wikimedia.org/wikipedia/commons/thumb/6/63/Cape_Henry_Lighthouse_2008.jpg/1024px-Cape_Henry_Lighthouse_2008.jpg',
-    imageCredit: 'Wikimedia Commons',
+      'Authorized by George Washington and completed in 1792, Cape Henry Lighthouse was the first public works project of the new United States. It marks the entrance to the Chesapeake Bay.\n\nKeepers and visitors have reported footsteps on the iron staircase when no one else is in the tower, and a lantern that seems to light itself on foggy nights. The site is also tied to colonial history and the 1607 landing of the first Virginia settlers.',
+    category: 'historical',
+    state: 'Virginia',
+    coords: { lat: 36.9265, lng: -76.0070 },
+    imageUrl: 'https://images.unsplash.com/photo-1532274402911-5a369e4c4bb5?w=900&q=80',
+    imageCredit: 'Unsplash',
   },
 ];
