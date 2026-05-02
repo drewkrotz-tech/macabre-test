@@ -715,7 +715,27 @@ type View =
   | { name: 'about' };
 
 export default function App() {
-  const [view, setView] = useState<View>({ name: 'home' });
+  const [view, _setViewRaw] = useState<View>({ name: 'home' });
+  // Navigation history stack — every time setView is called, the previous
+  // view gets pushed here so swipe-right can pop back to it.
+  const _navHistory = useRef<View[]>([]);
+  const setView = (next: View) => {
+    _setViewRaw((prev) => {
+      // Don't push if the new view is the same as current (no-op nav).
+      if (JSON.stringify(prev) !== JSON.stringify(next)) {
+        _navHistory.current.push(prev);
+        // Cap history at 50 to avoid unbounded growth.
+        if (_navHistory.current.length > 50) _navHistory.current.shift();
+      }
+      return next;
+    });
+  };
+  const goBack = () => {
+    const stack = _navHistory.current;
+    if (stack.length === 0) return; // already at oldest, no-op
+    const prev = stack.pop()!;
+    _setViewRaw(prev);
+  };
   const [currentLocation, setCurrentLocation] = useState<{ lat: number; lng: number } | null>(null);
   // Tracks whether to show the "Enable Always Location" modal. Shown once
   // on the second app launch (iOS only escalates "While Using" -> "Always"
@@ -767,6 +787,52 @@ export default function App() {
       window.removeEventListener('touchstart', primeOnFirstTouch);
     };
   }, []);
+
+  // Swipe-right-to-go-back. Triggers when a touch starts within ~50px of
+  // the left edge, moves at least 80px to the right, and stays mostly
+  // horizontal (vertical drift < 40px). Skips the home view since there
+  // is nothing to go back to. On the submit view, confirms first if the
+  // user has typed anything into the form.
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    let startX = 0, startY = 0, tracking = false;
+    const onStart = (e: TouchEvent) => {
+      if (!e.touches || e.touches.length !== 1) return;
+      const tch = e.touches[0];
+      // Edge-only: must start within 50px of the left edge.
+      if (tch.clientX > 50) { tracking = false; return; }
+      startX = tch.clientX;
+      startY = tch.clientY;
+      tracking = true;
+    };
+    const onEnd = (e: TouchEvent) => {
+      if (!tracking) return;
+      tracking = false;
+      const tch = (e.changedTouches && e.changedTouches[0]);
+      if (!tch) return;
+      const dx = tch.clientX - startX;
+      const dy = Math.abs(tch.clientY - startY);
+      if (dx < 80) return;          // not enough horizontal travel
+      if (dy > 40) return;           // too vertical, treat as scroll
+      // Don't swipe-back from home — there's nothing behind it.
+      if (view.name === 'home') return;
+      // On submit view, confirm if any input has text.
+      if (view.name === 'submit') {
+        try {
+          const inputs = Array.from(document.querySelectorAll('input, textarea')) as Array<HTMLInputElement | HTMLTextAreaElement>;
+          const dirty = inputs.some((el) => (el.value && el.value.trim().length > 0));
+          if (dirty && !window.confirm('Discard this submission and go back?')) return;
+        } catch { /* if confirm or query fails, just proceed */ }
+      }
+      goBack();
+    };
+    window.addEventListener('touchstart', onStart, { passive: true });
+    window.addEventListener('touchend', onEnd, { passive: true });
+    return () => {
+      window.removeEventListener('touchstart', onStart);
+      window.removeEventListener('touchend', onEnd);
+    };
+  }, [view]);
 
   // Scroll-bleed fix: every time the view changes, snap the page back to the
   // top. Without this, scrolling deep into a state list and then hitting Run
@@ -1480,12 +1546,7 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
   return (
     <div style={S.appBg}>
       <header style={S.header}>
-        <button
-          onClick={onBack}
-          style={{ ...S.backButton, border: `2px solid ${BLUE}`, boxShadow: `0 0 12px ${BLUE}66`, color: color }}
-        >
-          ← Run Home
-        </button>
+        
         <div style={{
           ...S.categoryViewTitle,
           color: color,
@@ -1548,12 +1609,7 @@ function AboutView({ onBack }: { onBack: () => void }) {
   return (
     <div style={S.appBg}>
       <header style={S.header}>
-        <button
-          onClick={onBack}
-          style={{ ...S.backButton, border: `2px solid ${WHITE}`, boxShadow: `0 0 12px ${WHITE}66`, color: WHITE }}
-        >
-          ← Run Home
-        </button>
+        
         <div
           style={{ ...S.categoryViewTitle, color: WHITE, textShadow: `0 0 14px ${WHITE}cc` }}
         >
@@ -1687,12 +1743,7 @@ function CategoryView({ label, color, sites, currentLocation, onSelectSite, onBa
   return (
     <div style={S.appBg}>
       <header style={S.header}>
-        <button
-          onClick={onBack}
-          style={{ ...S.backButton, border: `2px solid ${BLUE}`, boxShadow: `0 0 12px ${BLUE}66`, color: color }}
-        >
-          ← Run Home
-        </button>
+        
         <div style={{
           ...S.categoryViewTitle,
           color: color,
@@ -1812,12 +1863,7 @@ function DetailView({ site, currentLocation, onBack }: {
   return (
     <div style={S.appBg}>
       <header style={S.header}>
-        <button
-          onClick={onBack}
-          style={{ ...S.backButton, border: `2px solid ${BLUE}`, boxShadow: `0 0 12px ${BLUE}66`, color: color }}
-        >
-          ← Back
-        </button>
+        
       </header>
       <div style={{
         ...S.heroImage,
@@ -2008,17 +2054,7 @@ function SubmitView({ currentLocation, onBack }: {
             </div>
           </div>
           <div style={{ padding: '0 20px', width: '100%', boxSizing: 'border-box' }}>
-            <button
-              onClick={onBack}
-              style={{
-                ...S.directionsButton,
-                border: `2px solid ${BLUE}`,
-                color: '#FFFFFF',
-                boxShadow: `0 0 22px ${BLUE}77, inset 0 0 14px ${BLUE}22`,
-              }}
-            >
-              Run Home
-            </button>
+            
           </div>
         </div>
       </div>
@@ -2028,12 +2064,7 @@ function SubmitView({ currentLocation, onBack }: {
   return (
     <div style={S.appBg}>
       <header style={S.header}>
-        <button
-          onClick={onBack}
-          style={{ ...S.backButton, border: `2px solid ${BLUE}`, boxShadow: `0 0 12px ${BLUE}66`, color: '#FFFFFF' }}
-        >
-          ← Run Home
-        </button>
+        
         <div style={{ ...S.categoryViewTitle, color: '#FFFFFF', textShadow: `0 0 14px #FFFFFFcc` }}>
           Submit a Location
         </div>
