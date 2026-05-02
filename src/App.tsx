@@ -175,34 +175,34 @@ let _slidePrimed = false;
 function playSlide() {
   try {
     ensureSlideAudio();
-    if (_slideAudioCtx && _slideAudioBuffer && _slideAudioGain) {
-      if (_slideAudioCtx.state === 'suspended') {
-        _slideAudioCtx.resume().catch(() => { /* silent */ });
-      }
-      if (!_slidePrimed) {
-        _slidePrimed = true;
-        // Send a silent 100ms buffer through the gain chain. Skip the real
-        // sound this first call — better to miss one click than to blast.
-        try {
-          const sr = _slideAudioCtx.sampleRate;
-          const silent = _slideAudioCtx.createBuffer(1, Math.floor(sr * 0.1), sr);
-          const primer = _slideAudioCtx.createBufferSource();
-          primer.buffer = silent;
-          primer.connect(_slideAudioGain);
-          primer.start(0);
-        } catch { /* silent */ }
-        return; // Don't play the real sound on the priming call.
-      }
-      const src = _slideAudioCtx.createBufferSource();
-      src.buffer = _slideAudioBuffer;
-      src.connect(_slideAudioGain);
-      src.start(0);
+    // Only play through the Web Audio path. If the buffer isn't decoded
+    // yet (very first scrolls right after app launch), drop this scroll
+    // entirely — playing through the HTMLAudio fallback at this point
+    // would blast at full volume because iOS ignores HTMLAudio.volume.
+    if (!_slideAudioCtx || !_slideAudioBuffer || !_slideAudioGain) {
       return;
     }
-    if (_slideAudio) {
-      _slideAudio.currentTime = 0;
-      void _slideAudio.play();
+    if (_slideAudioCtx.state === 'suspended') {
+      _slideAudioCtx.resume().catch(() => { /* silent */ });
     }
+    if (!_slidePrimed) {
+      _slidePrimed = true;
+      // Send a silent 100ms buffer through the gain chain. Skip the real
+      // sound this first call — better to miss one click than to blast.
+      try {
+        const sr = _slideAudioCtx.sampleRate;
+        const silent = _slideAudioCtx.createBuffer(1, Math.floor(sr * 0.1), sr);
+        const primer = _slideAudioCtx.createBufferSource();
+        primer.buffer = silent;
+        primer.connect(_slideAudioGain);
+        primer.start(0);
+      } catch { /* silent */ }
+      return; // Don't play the real sound on the priming call.
+    }
+    const src = _slideAudioCtx.createBufferSource();
+    src.buffer = _slideAudioBuffer;
+    src.connect(_slideAudioGain);
+    src.start(0);
   } catch { /* silent */ }
 }
 

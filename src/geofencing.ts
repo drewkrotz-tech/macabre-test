@@ -100,13 +100,22 @@ let _bgGeoMod: BgGeoPlugin | null = null;
 let _localNotifMod: LocalNotifPlugin | null = null;
 
 async function loadBgGeo(): Promise<BgGeoPlugin | null> {
-  if (_bgGeoMod) return _bgGeoMod;
-  if (!isNative()) return null;
+  dlog('loadBgGeo: enter');
+  if (_bgGeoMod) {
+    dlog('loadBgGeo: returning cached');
+    return _bgGeoMod;
+  }
+  if (!isNative()) {
+    dlog('loadBgGeo: not native, returning null');
+    return null;
+  }
   try {
+    dlog('loadBgGeo: about to call registerPlugin');
     // Capacitor's registerPlugin returns a Proxy. Methods aren't always
     // enumerable until called, so we trust any truthy return and let real
     // errors surface at addWatcher() call time.
     const proxy = registerPlugin<BgGeoPlugin>('BackgroundGeolocation');
+    dlog('loadBgGeo: registerPlugin returned, type=' + typeof proxy + ', truthy=' + !!proxy);
     if (!proxy) {
       dlog('BackgroundGeolocation registerPlugin returned null');
       return null;
@@ -233,6 +242,7 @@ export async function requestPermissions(): Promise<Permissions> {
 
   const BG = await loadBgGeo();
   if (BG) {
+    dlog('requestPermissions: BG truthy, about to call addWatcher');
     try {
       let promptFiredId: string | null = null;
       const watcherId = await BG.addWatcher(
@@ -257,6 +267,7 @@ export async function requestPermissions(): Promise<Permissions> {
           }
         }
       );
+      dlog('requestPermissions: addWatcher resolved, watcherId=' + watcherId);
       promptFiredId = watcherId;
       try {
         await BG.removeWatcher({ id: promptFiredId });
