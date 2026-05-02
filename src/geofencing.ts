@@ -225,21 +225,30 @@ export async function requestPermissions(): Promise<Permissions> {
 
   const result: Permissions = { location: 'unknown', notifications: false };
 
+  // Run notification permission with a hard 5s timeout. If LN.requestPermissions()
+  // hangs (observed in v1.5/v1.6 logs — never resolved), we don't want it
+  // blocking the BackgroundGeolocation flow that comes after.
   const LN = await loadLocalNotif();
   if (LN) {
     try {
-      const perm = await LN.requestPermissions();
+      dlog('about to call LN.requestPermissions');
+      const perm: any = await Promise.race([
+        LN.requestPermissions(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('LN.requestPermissions timeout')), 5000)),
+      ]);
       result.notifications = perm?.display === 'granted';
       dlog('notification permission: ' + perm?.display);
       await ensureAndroidChannel();
       await attachNotifListeners();
     } catch (err: any) {
       dlog('requestPermissions(LN) failed: ' + (err?.message || err));
+      // Continue — don't let LN failure block BG.
     }
   } else {
     dlog('LocalNotifications module not available');
   }
 
+  dlog('about to call loadBgGeo');
   const BG = await loadBgGeo();
   if (BG) {
     dlog('requestPermissions: BG truthy, about to call addWatcher');
