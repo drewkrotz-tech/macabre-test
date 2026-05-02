@@ -788,36 +788,15 @@ export default function App() {
     };
   }, []);
 
-  // ----- iOS-style swipe-back drag -----
-  // Real drag: the rendered view follows the user's thumb. We don't change
-  // JSX (which has 7 different view-branches each with their own root div);
-  // instead we find the topmost rendered div in the React-mounted root and
-  // mutate its transform style during the drag. On release: animate off-
-  // screen + goBack() if past 35% width or quick flick, otherwise snap back.
+  // ----- iOS-style swipe-back drag (ref-based) -----
+  // We attach a ref to a wrapper div around the keyed view (see JSX below).
+  // The drag handler mutates _dragWrapperRef.current.style.transform during
+  // touchmove. On release: animate off-screen + goBack() if past 35% width
+  // or quick flick, otherwise snap back.
+  const _dragWrapperRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    if (typeof window === 'undefined' || typeof document === 'undefined') return;
-    if (view.name === 'home') return; // nothing to drag back to from home
-
-    // Find the React mount point. main.tsx mounts to #root.
-    const root = document.getElementById('root');
-    if (!root) return;
-    // The UI lives in the .sinister-view-enter div (sibling to <FireEffect />,
-    // which is the FIRST child of #root). Translating FireEffect would only
-    // move the fire/ember background — we want the actual UI wrapper.
-    // #root has two children: <FireEffect /> first, the UI wrapper second.
-    // We want the second (last) child — that's the UI layer.
-    const target = root.lastElementChild as HTMLElement | null;
-    if (!target) return;
-
-    // Save original styles so we can restore them on cleanup.
-    const orig = {
-      transform: target.style.transform,
-      transition: target.style.transition,
-      willChange: target.style.willChange,
-    };
-    const origRootOverflow = root.style.overflowX;
-    root.style.overflowX = 'hidden';
-    target.style.willChange = 'transform';
+    if (typeof window === 'undefined') return;
+    if (view.name === 'home') return;
 
     let startX = 0, startY = 0, startT = 0;
     let tracking = false;
@@ -827,8 +806,10 @@ export default function App() {
     const screenW = () => Math.max(window.innerWidth || 320, 320);
 
     const setX = (px: number, animate: boolean) => {
-      target.style.transition = animate ? 'transform 240ms cubic-bezier(0.22, 0.61, 0.36, 1)' : 'none';
-      target.style.transform = px === 0 ? '' : 'translateX(' + px + 'px)';
+      const el = _dragWrapperRef.current;
+      if (!el) return;
+      el.style.transition = animate ? 'transform 240ms cubic-bezier(0.22, 0.61, 0.36, 1)' : 'none';
+      el.style.transform = px === 0 ? '' : 'translateX(' + px + 'px)';
     };
 
     const onStart = (e: TouchEvent) => {
@@ -851,11 +832,10 @@ export default function App() {
       const dy = tch.clientY - startY;
 
       if (axis === 'none') {
-        // Lock axis once movement exceeds 8px in either direction.
         if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return;
         if (Math.abs(dy) > Math.abs(dx)) {
           axis = 'v';
-          tracking = false; // give up; user is scrolling
+          tracking = false;
           return;
         }
         axis = 'h';
@@ -863,14 +843,12 @@ export default function App() {
       }
 
       if (!dragging) return;
-      // Only allow rightward drag. Light rubber-band on leftward.
       currentDx = dx <= 0 ? Math.max(dx / 4, -40) : dx;
       setX(currentDx, false);
     };
 
     const finish = (shouldFire: boolean) => {
       if (shouldFire) {
-        // Submit-form dirty check.
         if (view.name === 'submit') {
           try {
             const inputs = Array.from(document.querySelectorAll('input, textarea')) as Array<HTMLInputElement | HTMLTextAreaElement>;
@@ -881,13 +859,13 @@ export default function App() {
             }
           } catch { /* proceed */ }
         }
-        // Animate off-screen, then call goBack. Use a shorter duration so
-        // the new view appears quickly.
         setX(screenW(), true);
         window.setTimeout(() => {
-          // Reset transform so the next view doesn't render shifted.
-          target.style.transition = 'none';
-          target.style.transform = '';
+          const el = _dragWrapperRef.current;
+          if (el) {
+            el.style.transition = 'none';
+            el.style.transform = '';
+          }
           goBack();
         }, 220);
       } else {
@@ -900,7 +878,6 @@ export default function App() {
       tracking = false;
       if (!dragging) return;
       dragging = false;
-
       const tch = (e.changedTouches && e.changedTouches[0]);
       const endX = tch ? tch.clientX : startX + currentDx;
       const dx = endX - startX;
@@ -912,10 +889,7 @@ export default function App() {
     };
 
     const onCancel = () => {
-      if (!dragging) {
-        tracking = false;
-        return;
-      }
+      if (!dragging) { tracking = false; return; }
       tracking = false;
       dragging = false;
       finish(false);
@@ -925,19 +899,11 @@ export default function App() {
     window.addEventListener('touchmove', onMove, { passive: true });
     window.addEventListener('touchend', onEnd, { passive: true });
     window.addEventListener('touchcancel', onCancel, { passive: true });
-
     return () => {
       window.removeEventListener('touchstart', onStart);
       window.removeEventListener('touchmove', onMove);
       window.removeEventListener('touchend', onEnd);
       window.removeEventListener('touchcancel', onCancel);
-      // Restore styles
-      try {
-        target.style.transform = orig.transform;
-        target.style.transition = orig.transition;
-        target.style.willChange = orig.willChange;
-        root.style.overflowX = origRootOverflow;
-      } catch { /* element may have unmounted */ }
     };
   }, [view]);
 
@@ -1175,7 +1141,7 @@ export default function App() {
   return (
     <>
       <FireEffect />
-      <div key={viewKey} className="sinister-view-enter">
+      <div ref={_dragWrapperRef} key={viewKey} className="sinister-view-enter">
         {viewElement}
       </div>
       {showAlwaysModal && (
