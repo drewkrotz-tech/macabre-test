@@ -1,5 +1,6 @@
 // @ts-ignore — Vite handles .ttf imports as URL strings
 declare module '*.ttf' { const url: string; export default url; }
+declare module '*.jpg' { const url: string; export default url; }
 
 import { forwardRef, useEffect, useRef, useState } from 'react';
 import {
@@ -11,6 +12,7 @@ import {
   getDebugLog,
 } from './geofencing';
 import LivingHellFontUrl from './assets/Living Hell.ttf';
+import SlideMountUrl from './assets/slide-mount.jpg';
 
 // Register the Living Hell font face once at module load.
 if (typeof document !== 'undefined' && !document.getElementById('__livinghell-fontface')) {
@@ -1793,7 +1795,7 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
   onSelectState: (state: string) => void;
   onBack: () => void;
 }) {
-  // Count locations per state for THIS category. Empty states still appear.
+  // Count locations per state for THIS category.
   const counts: Record<string, number> = {};
   for (const s of sites) {
     if (s.category === category) counts[s.state] = (counts[s.state] || 0) + 1;
@@ -1801,25 +1803,17 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
 
   const [selectedIdx, setSelectedIdx] = useState<number>(0);
   const stripRef = useRef<HTMLDivElement | null>(null);
-  // Glitch trigger — random jitter event we re-fire every few seconds.
   const [glitchSeed, setGlitchSeed] = useState<number>(0);
-  // Suppress scroll-driven selectedIdx updates while we're programmatically
-  // animating to a slide (otherwise the smooth-scroll midpoints fire spurious
-  // setSelectedIdx calls during the animation).
   const programmaticScrollUntil = useRef<number>(0);
 
-  // Bigger 35mm slide mounts so the detail actually reads. Square cardboard
-  // with a 3:2 photo cutout (real Kodachrome aspect).
-  const SLIDE_W = 130;
-  const SLIDE_H = 140;
-  const SLIDE_GAP = 16;
+  // Slide dimensions. The reference JPG is 377x360 (almost square). We render
+  // bigger so the printed detail (date stamp, red number) reads.
+  const SLIDE_W = 150;
+  const SLIDE_H = 144;
+  const SLIDE_GAP = 18;
 
-  // Compute scroll position for a given slide index. Each slide is centered
-  // because of the symmetric padding-left/padding-right we apply, so the
-  // simple stride math gives the exact scroll target.
   const scrollPosFor = (idx: number) => idx * (SLIDE_W + SLIDE_GAP);
 
-  // Track the slide nearest to the strip's horizontal center on user scroll.
   const handleScroll = () => {
     if (Date.now() < programmaticScrollUntil.current) return;
     const el = stripRef.current;
@@ -1830,8 +1824,8 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
     if (clamped !== selectedIdx) setSelectedIdx(clamped);
   };
 
-  // Tap a non-center slide → smooth-scroll it to the center. Tap the center
-  // slide → drill into the state.
+  // Tap a slide: if it's the centered one, drill in. Otherwise, scroll it
+  // to the center.
   const onSlideTap = (idx: number) => {
     if (idx === selectedIdx) {
       onSelectState(US_STATES[idx]);
@@ -1844,30 +1838,23 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
     setSelectedIdx(idx);
   };
 
-  // Prev / next arrow handlers — quick state navigation without long swipes.
   const goPrev = () => {
-    const next = Math.max(0, selectedIdx - 1);
-    if (next === selectedIdx) return;
-    onSlideTap(next);
+    if (selectedIdx === 0) return;
+    onSlideTap(selectedIdx - 1);
   };
   const goNext = () => {
-    const next = Math.min(US_STATES.length - 1, selectedIdx + 1);
-    if (next === selectedIdx) return;
-    onSlideTap(next);
+    if (selectedIdx === US_STATES.length - 1) return;
+    onSlideTap(selectedIdx + 1);
   };
 
-  // Center the strip on mount so the first slide is properly centered (not
-  // pinned to the left edge from default scrollLeft = 0). After mount, re-fire
-  // when selectedIdx changes due to arrow taps.
+  // Center the strip on mount.
   useEffect(() => {
     const el = stripRef.current;
     if (!el) return;
     el.scrollLeft = scrollPosFor(selectedIdx);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Glitch loop — re-render every 2.5-5s with a fresh random seed used by
-  // the projection's jitter overlay. CSS keyframes drive the actual animation;
-  // the seed just nudges them to feel non-periodic.
+  // Glitch loop — re-fire the jitter sweep every 2.5-5s with a fresh key.
   useEffect(() => {
     let cancelled = false;
     const tick = () => {
@@ -1880,9 +1867,6 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
     return () => { cancelled = true; window.clearTimeout(id); };
   }, []);
 
-  // Block global swipe-back from grabbing horizontal swipes that start
-  // inside the filmstrip OR the projection. Without this the v1.9 swipe
-  // handler drags the whole page sideways.
   const blockGlobalSwipe = (e: React.TouchEvent) => {
     e.stopPropagation();
   };
@@ -1901,91 +1885,101 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
         }}>{categoryLabel}</div>
       </header>
 
-      {/* ========= PROJECTOR LIGHT CONE =========
-          Big warm radial glow filling the upper page, fading down. Sells
-          the "projector beam falling on the wall" effect. */}
+      {/* ===== PROJECTOR LIGHT CONE =====
+          Big warm radial glow. Fades from bright warm-yellow at the projection
+          out to nothing well past the screen edges. */}
       <div style={{
         position: 'absolute',
-        top: '2%',
+        top: '0%',
         left: '50%',
         transform: 'translateX(-50%)',
-        width: '160vw',
-        height: '85vh',
+        width: '180vw',
+        height: '95vh',
         background:
-          'radial-gradient(ellipse 60% 50% at center 40%, ' +
-            'rgba(255, 225, 175, 0.28) 0%, ' +
-            'rgba(255, 205, 130, 0.16) 25%, ' +
-            'rgba(255, 180, 100, 0.06) 50%, ' +
+          'radial-gradient(ellipse 50% 45% at center 38%, ' +
+            'rgba(255, 230, 180, 0.32) 0%, ' +
+            'rgba(255, 210, 140, 0.18) 22%, ' +
+            'rgba(255, 185, 105, 0.07) 48%, ' +
             'transparent 70%)',
         pointerEvents: 'none',
         zIndex: 0,
       }} />
 
-      {/* ========= THE PROJECTION SCREEN =========
-          Rounded corners, soft feathered edges (no hard rectangle), bright
-          warm projected image with scanlines / grain / glitch. Tappable. */}
+      {/* ===== THE PROJECTION SCREEN =====
+          A real movie/slide screen: rounded corners, feathered glow edges, the
+          projected image is bright and warm, gets glitches and flashes. NOT
+          tappable now — only the centered slide drills into the state. */}
       <div
         onTouchStart={blockGlobalSwipe}
         onTouchMove={blockGlobalSwipe}
-        onClick={() => onSelectState(currentState)}
         style={{
           position: 'relative',
-          margin: '24px auto 0',
+          margin: '20px auto 0',
           width: '90%',
           aspectRatio: '4 / 3',
-          maxHeight: '52vh',
-          // Soft feathered edge — radial mask fades the screen into the wall
-          // so it doesn't read as a hard rectangle. webkit prefix for iOS.
-          WebkitMaskImage:
-            'radial-gradient(ellipse 92% 88% at center, black 70%, transparent 100%)',
-          maskImage:
-            'radial-gradient(ellipse 92% 88% at center, black 70%, transparent 100%)',
-          cursor: 'pointer',
+          maxHeight: '50vh',
           zIndex: 1,
+          // Feather the OUTER frame edges so the screen doesn't look like a
+          // hard rectangle pasted on the wall.
+          WebkitMaskImage:
+            'radial-gradient(ellipse 100% 100% at center, black 75%, transparent 100%)',
+          maskImage:
+            'radial-gradient(ellipse 100% 100% at center, black 75%, transparent 100%)',
         }}
-        className="sinister-pressable"
       >
-        {/* Inner screen with rounded corners. Layered effects stack inside this. */}
+        {/* Inner screen — rounded corners, the projection lives here. */}
         <div style={{
           position: 'absolute',
-          inset: '4%',
-          borderRadius: 14,
+          inset: '5%',
+          borderRadius: 18,
           overflow: 'hidden',
-          backgroundColor: '#1a140a',
+          backgroundColor: '#1a1308',
           boxShadow:
-            '0 0 80px 12px rgba(255, 220, 160, 0.45), ' +
-            '0 0 180px 35px rgba(255, 200, 120, 0.22), ' +
-            '0 0 320px 80px rgba(255, 180, 100, 0.10)',
+            '0 0 100px 18px rgba(255, 225, 165, 0.5), ' +
+            '0 0 220px 50px rgba(255, 200, 125, 0.26), ' +
+            '0 0 380px 100px rgba(255, 175, 95, 0.12)',
         }}>
-          {/* Photo placeholder — warm sepia gradient (washed-out projected look) */}
+          {/* Photo placeholder — warm sepia gradient until per-state photos drop in */}
           <div style={{
             position: 'absolute',
             inset: 0,
-            background: 'radial-gradient(ellipse at center, #4a3a26 0%, #2a2014 50%, #14100a 100%)',
+            background: 'radial-gradient(ellipse at center, #5a4530 0%, #322516 50%, #14100a 100%)',
           }} />
 
-          {/* Sepia warm tint pass — projected slides have a warm cast */}
+          {/* Sepia overlay — projected slides have a warm tone */}
           <div style={{
             position: 'absolute',
             inset: 0,
-            background: 'linear-gradient(180deg, rgba(255, 200, 130, 0.12) 0%, rgba(180, 120, 70, 0.08) 100%)',
+            background: 'linear-gradient(180deg, rgba(255, 200, 130, 0.16) 0%, rgba(180, 120, 70, 0.10) 100%)',
             mixBlendMode: 'overlay',
             pointerEvents: 'none',
           }} />
 
-          {/* Vignette */}
+          {/* Vignette — focus the eye on the center */}
           <div style={{
             position: 'absolute',
             inset: 0,
-            background: 'radial-gradient(ellipse at center, transparent 40%, rgba(0,0,0,0.7) 100%)',
+            background: 'radial-gradient(ellipse at center, transparent 38%, rgba(0,0,0,0.8) 100%)',
             pointerEvents: 'none',
           }} />
 
-          {/* Animated film grain */}
+          {/* Scratched film effect — diagonal scratches via repeating gradient */}
+          <div style={{
+            position: 'absolute',
+            inset: 0,
+            backgroundImage:
+              'repeating-linear-gradient(91deg, transparent 0px, transparent 60px, rgba(255,240,200,0.08) 60.5px, transparent 61px), ' +
+              'repeating-linear-gradient(89deg, transparent 0px, transparent 130px, rgba(255,240,200,0.06) 130.4px, transparent 131px)',
+            mixBlendMode: 'screen',
+            opacity: 0.6,
+            pointerEvents: 'none',
+          }} />
+
+          {/* Animated grain */}
           <div className="projector-grain" style={{
             position: 'absolute',
             inset: 0,
-            opacity: 0.28,
+            opacity: 0.32,
             mixBlendMode: 'overlay',
             pointerEvents: 'none',
           }} />
@@ -1994,12 +1988,12 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
           <div className="projector-dust" style={{
             position: 'absolute',
             inset: 0,
-            opacity: 0.55,
+            opacity: 0.65,
             pointerEvents: 'none',
             mixBlendMode: 'screen',
           }} />
 
-          {/* Vertical jitter glitch — appears occasionally as a moving line */}
+          {/* Vertical jitter sweep — re-fired by changing key on glitchSeed */}
           <div className="projector-jitter" key={'jit-' + glitchSeed} style={{
             position: 'absolute',
             inset: 0,
@@ -2010,23 +2004,23 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
           <div style={{
             position: 'absolute',
             inset: 0,
-            backgroundImage: 'repeating-linear-gradient(0deg, rgba(0,0,0,0.18) 0px, rgba(0,0,0,0.18) 1px, transparent 1px, transparent 3px)',
+            backgroundImage: 'repeating-linear-gradient(0deg, rgba(0,0,0,0.2) 0px, rgba(0,0,0,0.2) 1px, transparent 1px, transparent 3px)',
             pointerEvents: 'none',
           }} />
 
           {/* Top-edge warm light leak */}
           <div style={{
             position: 'absolute',
-            top: 0, left: 0, right: 0, height: '50%',
-            background: 'linear-gradient(180deg, rgba(255, 190, 110, 0.22) 0%, transparent 100%)',
+            top: 0, left: 0, right: 0, height: '55%',
+            background: 'linear-gradient(180deg, rgba(255, 195, 115, 0.26) 0%, transparent 100%)',
             pointerEvents: 'none',
           }} />
 
-          {/* Brightness flash glitch — full-screen warm pulse, rare */}
+          {/* Brightness flash glitch */}
           <div className="projector-flash" style={{
             position: 'absolute',
             inset: 0,
-            backgroundColor: 'rgba(255, 230, 180, 1)',
+            backgroundColor: 'rgba(255, 235, 190, 1)',
             pointerEvents: 'none',
             mixBlendMode: 'screen',
             opacity: 0,
@@ -2040,7 +2034,7 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
             pointerEvents: 'none',
           }} />
 
-          {/* State name + count */}
+          {/* State name + count overlaid on the projection */}
           <div style={{
             position: 'absolute',
             inset: 0,
@@ -2051,23 +2045,23 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
             color: '#fff5e0',
             textAlign: 'center',
             padding: '0 16px',
-            textShadow: '0 2px 14px rgba(0,0,0,0.95), 0 0 30px rgba(0,0,0,0.7)',
+            textShadow: '0 2px 16px rgba(0,0,0,0.95), 0 0 32px rgba(0,0,0,0.7)',
             letterSpacing: '0.05em',
             pointerEvents: 'none',
           }}>
             <div style={{
-              fontSize: 'clamp(32px, 8vw, 52px)',
+              fontSize: 'clamp(34px, 8.5vw, 56px)',
               fontWeight: 700,
               fontFamily: 'system-ui, -apple-system, sans-serif',
-              lineHeight: 1.1,
+              lineHeight: 1.05,
             }}>
               {currentState.toUpperCase()}
             </div>
             <div style={{
-              marginTop: 10,
+              marginTop: 12,
               fontSize: 14,
-              letterSpacing: '0.3em',
-              opacity: 0.9,
+              letterSpacing: '0.32em',
+              opacity: 0.92,
               fontFamily: 'system-ui, -apple-system, sans-serif',
             }}>
               {countLabel}
@@ -2076,16 +2070,15 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
         </div>
       </div>
 
-      {/* ========= PREV / NEXT ARROWS =========
-          Quick navigation — way faster than swiping 50 slides. */}
+      {/* ===== PREV / NEXT ARROWS ===== */}
       <div style={{
         position: 'absolute',
-        top: 'calc(24px + 26vh - 22px)',
+        top: 'calc(20px + 25vh - 22px)',
         left: 0,
         right: 0,
         display: 'flex',
         justifyContent: 'space-between',
-        padding: '0 8px',
+        padding: '0 6px',
         pointerEvents: 'none',
         zIndex: 3,
       }}>
@@ -2096,18 +2089,19 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
           className="sinister-pressable"
           style={{
             pointerEvents: 'auto',
-            background: 'rgba(0,0,0,0.5)',
-            border: '1px solid rgba(255,220,160,0.3)',
+            background: 'rgba(0,0,0,0.55)',
+            border: '1px solid rgba(255,220,160,0.35)',
             color: '#fff',
-            width: 44,
-            height: 44,
-            borderRadius: 22,
-            fontSize: 20,
+            width: 42,
+            height: 42,
+            borderRadius: 21,
+            fontSize: 22,
             cursor: selectedIdx === 0 ? 'default' : 'pointer',
-            opacity: selectedIdx === 0 ? 0.25 : 0.85,
+            opacity: selectedIdx === 0 ? 0.2 : 0.85,
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
+            paddingBottom: 3,
           }}
         >‹</button>
         <button
@@ -2117,30 +2111,35 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
           className="sinister-pressable"
           style={{
             pointerEvents: 'auto',
-            background: 'rgba(0,0,0,0.5)',
-            border: '1px solid rgba(255,220,160,0.3)',
+            background: 'rgba(0,0,0,0.55)',
+            border: '1px solid rgba(255,220,160,0.35)',
             color: '#fff',
-            width: 44,
-            height: 44,
-            borderRadius: 22,
-            fontSize: 20,
+            width: 42,
+            height: 42,
+            borderRadius: 21,
+            fontSize: 22,
             cursor: selectedIdx === US_STATES.length - 1 ? 'default' : 'pointer',
-            opacity: selectedIdx === US_STATES.length - 1 ? 0.25 : 0.85,
+            opacity: selectedIdx === US_STATES.length - 1 ? 0.2 : 0.85,
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
+            paddingBottom: 3,
           }}
         >›</button>
       </div>
 
-      {/* ========= 35MM SLIDE FILMSTRIP ========= */}
+      {/* ===== KODACHROME SLIDE FILMSTRIP =====
+          Each slide uses the real slide reference image as its background,
+          so they look like actual cardboard mounts (not CSS approximations).
+          The state name is overlaid in the embossed text region (top of
+          the mount where the date stamp lives in the reference). */}
       <div
         onTouchStart={blockGlobalSwipe}
         onTouchMove={blockGlobalSwipe}
         onTouchEnd={blockGlobalSwipe}
         style={{
           position: 'absolute',
-          bottom: 28,
+          bottom: 30,
           left: 0,
           right: 0,
           zIndex: 2,
@@ -2156,19 +2155,23 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
             overflowX: 'auto',
             overflowY: 'hidden',
             scrollSnapType: 'x mandatory',
-            // 'normal' lets a fast flick carry across multiple slides instead
-            // of stopping at every single one — way faster scanning.
             WebkitOverflowScrolling: 'touch',
             scrollbarWidth: 'none',
             paddingLeft: 'calc(50vw - ' + (SLIDE_W / 2) + 'px)',
             paddingRight: 'calc(50vw - ' + (SLIDE_W / 2) + 'px)',
-            paddingTop: 18,
-            paddingBottom: 18,
+            paddingTop: 22,
+            paddingBottom: 22,
           }}
         >
           {US_STATES.map((state, i) => {
-            const isActive = i === selectedIdx;
+            const dist = Math.abs(i - selectedIdx);
+            const isActive = dist === 0;
             const count = counts[state] || 0;
+            // Falloff curve: distance 0 = full bright, distance 1 dim,
+            // distance 2+ very dim. Same idea as the home page filmstrip.
+            const opacity = isActive ? 1 : (dist === 1 ? 0.5 : (dist === 2 ? 0.28 : 0.15));
+            const brightness = isActive ? 1 : (dist === 1 ? 0.45 : (dist === 2 ? 0.30 : 0.22));
+            const scale = isActive ? 1.0 : (dist === 1 ? 0.86 : (dist === 2 ? 0.78 : 0.74));
             return (
               <div
                 key={state}
@@ -2179,108 +2182,67 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
                   width: SLIDE_W,
                   height: SLIDE_H,
                   scrollSnapAlign: 'center',
-                  // 'normal' = momentum carries across slides during a flick.
                   scrollSnapStop: 'normal',
-                  // Cardboard slide mount with rounded corners.
-                  backgroundColor: isActive ? BONE : '#241f17',
-                  borderRadius: 8,
-                  // Subtle cardboard texture
-                  backgroundImage: isActive
-                    ? 'linear-gradient(135deg, rgba(0,0,0,0.04) 0%, transparent 50%, rgba(0,0,0,0.08) 100%), radial-gradient(circle at 20% 80%, rgba(0,0,0,0.04) 0%, transparent 40%)'
-                    : 'linear-gradient(135deg, rgba(255,255,255,0.025) 0%, transparent 50%, rgba(0,0,0,0.4) 100%)',
-                  padding: '11px 12px 9px 12px',
-                  display: 'flex',
-                  flexDirection: 'column',
-                  alignItems: 'center',
-                  cursor: 'pointer',
-                  boxShadow: isActive
-                    ? '0 10px 22px rgba(0,0,0,0.75), 0 0 0 1px rgba(255,220,160,0.3), inset 0 1px 0 rgba(255,255,255,0.18)'
-                    : '0 3px 6px rgba(0,0,0,0.55), inset 0 1px 0 rgba(255,255,255,0.04)',
-                  transform: isActive ? 'scale(1.0)' : 'scale(0.78)',
-                  transition: 'transform 240ms ease, background-color 240ms ease, box-shadow 240ms ease, opacity 240ms ease',
-                  opacity: isActive ? 1 : 0.6,
-                  border: isActive ? '1px solid #c4bb9f' : '1px solid #0a0905',
                   position: 'relative',
+                  cursor: 'pointer',
+                  transform: 'scale(' + scale + ')',
+                  opacity: opacity,
+                  filter: 'brightness(' + brightness + ')',
+                  transition: 'transform 240ms ease, opacity 240ms ease, filter 240ms ease',
+                  // The slide image as background. background-size:contain
+                  // so the entire mount is visible regardless of slot ratio.
+                  backgroundImage: 'url(' + SlideMountUrl + ')',
+                  backgroundSize: '100% 100%',
+                  backgroundRepeat: 'no-repeat',
+                  backgroundPosition: 'center',
+                  // Soft cast shadow only when active.
+                  boxShadow: isActive
+                    ? '0 12px 26px rgba(0,0,0,0.75), 0 0 0 1px rgba(255,220,160,0.3)'
+                    : 'none',
+                  borderRadius: 4,
                 }}
               >
-                {/* Top label — state name */}
+                {/* State name overlay — sits in the embossed top-region of
+                    the slide, where the date stamp ("MAY 82") appears in
+                    the reference image. */}
                 <div style={{
-                  fontSize: 8.5,
-                  fontWeight: 700,
-                  letterSpacing: '0.12em',
-                  fontFamily: 'Georgia, "Times New Roman", serif',
-                  color: isActive ? '#3a2f1a' : '#62584a',
+                  position: 'absolute',
+                  top: '8%',
+                  left: '12%',
+                  right: '12%',
                   textAlign: 'center',
-                  width: '100%',
-                  marginBottom: 6,
+                  fontSize: 11,
+                  fontWeight: 700,
+                  letterSpacing: '0.14em',
+                  fontFamily: 'Georgia, "Times New Roman", serif',
+                  color: '#3a2f1a',
                   textTransform: 'uppercase',
                   whiteSpace: 'nowrap',
                   overflow: 'hidden',
                   textOverflow: 'ellipsis',
+                  // Subtle emboss effect — light shadow up, dark shadow down
+                  textShadow: '0 1px 0 rgba(255,255,255,0.4), 0 -1px 0 rgba(0,0,0,0.15)',
                 }}>
                   {state}
                 </div>
 
-                {/* Photo cutout — 3:2 landscape, rounded corners, embossed */}
-                <div style={{
-                  width: 102,
-                  height: 68,
-                  backgroundColor: '#0a0805',
-                  borderRadius: 4,
-                  boxShadow: 'inset 0 2px 4px rgba(0,0,0,0.95), inset 0 0 0 1px rgba(0,0,0,0.7)',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  fontSize: 11,
-                  fontWeight: 600,
-                  color: count > 0 ? '#888' : '#2a2520',
-                  fontFamily: 'system-ui, -apple-system, sans-serif',
-                }}>
-                  {count > 0 ? count : ''}
-                </div>
-
-                {/* Bottom row: Kodachrome label left + count right */}
-                <div style={{
-                  display: 'flex',
-                  width: '100%',
-                  justifyContent: 'space-between',
-                  alignItems: 'center',
-                  marginTop: 7,
-                  paddingLeft: 2,
-                  paddingRight: 2,
-                }}>
-                  <div style={{
-                    fontSize: 5.5,
-                    letterSpacing: '0.18em',
-                    fontFamily: 'Georgia, "Times New Roman", serif',
-                    color: isActive ? '#7a6a4a' : '#3a3528',
-                    textTransform: 'uppercase',
-                    fontStyle: 'italic',
-                  }}>
-                    Kodachrome
-                  </div>
-                  <div style={{
-                    fontSize: 5.5,
-                    letterSpacing: '0.15em',
-                    fontFamily: 'Georgia, "Times New Roman", serif',
-                    color: isActive ? '#7a6a4a' : '#3a3528',
-                    textTransform: 'uppercase',
-                  }}>
-                    {count === 1 ? '1 LOC' : count + ' LOCS'}
-                  </div>
-                </div>
-
-                {/* Manufacturer red dot — tiny detail, top-right corner */}
+                {/* Location count — small, sits below the photo cutout area
+                    where the slide bottom edge has its tactile shadow. */}
                 <div style={{
                   position: 'absolute',
-                  top: 6,
-                  right: 7,
-                  width: 4,
-                  height: 4,
-                  borderRadius: 2,
-                  backgroundColor: isActive ? '#a83030' : '#3a1a1a',
-                  boxShadow: isActive ? '0 0 2px rgba(168,48,48,0.6)' : 'none',
-                }} />
+                  bottom: '8%',
+                  left: '12%',
+                  right: '12%',
+                  textAlign: 'center',
+                  fontSize: 9,
+                  letterSpacing: '0.18em',
+                  fontFamily: 'Georgia, "Times New Roman", serif',
+                  color: count > 0 ? '#5a4a30' : '#8a8070',
+                  fontStyle: count === 0 ? 'italic' : 'normal',
+                  textTransform: 'uppercase',
+                }}>
+                  {count === 0 ? 'No Sites' : (count === 1 ? '1 Location' : count + ' Locations')}
+                </div>
               </div>
             );
           })}
