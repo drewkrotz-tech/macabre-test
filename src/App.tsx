@@ -2323,182 +2323,270 @@ function CategoryView({ label, color, sites, currentLocation, onSelectSite, onBa
   onBack: () => void;
 }) {
   // Search box: case-insensitive substring match against title, short
-  // description, and full description. Trims whitespace so trailing spaces
-  // don't kill matches. Empty query = show all.
+  // description, full description, and state name. Empty query = show all.
   const [query, setQuery] = useState('');
   const q = query.trim().toLowerCase();
-  const filtered = q
+  const filteredSites = q
     ? sites.filter(s =>
         s.title.toLowerCase().includes(q) ||
         s.shortDescription.toLowerCase().includes(q) ||
         s.fullDescription.toLowerCase().includes(q) ||
-        // Also match state name so "vir" filters to all Virginia sites
-        // when this view is showing a whole category across all states.
         s.state.toLowerCase().includes(q)
       )
     : sites;
 
+  // Mirror HomeView exactly: filmstrip with 3-copy looping scroll, sprocket
+  // columns sliding in lockstep, one-cell-per-gesture detent scrolling.
+  // Each cell is a SinisterSite instead of a category.
+  type Entry = { id: string; site: SinisterSite };
+  const baseSequence: Entry[] = filteredSites.map((s, i) => ({
+    id: `site-${s.id}-${i}`,
+    site: s,
+  }));
+  const cellsLooped: Entry[] = [0, 1, 2].flatMap((copy) =>
+    baseSequence.map(e => ({ ...e, id: `c${copy}-${e.id}` }))
+  );
+
+  // Same stride as HomeView so the rhythm matches.
+  const CELL_STRIDE = 248 + 16;
+  const sequenceLength = baseSequence.length;
+  const oneCopyHeight = sequenceLength * CELL_STRIDE;
+
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const sprocketLeftRef = useRef<HTMLDivElement | null>(null);
+  const sprocketRightRef = useRef<HTMLDivElement | null>(null);
+
+  // Reset to middle copy whenever the filtered set changes (e.g. user types
+  // in the search box and the sequence length changes).
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollTop = oneCopyHeight;
+  }, [oneCopyHeight]);
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    // Empty filtered list — nothing to scroll, skip wiring up gestures.
+    if (sequenceLength === 0) return;
+    let raf = 0;
+    let isAnimating = false;
+    let wheelLockUntil = 0;
+    let touchStartY = 0;
+    let touchStartScroll = 0;
+
+    const updateFocus = () => {
+      const viewportCenter = el.scrollTop + el.clientHeight / 2;
+      const cells = el.querySelectorAll<HTMLElement>('[data-cell="1"]');
+      let bestEl: HTMLElement | null = null;
+      let bestDist = Infinity;
+      cells.forEach(c => {
+        const cellCenter = c.offsetTop + c.offsetHeight / 2;
+        const dist = Math.abs(cellCenter - viewportCenter);
+        if (dist < bestDist) { bestDist = dist; bestEl = c; }
+      });
+      cells.forEach(c => {
+        c.setAttribute('data-focus', c === bestEl ? 'center' : 'off');
+      });
+    };
+
+    const SPROCKET_STRIDE = 28;
+    const updateSprockets = () => {
+      const offset = -(el.scrollTop % SPROCKET_STRIDE);
+      const transform = `translateY(${offset}px)`;
+      if (sprocketLeftRef.current) sprocketLeftRef.current.style.transform = transform;
+      if (sprocketRightRef.current) sprocketRightRef.current.style.transform = transform;
+    };
+
+    const animateTo = (target: number) => {
+      isAnimating = true;
+      const start = el.scrollTop;
+      const distance = target - start;
+      const duration = 280;
+      const startTime = performance.now();
+      const step = (now: number) => {
+        const t = Math.min(1, (now - startTime) / duration);
+        const eased = 1 - Math.pow(1 - t, 3);
+        el.scrollTop = start + distance * eased;
+        updateFocus();
+        updateSprockets();
+        if (t < 1) {
+          raf = requestAnimationFrame(step);
+        } else {
+          isAnimating = false;
+          const top = el.scrollTop;
+          if (top < oneCopyHeight * 0.5) el.scrollTop = top + oneCopyHeight;
+          else if (top > oneCopyHeight * 1.5) el.scrollTop = top - oneCopyHeight;
+          updateFocus();
+          updateSprockets();
+        }
+      };
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(step);
+    };
+
+    const advanceOneCell = (dir: 1 | -1) => {
+      if (isAnimating) return;
+      playSlide();
+      const target = el.scrollTop + dir * CELL_STRIDE;
+      animateTo(target);
+    };
+
+    const onWheel = (e: WheelEvent) => {
+      if (Math.abs(e.deltaY) < 5) return;
+      e.preventDefault();
+      const now = performance.now();
+      if (now < wheelLockUntil) return;
+      wheelLockUntil = now + 320;
+      advanceOneCell(e.deltaY > 0 ? 1 : -1);
+    };
+    const onTouchStart = (e: TouchEvent) => {
+      touchStartY = e.touches[0]?.clientY ?? 0;
+      touchStartScroll = el.scrollTop;
+    };
+    const onTouchMove = (e: TouchEvent) => {
+      e.preventDefault();
+    };
+    const onTouchEnd = (e: TouchEvent) => {
+      if (isAnimating) return;
+      const endY = e.changedTouches[0]?.clientY ?? touchStartY;
+      const delta = touchStartY - endY;
+      if (Math.abs(delta) > 25) {
+        advanceOneCell(delta > 0 ? 1 : -1);
+      } else {
+        animateTo(touchStartScroll);
+      }
+    };
+
+    el.addEventListener('wheel', onWheel, { passive: false });
+    el.addEventListener('touchstart', onTouchStart, { passive: true });
+    el.addEventListener('touchmove', onTouchMove, { passive: false });
+    el.addEventListener('touchend', onTouchEnd, { passive: true });
+
+    setTimeout(() => { updateFocus(); updateSprockets(); }, 0);
+
+    return () => {
+      el.removeEventListener('wheel', onWheel);
+      el.removeEventListener('touchstart', onTouchStart);
+      el.removeEventListener('touchmove', onTouchMove);
+      el.removeEventListener('touchend', onTouchEnd);
+      cancelAnimationFrame(raf);
+    };
+  }, [oneCopyHeight, sequenceLength]);
+
+  const handleClick = (e: Entry) => {
+    onSelectSite(e.site);
+  };
+
   return (
     <div style={S.appBg}>
-      <header style={S.header}>
-        
-        <div style={{
-          ...S.categoryViewTitle,
-          color: color,
-          textShadow: `0 0 14px ${color}cc, 0 0 28px ${color}66`,
-        }}>{label}</div>
-      </header>
-
-      {/* Search — only shown when there's at least one site to filter. With
-          zero sites the search box would just confuse, and with 1-2 sites
-          it's overkill. Threshold can be tuned later. */}
-      {sites.length >= 1 && (
-        <div style={S.searchWrap}>
-          <input
-            type="text"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search by name, city, or keyword..."
-            style={S.searchInput}
-          />
-          {query && (
-            <button
-              type="button"
-              onClick={() => setQuery('')}
-              style={S.searchClear}
-              aria-label="Clear search"
+      <div style={S.homeReelLayout}>
+        <div style={S.homeReelGroup}>
+          <div style={S.homeFilmHeader}>
+            {/* Single-line title for category pages — uses the same glitched
+                LivingHell font as the home title's bottom word, sized to fit
+                the header band. The `label` prop already handles the wording
+                (e.g. "Hauntings", "True Crime"). */}
+            <div
+              style={{
+                ...S.titleStackBottom,
+                fontFamily: '"LivingHell", "Jolly Lodger", system-ui, serif',
+                color: color,
+                textShadow: `0 0 14px ${color}cc, 0 0 28px ${color}66`,
+              }}
+              className="sinister-glitch"
+              data-text={label}
             >
-              ✕
-            </button>
-          )}
-        </div>
-      )}
+              {label}
+            </div>
+            <div style={S.bySinister}><BySinister /></div>
+          </div>
 
-      {sites.length === 0 ? (
-        <div style={S.emptyState}>
-          No sites in this state for this category yet.
-          <div style={S.emptyStateSub}>Be the first to add one — tap "Submit a Location" on the home screen.</div>
-        </div>
-      ) : filtered.length === 0 ? (
-        <div style={S.emptyState}>
-          No sites match "{query}".
-          <div style={S.emptyStateSub}>Try a different keyword.</div>
-        </div>
-      ) : (
-        <div style={{
-          // Full-width slide-tile list. Each tile is the slide-mount.png
-          // cardboard at near-full screen width, with the user's photo
-          // in the cutout, the location title in the top emboss band,
-          // and the state name in the bottom band. Vertically scrolls.
-          display: 'flex',
-          flexDirection: 'column',
-          alignItems: 'center',
-          gap: 14,
-          padding: '8px 12px 28px',
-        }}>
-          {filtered.map((site) => {
-            // Slide aspect: slide-mount.png is 300x304 (essentially square).
-            // Use 100% width capped at 380px so on tablets it doesn't blow
-            // out to absurd sizes, and use the same ~1.013 height ratio.
-            return (
-              <div
-                key={site.id}
-                onClick={() => onSelectSite(site)}
-                className="sinister-pressable"
-                style={{
-                  position: 'relative',
-                  width: '100%',
-                  maxWidth: 380,
-                  aspectRatio: '300 / 304',
-                  backgroundImage: 'url(' + SlideMountUrl + ')',
-                  backgroundSize: 'contain',
-                  backgroundRepeat: 'no-repeat',
-                  backgroundPosition: 'center',
-                  cursor: 'pointer',
-                  flexShrink: 0,
-                }}
-              >
-                {/* Photo cutout — user's submitted photo of the location.
-                    Empty/dark window if no photo (intentional, no fallback). */}
-                {site.imageUrl ? (
+          {/* Search bar sits between header and filmstrip. Hidden on empty
+              category since there's nothing to search through. */}
+          {sites.length >= 1 && (
+            <div style={{ ...S.searchWrap, marginBottom: 8 }}>
+              <input
+                type="text"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search by name, city, or keyword..."
+                style={S.searchInput}
+              />
+              {query && (
+                <button
+                  type="button"
+                  onClick={() => setQuery('')}
+                  style={S.searchClear}
+                  aria-label="Clear search"
+                >
+                  ✕
+                </button>
+              )}
+            </div>
+          )}
+
+          <div style={S.homeReelCenter}>
+            <div style={S.filmstripOuter}>
+              <SprocketColumn ref={sprocketLeftRef} side="left" />
+              <SprocketColumn ref={sprocketRightRef} side="right" />
+              <div ref={scrollRef} style={S.filmstripWrap}>
+                <div style={S.filmstripFrames}>
+                {sequenceLength === 0 ? (
                   <div style={{
-                    position: 'absolute',
-                    left: '21%',
-                    right: '19%',
-                    top: '30%',
-                    bottom: '30%',
-                    backgroundImage: 'url(' + site.imageUrl + ')',
-                    backgroundSize: 'cover',
-                    backgroundPosition: 'center',
-                    pointerEvents: 'none',
-                    overflow: 'hidden',
-                  }} />
-                ) : (
-                  <div style={{
-                    position: 'absolute',
-                    left: '21%',
-                    right: '19%',
-                    top: '30%',
-                    bottom: '30%',
-                    backgroundColor: '#0a0a0a',
-                    pointerEvents: 'none',
-                  }} />
-                )}
-                {/* Title in top cardboard band. Centered, supports up to 2
-                    lines for long location names. Lucida Console per design. */}
-                <div style={{
-                  position: 'absolute',
-                  top: '11%',
-                  left: '15%',
-                  right: '15%',
-                  height: '11%',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  textAlign: 'center',
-                  fontSize: 'clamp(16px, 4.8vw, 22px)',
-                  lineHeight: 1.05,
-                  fontFamily: '"Lucida Console", "Courier New", monospace',
-                  color: '#3a2f1a',
-                  textTransform: 'uppercase',
-                  letterSpacing: '0.06em',
-                  overflow: 'hidden',
-                  display: '-webkit-box',
-                  WebkitLineClamp: 2,
-                  WebkitBoxOrient: 'vertical',
-                  pointerEvents: 'none',
-                }}>
-                  {site.title}
-                </div>
-                {/* State name in bottom cardboard band. Same Lucida Console
-                    treatment, slightly smaller. */}
-                <div style={{
-                  position: 'absolute',
-                  bottom: '8%',
-                  left: '15%',
-                  right: '15%',
-                  height: '11%',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  textAlign: 'center',
-                  fontSize: 'clamp(13px, 4vw, 18px)',
-                  fontFamily: '"Lucida Console", "Courier New", monospace',
-                  color: '#3a2f1a',
-                  textTransform: 'uppercase',
-                  letterSpacing: '0.18em',
-                  whiteSpace: 'nowrap',
-                  overflow: 'hidden',
-                  textOverflow: 'ellipsis',
-                  pointerEvents: 'none',
-                }}>
-                  {site.state}
-                </div>
+                    color: '#bbb',
+                    fontFamily: '"Lucida Console", monospace',
+                    fontSize: 14,
+                    textAlign: 'center',
+                    padding: '40px 20px',
+                    opacity: 0.7,
+                  }}>
+                    {sites.length === 0
+                      ? 'No locations submitted yet.'
+                      : `No locations match "${query}".`}
+                  </div>
+                ) : cellsLooped.map((entry) => (
+                  <button
+                    key={entry.id}
+                    data-cell="1"
+                    className="sinister-pressable"
+                    onClick={() => handleClick(entry)}
+                    style={{
+                      ...S.filmFrame,
+                      backgroundImage: entry.site.imageUrl
+                        ? `url(${entry.site.imageUrl})`
+                        : 'linear-gradient(180deg, #1a0f0f 0%, #0a0a0a 100%)',
+                    }}
+                  >
+                    <div style={S.filmFrameOverlay} />
+                    <div style={S.filmFrameContent}>
+                      <div style={S.filmFrameLabel}>{entry.site.title}</div>
+                      <div style={S.filmFrameCount}>
+                        {entry.site.shortDescription}
+                      </div>
+                    </div>
+                  </button>
+                ))}
               </div>
-            );
-          })}
+            </div>
+          </div>
         </div>
-      )}
+      </div>
+    </div>
+
+      {/* Mirror HomeView's bottom controls so this page truly duplicates the
+          home layout — Submit button always visible, SocialBar pinned to the
+          viewport bottom. Submit goes back home then opens submit; About is
+          handled at app level. */}
+      <button
+        className="sinister-pressable"
+        onClick={onBack}
+        style={S.submitFixedButton}
+      >
+        <span style={S.submitFixedButtonText}>← Back to Categories</span>
+      </button>
+
+      <SocialBar onAbout={onBack} />
     </div>
   );
 }
