@@ -759,22 +759,36 @@ function buildStyleCss() {
   3%         { transform: translate(3px, 0); clip-path: inset(15% 0 70% 0); opacity: 0.85; }
   3.5%       { transform: translate(3px, 0); clip-path: inset(60% 0 25% 0); opacity: 0.85; }
   4.2%       { transform: translate(0, 0); opacity: 0; }
+  17%        { transform: translate(2px, 0); clip-path: inset(25% 0 55% 0); opacity: 0.85; }
+  17.6%      { transform: translate(0, 0); opacity: 0; }
   31%        { transform: translate(4px, 0); clip-path: inset(40% 0 40% 0); opacity: 0.85; }
   31.6%      { transform: translate(0, 0); opacity: 0; }
+  48%        { transform: translate(3px, 0); clip-path: inset(8% 0 70% 0); opacity: 0.85; }
+  48.5%      { transform: translate(3px, 0); clip-path: inset(55% 0 22% 0); opacity: 0.85; }
+  49.1%      { transform: translate(0, 0); opacity: 0; }
   68%        { transform: translate(2px, 1px); clip-path: inset(8% 0 78% 0); opacity: 0.85; }
   68.7%      { transform: translate(2px, 0); clip-path: inset(72% 0 12% 0); opacity: 0.85; }
   69.5%      { transform: translate(0, 0); opacity: 0; }
+  84%        { transform: translate(3px, 0); clip-path: inset(35% 0 35% 0); opacity: 0.85; }
+  84.6%      { transform: translate(0, 0); opacity: 0; }
 }
 @keyframes projector-glitch-cyan {
   0%, 100%   { transform: translate(0, 0); clip-path: inset(0 0 0 0); opacity: 0; }
   3%         { transform: translate(-3px, 0); clip-path: inset(60% 0 25% 0); opacity: 0.85; }
   3.5%       { transform: translate(-3px, 0); clip-path: inset(15% 0 70% 0); opacity: 0.85; }
   4.2%       { transform: translate(0, 0); opacity: 0; }
+  17%        { transform: translate(-2px, 0); clip-path: inset(55% 0 25% 0); opacity: 0.85; }
+  17.6%      { transform: translate(0, 0); opacity: 0; }
   31%        { transform: translate(-4px, 0); clip-path: inset(40% 0 40% 0); opacity: 0.85; }
   31.6%      { transform: translate(0, 0); opacity: 0; }
+  48%        { transform: translate(-3px, 0); clip-path: inset(55% 0 22% 0); opacity: 0.85; }
+  48.5%      { transform: translate(-3px, 0); clip-path: inset(8% 0 70% 0); opacity: 0.85; }
+  49.1%      { transform: translate(0, 0); opacity: 0; }
   68%        { transform: translate(-2px, -1px); clip-path: inset(72% 0 12% 0); opacity: 0.85; }
   68.7%      { transform: translate(-2px, 0); clip-path: inset(8% 0 78% 0); opacity: 0.85; }
   69.5%      { transform: translate(0, 0); opacity: 0; }
+  84%        { transform: translate(-3px, 0); clip-path: inset(35% 0 35% 0); opacity: 0.85; }
+  84.6%      { transform: translate(0, 0); opacity: 0; }
 }
 @keyframes projector-glitch-jitter {
   0%, 100%   { transform: translate(0, 0); }
@@ -1057,7 +1071,9 @@ export default function App() {
             prevEl.style.transition = 'none';
             prevEl.style.transform = '';
           }
-          try { playBackSound(); } catch { /* silent */ }
+          // playBackSound() not called here — goBack() resolves to a route
+          // handler (goHome / goStateListBack / goLocaleListBack) that already
+          // plays the back sound. Calling it here too caused a double-fire.
           goBack();
           // Tear down the peek layer — the new current view IS the old
           // prev view now, so we don't need a peek layer anymore.
@@ -1905,15 +1921,6 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
     setSelectedIdx(idx);
   };
 
-  const goPrev = () => {
-    const next = Math.max(0, selectedIdx - 2);
-    if (next !== selectedIdx) onSlideTap(next);
-  };
-  const goNext = () => {
-    const next = Math.min(US_STATES.length - 1, selectedIdx + 2);
-    if (next !== selectedIdx) onSlideTap(next);
-  };
-
   useEffect(() => {
     const el = stripRef.current;
     if (!el) return;
@@ -1937,11 +1944,17 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
   return (
     <div style={{ ...S.appBg, overflow: 'hidden', position: 'relative' }}>
       <header style={S.header}>
-        <div style={{
-          ...S.categoryViewTitle,
-          color: color,
-          textShadow: `0 0 14px ${color}cc, 0 0 28px ${color}66`,
-        }}>{categoryLabel}</div>
+        <div
+          style={{
+            ...S.categoryViewTitle,
+            fontFamily: '"LivingHell", "Jolly Lodger", system-ui, serif',
+            fontSize: 64,
+            color: '#FFFFFF',
+            textShadow: `0 0 20px #FFFFFF, 0 0 40px #FFFFFFaa, 2px 2px 0 #000`,
+          }}
+          className="sinister-glitch"
+          data-text={categoryLabel}
+        >{categoryLabel}</div>
       </header>
 
       {/* Soft projector light cone behind the screen */}
@@ -2016,7 +2029,16 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
                   flex: '0 0 ' + (100 / US_STATES.length) + '%',
                   height: '100%',
                   overflow: 'hidden',
+                  // Solid black sides give each slide a small black margin so
+                  // adjacent slides have a visible gap between them during
+                  // the swipe transition rather than butting up flush.
+                  paddingLeft: '4%',
+                  paddingRight: '4%',
+                  backgroundColor: '#000',
+                  boxSizing: 'border-box',
                 }}>
+                  <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none' }}>
+                  <div style={{ position: 'relative', width: '100%', height: '100%', overflow: 'hidden' }}>
                   {/* ===== Glitch image stack — three duplicate layers =====
                       Bottom: cyan-shifted, offset left, clip-pathed
                       Middle: red-shifted, offset right, clip-pathed
@@ -2089,6 +2111,8 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
                       fontFamily: 'system-ui, -apple-system, sans-serif',
                     }}>{stateLabel}</div>
                   </div>
+                  </div>
+                  </div>
                 </div>
               );
             })}
@@ -2107,7 +2131,7 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
           }} />
           <div className="projector-grain" style={{ position: 'absolute', inset: 0, opacity: 0.32, mixBlendMode: 'overlay', pointerEvents: 'none', zIndex: 4 }} />
           <div className="projector-dust" style={{ position: 'absolute', inset: 0, opacity: 0.6, pointerEvents: 'none', mixBlendMode: 'screen', zIndex: 4 }} />
-          <div className="projector-jitter" key={'jit-' + glitchSeed} style={{ position: 'absolute', inset: 0, pointerEvents: 'none', zIndex: 4 }} />
+          
           <div style={{
             position: 'absolute', inset: 0,
             backgroundImage: 'repeating-linear-gradient(0deg, rgba(0,0,0,0.2) 0px, rgba(0,0,0,0.2) 1px, transparent 1px, transparent 3px)',
@@ -2122,54 +2146,6 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
           }} />
           <div className="projector-flicker" style={{ position: 'absolute', inset: 0, backgroundColor: '#000', pointerEvents: 'none', zIndex: 4 }} />
         </div>
-      </div>
-
-      <div style={{
-        position: 'absolute',
-        top: 'calc(24px + 25vh - 22px)',
-        left: 0, right: 0,
-        display: 'flex',
-        justifyContent: 'space-between',
-        padding: '0 6px',
-        pointerEvents: 'none',
-        zIndex: 3,
-      }}>
-        <button
-          type="button"
-          onClick={goPrev}
-          disabled={selectedIdx === 0}
-          className="sinister-pressable"
-          style={{
-            pointerEvents: 'auto',
-            background: 'rgba(0,0,0,0.55)',
-            border: '1px solid rgba(255,220,160,0.35)',
-            color: '#fff',
-            width: 42, height: 42, borderRadius: 21,
-            fontSize: 22,
-            cursor: selectedIdx === 0 ? 'default' : 'pointer',
-            opacity: selectedIdx === 0 ? 0.2 : 0.85,
-            display: 'flex', alignItems: 'center', justifyContent: 'center',
-            paddingBottom: 3,
-          }}
-        >‹</button>
-        <button
-          type="button"
-          onClick={goNext}
-          disabled={selectedIdx === US_STATES.length - 1}
-          className="sinister-pressable"
-          style={{
-            pointerEvents: 'auto',
-            background: 'rgba(0,0,0,0.55)',
-            border: '1px solid rgba(255,220,160,0.35)',
-            color: '#fff',
-            width: 42, height: 42, borderRadius: 21,
-            fontSize: 22,
-            cursor: selectedIdx === US_STATES.length - 1 ? 'default' : 'pointer',
-            opacity: selectedIdx === US_STATES.length - 1 ? 0.2 : 0.85,
-            display: 'flex', alignItems: 'center', justifyContent: 'center',
-            paddingBottom: 3,
-          }}
-        >›</button>
       </div>
 
       <div
