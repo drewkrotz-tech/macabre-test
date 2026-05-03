@@ -852,16 +852,11 @@ export default function App() {
       axis = 'none';
       dragging = false;
       currentDx = 0;
-      // Stage the previous view for peek-in-from-left rendering. We do this
-      // up front (not lazily on first horizontal motion) so React has a
-      // chance to mount the layer before the user crosses the axis-lock
-      // threshold. If the stack is empty, leave prevView null and the
-      // current view will simply slide off into emptiness on a hard swipe
-      // (goBack() no-ops and we snap back via the 220ms timeout cleanup).
-      const stack = _navHistory.current;
-      if (stack.length > 0) {
-        setPrevView(stack[stack.length - 1]);
-      }
+      // NOTE: prevView is NOT staged here. Touchstart fires on every tap
+      // (including taps to scroll the page), and staging the peek layer
+      // up-front caused it to render in the background during normal
+      // page interaction. We now stage prevView only after axis-lock
+      // confirms a horizontal drag - see onMove below.
     };
 
     const onMove = (e: TouchEvent) => {
@@ -880,6 +875,14 @@ export default function App() {
         }
         axis = 'h';
         dragging = true;
+        // Now that the gesture has committed to horizontal, stage the
+        // previous view so the peek layer mounts. This is the right
+        // moment - we know the user wants to swipe back, and the layer
+        // wasn't bleeding into normal page interaction beforehand.
+        const stack = _navHistory.current;
+        if (stack.length > 0) {
+          setPrevView(stack[stack.length - 1]);
+        }
       }
 
       if (!dragging) return;
@@ -1207,35 +1210,34 @@ export default function App() {
   return (
     <>
       <FireEffect />
-      <div ref={_dragWrapperRef} style={{ willChange: 'transform', position: 'relative' }}>
-        {/* Peek-from-left layer: previous view sliding in behind the current one.
-            Fixed-positioned, lower z-index, only mounted while a drag stages it.
-            Initial transform is set inline (-30% screenW) so there's no flash
-            of un-translated content before the drag handler's first setX call. */}
-        {prevLayer && (
-          <div
-            ref={_prevWrapperRef}
-            key={`prev-${prevLayer.key}`}
-            style={{
-              position: 'fixed',
-              top: 0,
-              left: 0,
-              right: 0,
-              bottom: 0,
-              zIndex: 0,
-              transform: 'translateX(-30vw)',
-              willChange: 'transform',
-              pointerEvents: 'none',
-            }}
-          >
-            {prevLayer.element}
-          </div>
-        )}
+      {/* Peek-from-left layer rendered as a SIBLING of the drag wrapper, NOT
+          inside it. If it lived inside the wrapper, the wrapper's translateX
+          during a swipe would drag the peek layer along with the current
+          view - defeating the whole effect. As a fixed-position sibling the
+          peek layer is independent of the wrapper's transform.
+          Mounted only when prevLayer is non-null (a horizontal drag is in
+          progress and the history stack has something to peek). */}
+      {prevLayer && (
         <div
-          key={viewKey}
-          className="sinister-view-enter"
-          style={{ position: 'relative', zIndex: 1 }}
+          ref={_prevWrapperRef}
+          key={`prev-${prevLayer.key}`}
+          style={{
+            position: 'fixed',
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            zIndex: 1,
+            transform: 'translateX(-30vw)',
+            willChange: 'transform',
+            pointerEvents: 'none',
+            backgroundColor: '#0A0A0A',
+          }}
         >
+          {prevLayer.element}
+        </div>
+      )}
+      <div ref={_dragWrapperRef} style={{ willChange: 'transform', position: 'relative', zIndex: 2, backgroundColor: '#0A0A0A' }}><div key={viewKey} className="sinister-view-enter">
         {viewElement}
       </div></div>
       {showAlwaysModal && (
