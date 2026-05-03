@@ -140,7 +140,13 @@ workflows:
           # The non-testflight variant counts ALL builds including processing
           # and rejected ones, so the +1 always lands on a fresh number.
           LATEST_BUILD_NUMBER=$(app-store-connect get-latest-build-number "$APP_STORE_APP_ID" || echo "1")
-          agvtool new-marketing-version 1.9 && agvtool new-version -all $(($LATEST_BUILD_NUMBER + 1))
+          # Apple has phantom builds at numbers higher than what their API
+          # returns (build 34 was rejecting as duplicate even when API said
+          # latest was 33). Use a floor of 40 to skip past any phantoms.
+          # Bump this floor up if we ever hit a duplicate again.
+          NEXT_BUILD=$((LATEST_BUILD_NUMBER + 1))
+          if [ "$NEXT_BUILD" -lt 40 ]; then NEXT_BUILD=40; fi
+          agvtool new-marketing-version 1.9 && agvtool new-version -all "$NEXT_BUILD"
       - name: Build signed .ipa for App Store
         script: |
           cd ios/App
