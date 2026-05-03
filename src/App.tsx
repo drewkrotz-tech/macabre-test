@@ -649,6 +649,45 @@ function buildStyleCss() {
 }
 `;
 
+  // ---- Projector / slide-mount visual effects ----
+  // Used by StateListView (the projector page). The grain is an SVG
+  // turbulence pattern repeated and slowly offset; the flicker is a
+  // black overlay whose opacity pulses unpredictably.
+  css += `
+/* Hide horizontal scrollbar on the slide filmstrip on WebKit */
+.sinister-pressable::-webkit-scrollbar { display: none; }
+
+/* Animated film grain — used inside the .projector-grain layer */
+.projector-grain {
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='180' height='180'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 0.55 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+  background-size: 180px 180px;
+  animation: projector-grain-shift 600ms steps(8) infinite;
+}
+@keyframes projector-grain-shift {
+  0%   { background-position: 0 0; }
+  20%  { background-position: -40px 30px; }
+  40%  { background-position: 30px -50px; }
+  60%  { background-position: -60px 10px; }
+  80%  { background-position: 50px 40px; }
+  100% { background-position: 0 0; }
+}
+
+/* Subtle projector flicker — black overlay pulses opacity */
+.projector-flicker {
+  animation: projector-flicker-pulse 4.7s infinite;
+  opacity: 0;
+}
+@keyframes projector-flicker-pulse {
+  0%, 100% { opacity: 0; }
+  3%   { opacity: 0.06; }
+  4%   { opacity: 0; }
+  47%  { opacity: 0.04; }
+  48%  { opacity: 0; }
+  73%  { opacity: 0.08; }
+  74%  { opacity: 0; }
+}
+`;
+
   return css;
 }
 
@@ -1705,57 +1744,266 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
   onSelectState: (state: string) => void;
   onBack: () => void;
 }) {
-  // Count how many sites in this category live in each state. States with
-  // zero are still rendered (visually dimmed) so users see all 50 entries.
+  // Count locations per state for THIS category. Empty states still appear
+  // in the filmstrip (every slide is selectable regardless of count).
   const counts: Record<string, number> = {};
   for (const s of sites) {
     if (s.category === category) counts[s.state] = (counts[s.state] || 0) + 1;
   }
 
+  // Currently-projected slide index. Driven by scroll position (snap point
+  // in the center of the filmstrip).
+  const [selectedIdx, setSelectedIdx] = useState<number>(0);
+  const stripRef = useRef<HTMLDivElement | null>(null);
+
+  // Slide dimensions. Each cardboard mount is squarish (~104x120 with the
+  // photo window in the middle). Sized so 3 fit on screen at once with the
+  // center one being the active slide.
+  const SLIDE_W = 110;
+  const SLIDE_GAP = 14;
+
+  // On scroll, find the slide closest to the horizontal center of the strip.
+  const handleScroll = () => {
+    const el = stripRef.current;
+    if (!el) return;
+    const center = el.scrollLeft + el.clientWidth / 2;
+    const stride = SLIDE_W + SLIDE_GAP;
+    // The first slide's center sits at (clientWidth/2) due to padding.
+    // So the index is just (scrollLeft / stride) rounded.
+    const idx = Math.round(el.scrollLeft / stride);
+    const clamped = Math.max(0, Math.min(US_STATES.length - 1, idx));
+    if (clamped !== selectedIdx) setSelectedIdx(clamped);
+  };
+
+  // Tap a slide → smooth-scroll the strip so that slide is centered.
+  const goToSlide = (idx: number) => {
+    const el = stripRef.current;
+    if (!el) return;
+    const stride = SLIDE_W + SLIDE_GAP;
+    el.scrollTo({ left: idx * stride, behavior: 'smooth' });
+  };
+
+  const currentState = US_STATES[selectedIdx] || US_STATES[0];
+  const currentCount = counts[currentState] || 0;
+  const countLabel = currentCount === 1 ? '1 LOCATION' : currentCount + ' LOCATIONS';
+
   return (
-    <div style={S.appBg}>
+    <div style={{ ...S.appBg, overflow: 'hidden' }}>
       <header style={S.header}>
-        
         <div style={{
           ...S.categoryViewTitle,
           color: color,
           textShadow: `0 0 14px ${color}cc, 0 0 28px ${color}66`,
         }}>{categoryLabel}</div>
-        <div style={S.stateListHint}>Choose a state</div>
       </header>
 
-      {/* Filmstrip layout — 2 cells per row, each a 35mm-aspect frame with
-          Jolly Lodger name + count centered. Sprocket columns flank both
-          edges of the strip like the home filmstrip. */}
-      <div style={S.stateFilmstripOuter}>
-        <SprocketColumn side="left" />
-        <SprocketColumn side="right" />
-        <div style={S.stateFilmstripGrid}>
-          {US_STATES.map((state) => {
+      {/* ============ THE PROJECTION ============
+          A "screen" hung on a dark wall. Tappable — taps drill into the
+          state's locations list. Heavy use of layered effects to sell the
+          projector look: vignette, light bleed, scanlines, animated grain,
+          and a faint flicker. The photo backdrop is a placeholder gradient
+          for now (Drew will provide real per-state photos later). */}
+      <div
+        onClick={() => onSelectState(currentState)}
+        style={{
+          position: 'relative',
+          margin: '12px auto 0',
+          width: '88%',
+          aspectRatio: '4 / 3',
+          maxHeight: '52vh',
+          backgroundColor: '#000',
+          borderRadius: 4,
+          boxShadow:
+            '0 0 80px 20px rgba(255, 220, 160, 0.18), ' +
+            '0 0 200px 40px rgba(255, 200, 120, 0.08), ' +
+            '0 8px 24px rgba(0,0,0,0.6)',
+          overflow: 'hidden',
+          cursor: 'pointer',
+          border: '1px solid rgba(255, 220, 160, 0.15)',
+        }}
+        className="sinister-pressable"
+      >
+        {/* Photo placeholder — flat dark gradient until real photos drop in */}
+        <div style={{
+          position: 'absolute',
+          inset: 0,
+          background: 'radial-gradient(ellipse at center, #2a2a2a 0%, #1a1a1a 50%, #0d0d0d 100%)',
+        }} />
+
+        {/* Vignette — darken the edges so the eye lands on the text */}
+        <div style={{
+          position: 'absolute',
+          inset: 0,
+          background: 'radial-gradient(ellipse at center, transparent 50%, rgba(0,0,0,0.7) 100%)',
+          pointerEvents: 'none',
+        }} />
+
+        {/* Animated film grain via CSS — subtle moving noise */}
+        <div className="projector-grain" style={{
+          position: 'absolute',
+          inset: 0,
+          opacity: 0.18,
+          mixBlendMode: 'overlay',
+          pointerEvents: 'none',
+        }} />
+
+        {/* Horizontal scanlines — very faint */}
+        <div style={{
+          position: 'absolute',
+          inset: 0,
+          backgroundImage: 'repeating-linear-gradient(0deg, rgba(0,0,0,0.18) 0px, rgba(0,0,0,0.18) 1px, transparent 1px, transparent 3px)',
+          pointerEvents: 'none',
+        }} />
+
+        {/* Light leak — warm orange tint at the top edge */}
+        <div style={{
+          position: 'absolute',
+          top: 0, left: 0, right: 0, height: '40%',
+          background: 'linear-gradient(180deg, rgba(255, 180, 100, 0.12) 0%, transparent 100%)',
+          pointerEvents: 'none',
+        }} />
+
+        {/* Flicker overlay — animated via CSS keyframes */}
+        <div className="projector-flicker" style={{
+          position: 'absolute',
+          inset: 0,
+          backgroundColor: '#000',
+          pointerEvents: 'none',
+        }} />
+
+        {/* State name + count, centered */}
+        <div style={{
+          position: 'absolute',
+          inset: 0,
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'center',
+          color: '#FFFFFF',
+          textAlign: 'center',
+          padding: '0 16px',
+          textShadow: '0 2px 12px rgba(0,0,0,0.9), 0 0 24px rgba(0,0,0,0.6)',
+          letterSpacing: '0.05em',
+          pointerEvents: 'none',
+        }}>
+          <div style={{
+            fontSize: 'clamp(28px, 7vw, 44px)',
+            fontWeight: 600,
+            fontFamily: 'system-ui, -apple-system, sans-serif',
+            lineHeight: 1.1,
+          }}>
+            {currentState.toUpperCase()}
+          </div>
+          <div style={{
+            marginTop: 8,
+            fontSize: 13,
+            letterSpacing: '0.25em',
+            opacity: 0.85,
+            fontFamily: 'system-ui, -apple-system, sans-serif',
+          }}>
+            {countLabel}
+          </div>
+        </div>
+      </div>
+
+      {/* ============ THE FILMSTRIP OF SLIDES ============
+          Horizontal scroll of cardboard 35mm slide mounts. Center one is
+          highlighted (cream/white mount, raised). Off-center ones are
+          dark/dimmer. Tapping any slide scrolls it to center, which
+          updates the projection above. Snap-x for clean stops. */}
+      <div style={{
+        position: 'absolute',
+        bottom: 24,
+        left: 0,
+        right: 0,
+      }}>
+        <div
+          ref={stripRef}
+          onScroll={handleScroll}
+          style={{
+            display: 'flex',
+            gap: SLIDE_GAP + 'px',
+            overflowX: 'auto',
+            overflowY: 'hidden',
+            scrollSnapType: 'x mandatory',
+            WebkitOverflowScrolling: 'touch',
+            scrollbarWidth: 'none',
+            // Pad with half the viewport minus half a slide so first/last
+            // can sit centered on the screen.
+            paddingLeft: 'calc(50vw - ' + (SLIDE_W / 2) + 'px)',
+            paddingRight: 'calc(50vw - ' + (SLIDE_W / 2) + 'px)',
+            paddingTop: 12,
+            paddingBottom: 12,
+          }}
+        >
+          {US_STATES.map((state, i) => {
+            const isActive = i === selectedIdx;
             const count = counts[state] || 0;
-            const empty = count === 0;
             return (
-              <button
+              <div
                 key={state}
-                onClick={() => onSelectState(state)}
+                onClick={() => goToSlide(i)}
                 className="sinister-pressable"
                 style={{
-                  ...S.stateFilmCell,
-                  opacity: empty ? 0.55 : 1,
-                  filter: empty ? 'grayscale(0.5)' : 'none',
+                  flex: '0 0 auto',
+                  width: SLIDE_W,
+                  height: 124,
+                  scrollSnapAlign: 'center',
+                  scrollSnapStop: 'always',
+                  // Cardboard slide mount look. Active is BONE/cream,
+                  // inactive is dark. Active is also slightly raised.
+                  backgroundColor: isActive ? BONE : '#1a1a1a',
+                  border: isActive ? '1px solid #d8cfb8' : '1px solid #2a2a2a',
+                  borderRadius: 3,
+                  padding: '8px 10px',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'center',
+                  cursor: 'pointer',
+                  boxShadow: isActive
+                    ? '0 6px 16px rgba(0,0,0,0.7), 0 0 0 1px rgba(255,220,160,0.2)'
+                    : '0 2px 4px rgba(0,0,0,0.4)',
+                  transform: isActive ? 'scale(1.0)' : 'scale(0.9)',
+                  transition: 'transform 200ms ease, background-color 200ms ease, box-shadow 200ms ease',
+                  opacity: isActive ? 1 : 0.75,
                 }}
               >
-                <div style={S.stateFilmCellName}>
-                  <span style={empty ? undefined : {
-                    display: 'inline-block',
-                    animation: 'sinister-cell-title-pulse 3.5s ease-in-out infinite',
-                    transformOrigin: 'center center',
-                  }}>{state}</span>
+                {/* Top label — state name printed on the cardboard */}
+                <div style={{
+                  fontSize: 8,
+                  fontWeight: 700,
+                  letterSpacing: '0.15em',
+                  fontFamily: 'system-ui, -apple-system, sans-serif',
+                  color: isActive ? '#3a2f1a' : '#666',
+                  textAlign: 'center',
+                  width: '100%',
+                  marginBottom: 4,
+                  textTransform: 'uppercase',
+                  whiteSpace: 'nowrap',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                }}>
+                  {state}
                 </div>
-                <div style={S.stateFilmCellCount}>
-                  {count === 1 ? '1 Location' : `${count} Locations`}
+
+                {/* Photo window — the dark cutout in the middle of the mount */}
+                <div style={{
+                  flex: 1,
+                  width: '100%',
+                  backgroundColor: '#0a0a0a',
+                  borderRadius: 1,
+                  // Tiny placeholder content centered — just so the cutout
+                  // doesn't read as completely empty during testing.
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  fontSize: 9,
+                  color: count > 0 ? '#444' : '#222',
+                  fontFamily: 'system-ui, -apple-system, sans-serif',
+                }}>
+                  {count > 0 ? count : ''}
                 </div>
-              </button>
+              </div>
             );
           })}
         </div>
