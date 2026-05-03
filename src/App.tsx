@@ -1306,6 +1306,7 @@ export default function App() {
             sites={filtered}
             currentLocation={currentLocation}
             onSelectSite={goDetail}
+            onSubmit={goSubmit}
             onBack={goHome}
           />
         ),
@@ -2314,12 +2315,13 @@ function AboutView({ onBack }: { onBack: () => void }) {
 }
 
 // ---------- CATEGORY ----------
-function CategoryView({ label, color, sites, currentLocation, onSelectSite, onBack }: {
+function CategoryView({ label, color, sites, currentLocation, onSelectSite, onSubmit, onBack }: {
   label: string;
   color: string;
   sites: SinisterSite[];
   currentLocation: { lat: number; lng: number } | null;
   onSelectSite: (s: SinisterSite) => void;
+  onSubmit: () => void;
   onBack: () => void;
 }) {
   // Search box: case-insensitive substring match against title, short
@@ -2574,16 +2576,15 @@ function CategoryView({ label, color, sites, currentLocation, onSelectSite, onBa
       </div>
     </div>
 
-      {/* Mirror HomeView's bottom controls so this page truly duplicates the
-          home layout — Submit button always visible, SocialBar pinned to the
-          viewport bottom. Submit goes back home then opens submit; About is
-          handled at app level. */}
+      {/* Mirror HomeView's bottom controls — Submit Location button always
+          visible above the SocialBar, exactly as on the home page. This is the
+          primary CTA for populating the category. */}
       <button
         className="sinister-pressable"
-        onClick={onBack}
+        onClick={onSubmit}
         style={S.submitFixedButton}
       >
-        <span style={S.submitFixedButtonText}>← Back to Categories</span>
+        <span style={S.submitFixedButtonText}>Submit a Location</span>
       </button>
 
       <SocialBar onAbout={onBack} />
@@ -2640,16 +2641,30 @@ function DetailView({ site, currentLocation, onBack }: {
       <div style={{
         ...S.heroImage,
         backgroundImage: `url(${site.imageUrl})`,
-        border: `2px solid ${BLUE}`,
-        boxShadow: `0 0 28px ${BLUE}66, inset 0 -50px 80px ${BLACK}`,
+        border: `2px solid ${SUBMIT_RED}`,
+        boxShadow: `0 0 28px ${SUBMIT_RED}aa, 0 0 56px ${SUBMIT_RED}55, inset 0 -50px 80px ${BLACK}`,
       }} />
       <div style={S.detailBody}>
         <div style={{ ...S.detailCategory, color: color, textShadow: `0 0 12px ${color}` }}>
           {titleCase(site.category)}
         </div>
-        <div style={{ ...S.detailTitle, textShadow: `0 0 18px ${color}88` }}>{site.title}</div>
+        {/* Title styled to match the home / category page titles: LivingHell
+            font with the chromatic-aberration glitch effect. data-text mirrors
+            content for the ::before/::after pseudo-elements that drive the
+            red/cyan channel split. */}
+        <div
+          style={{
+            ...S.detailTitle,
+            fontFamily: '"LivingHell", "Jolly Lodger", system-ui, serif',
+            textShadow: `0 0 18px ${color}cc, 0 0 36px ${color}66, 2px 2px 0 ${BLACK}`,
+          }}
+          className="sinister-glitch"
+          data-text={site.title}
+        >
+          {site.title}
+        </div>
         {distMi && <div style={{ ...S.detailDistance, color: color }}>📍 {distMi} mi from you</div>}
-        <div style={{ ...S.detailDivider, backgroundColor: BLUE, boxShadow: `0 0 12px ${BLUE}` }} />
+        <div style={{ ...S.detailDivider, backgroundColor: SUBMIT_RED, boxShadow: `0 0 12px ${SUBMIT_RED}` }} />
         <div style={S.detailDescription}>
           {site.fullDescription.split('\n\n').map((para, i) => <p key={i} style={S.detailPara}>{para}</p>)}
         </div>
@@ -2657,9 +2672,9 @@ function DetailView({ site, currentLocation, onBack }: {
           onClick={handleDirections}
           style={{
             ...S.directionsButton,
-            border: `2px solid ${BLUE}`,
+            border: `2px solid ${SUBMIT_RED}`,
             color: color,
-            boxShadow: `0 0 22px ${BLUE}77, inset 0 0 14px ${BLUE}22`,
+            boxShadow: `0 0 22px ${SUBMIT_RED}aa, 0 0 44px ${SUBMIT_RED}55, inset 0 0 14px ${SUBMIT_RED}33`,
             textShadow: `0 0 10px ${color}`,
           }}
         >
