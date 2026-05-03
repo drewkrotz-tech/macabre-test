@@ -145,8 +145,8 @@ workflows:
           # latest was 33). Use a floor of 40 to skip past any phantoms.
           # Bump this floor up if we ever hit a duplicate again.
           NEXT_BUILD=$((LATEST_BUILD_NUMBER + 1))
-          if [ "$NEXT_BUILD" -lt 40 ]; then NEXT_BUILD=40; fi
-          agvtool new-marketing-version 1.9 && agvtool new-version -all "$NEXT_BUILD"
+          if [ "$NEXT_BUILD" -lt 41 ]; then NEXT_BUILD=41; fi
+          agvtool new-marketing-version 1.10 && agvtool new-version -all "$NEXT_BUILD"
       - name: Build signed .ipa for App Store
         script: |
           cd ios/App
