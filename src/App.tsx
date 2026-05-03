@@ -806,6 +806,12 @@ export default function App() {
   // touchmove. On release: animate off-screen + goBack() if past 35% width
   // or quick flick, otherwise snap back.
   const _dragWrapperRef = useRef<HTMLDivElement | null>(null);
+  // Wrapper for the previous view that peeks in from the left during a drag.
+  // Only rendered while a drag is active (prevView !== null).
+  const _prevWrapperRef = useRef<HTMLDivElement | null>(null);
+  // The previous view, exposed to JSX so we can render it as a peek layer
+  // during a swipe-back gesture. Set on drag start, cleared on drag end.
+  const [prevView, setPrevView] = useState<View | null>(null);
   useEffect(() => {
     if (typeof window === 'undefined') return;
     if (view.name === 'home') return;
@@ -819,9 +825,21 @@ export default function App() {
 
     const setX = (px: number, animate: boolean) => {
       const el = _dragWrapperRef.current;
-      if (!el) return;
-      el.style.transition = animate ? 'transform 240ms cubic-bezier(0.22, 0.61, 0.36, 1)' : 'none';
-      el.style.transform = px === 0 ? '' : 'translateX(' + px + 'px)';
+      if (el) {
+        el.style.transition = animate ? 'transform 240ms cubic-bezier(0.22, 0.61, 0.36, 1)' : 'none';
+        el.style.transform = px === 0 ? '' : 'translateX(' + px + 'px)';
+      }
+      // Drive the previous-view peek layer in lockstep. At px=0 the prev
+      // layer sits at -30% screenW (peeking from the left edge). At
+      // px=screenW the prev layer sits at 0 (fully revealed).
+      const prevEl = _prevWrapperRef.current;
+      if (prevEl) {
+        const w = screenW();
+        const ratio = Math.min(1, Math.max(0, px / w));
+        const peek = -0.3 * w + ratio * (0.3 * w);
+        prevEl.style.transition = animate ? 'transform 240ms cubic-bezier(0.22, 0.61, 0.36, 1)' : 'none';
+        prevEl.style.transform = 'translateX(' + peek + 'px)';
+      }
     };
 
     const onStart = (e: TouchEvent) => {
@@ -834,6 +852,16 @@ export default function App() {
       axis = 'none';
       dragging = false;
       currentDx = 0;
+      // Stage the previous view for peek-in-from-left rendering. We do this
+      // up front (not lazily on first horizontal motion) so React has a
+      // chance to mount the layer before the user crosses the axis-lock
+      // threshold. If the stack is empty, leave prevView null and the
+      // current view will simply slide off into emptiness on a hard swipe
+      // (goBack() no-ops and we snap back via the 220ms timeout cleanup).
+      const stack = _navHistory.current;
+      if (stack.length > 0) {
+        setPrevView(stack[stack.length - 1]);
+      }
     };
 
     const onMove = (e: TouchEvent) => {
@@ -878,10 +906,23 @@ export default function App() {
             el.style.transition = 'none';
             el.style.transform = '';
           }
+          // Reset the prev-layer transform too so the next drag starts
+          // from a known state if React keeps the node alive across
+          // renders (it shouldn't, but defensively reset anyway).
+          const prevEl = _prevWrapperRef.current;
+          if (prevEl) {
+            prevEl.style.transition = 'none';
+            prevEl.style.transform = '';
+          }
           goBack();
+          // Tear down the peek layer — the new current view IS the old
+          // prev view now, so we don't need a peek layer anymore.
+          setPrevView(null);
         }, 220);
       } else {
         setX(0, true);
+        // Snap-back finished — drop the peek layer after the animation.
+        window.setTimeout(() => { setPrevView(null); }, 260);
       }
     };
 
@@ -1059,61 +1100,74 @@ export default function App() {
   // Pick the rendered view based on current state. We assemble it into a
   // local variable rather than returning directly so we can wrap the result
   // in a keyed animation container below.
-  let viewElement: JSX.Element;
-  let viewKey: string;
-  if (view.name === 'detail') {
-    viewKey = `detail:${view.site.id}`;
-    viewElement = (
-      <DetailView
-        site={view.site}
-        currentLocation={currentLocation}
-        onBack={() => goLocaleListBack(view.site.category as CategoryKey, view.site.state)}
-      />
-    );
-  } else if (view.name === 'category') {
-    const filtered = sites.filter(s => s.category === view.category && s.state === view.state);
-    const cat = CATEGORIES.find(c => c.key === view.category);
-    viewKey = `category:${view.category}:${view.state}`;
-    viewElement = (
-      <CategoryView
-        label={`${view.state} · ${cat?.label || titleCase(view.category)}`}
-        color={CATEGORY_COLOR[view.category]}
-        sites={filtered}
-        currentLocation={currentLocation}
-        onSelectSite={goDetail}
-        onBack={() => goStateListBack(view.category)}
-      />
-    );
-  } else if (view.name === 'stateList') {
-    const cat = CATEGORIES.find(c => c.key === view.category);
-    viewKey = `stateList:${view.category}`;
-    viewElement = (
-      <StateListView
-        sites={sites}
-        category={view.category}
-        categoryLabel={cat?.label || titleCase(view.category)}
-        color={CATEGORY_COLOR[view.category]}
-        onSelectState={(state) => goCategoryState(view.category, state)}
-        onBack={goHome}
-      />
-    );
-  } else if (view.name === 'submit') {
-    viewKey = 'submit';
-    viewElement = <SubmitView currentLocation={currentLocation} onBack={goHome} />;
-  } else if (view.name === 'about') {
-    viewKey = 'about';
-    viewElement = <AboutView onBack={goHome} />;
-  } else {
-    viewKey = 'home';
-    viewElement = (
-      <HomeView
-        sites={sites}
-        onSelectCategory={goStateList}
-        onSubmit={goSubmit}
-        onAbout={goAbout}
-      />
-    );
-  }
+  // Pick the rendered view based on current state. Extracted into a helper
+  // so we can call it for both the active view AND the previous view (when
+  // a swipe-back is in progress and we need to render the peek layer).
+  const buildViewLayer = (v: View): { key: string; element: JSX.Element } => {
+    if (v.name === 'detail') {
+      return {
+        key: `detail:${v.site.id}`,
+        element: (
+          <DetailView
+            site={v.site}
+            currentLocation={currentLocation}
+            onBack={() => goLocaleListBack(v.site.category as CategoryKey, v.site.state)}
+          />
+        ),
+      };
+    } else if (v.name === 'category') {
+      const filtered = sites.filter(s => s.category === v.category && s.state === v.state);
+      const cat = CATEGORIES.find(c => c.key === v.category);
+      return {
+        key: `category:${v.category}:${v.state}`,
+        element: (
+          <CategoryView
+            label={`${v.state} · ${cat?.label || titleCase(v.category)}`}
+            color={CATEGORY_COLOR[v.category]}
+            sites={filtered}
+            currentLocation={currentLocation}
+            onSelectSite={goDetail}
+            onBack={() => goStateListBack(v.category)}
+          />
+        ),
+      };
+    } else if (v.name === 'stateList') {
+      const cat = CATEGORIES.find(c => c.key === v.category);
+      return {
+        key: `stateList:${v.category}`,
+        element: (
+          <StateListView
+            sites={sites}
+            category={v.category}
+            categoryLabel={cat?.label || titleCase(v.category)}
+            color={CATEGORY_COLOR[v.category]}
+            onSelectState={(state) => goCategoryState(v.category, state)}
+            onBack={goHome}
+          />
+        ),
+      };
+    } else if (v.name === 'submit') {
+      return { key: 'submit', element: <SubmitView currentLocation={currentLocation} onBack={goHome} /> };
+    } else if (v.name === 'about') {
+      return { key: 'about', element: <AboutView onBack={goHome} /> };
+    } else {
+      return {
+        key: 'home',
+        element: (
+          <HomeView
+            sites={sites}
+            onSelectCategory={goStateList}
+            onSubmit={goSubmit}
+            onAbout={goAbout}
+          />
+        ),
+      };
+    }
+  };
+
+  const { key: viewKey, element: viewElement } = buildViewLayer(view);
+  // Build the prev layer only when a drag is staging it. Cleared on drag end.
+  const prevLayer = prevView ? buildViewLayer(prevView) : null;
 
   // Set the document body to the app's black background once on mount.
   // Now that appBg uses a transparent background (so the fixed FireEffect
@@ -1153,7 +1207,35 @@ export default function App() {
   return (
     <>
       <FireEffect />
-      <div ref={_dragWrapperRef} style={{ willChange: 'transform' }}><div key={viewKey} className="sinister-view-enter">
+      <div ref={_dragWrapperRef} style={{ willChange: 'transform', position: 'relative' }}>
+        {/* Peek-from-left layer: previous view sliding in behind the current one.
+            Fixed-positioned, lower z-index, only mounted while a drag stages it.
+            Initial transform is set inline (-30% screenW) so there's no flash
+            of un-translated content before the drag handler's first setX call. */}
+        {prevLayer && (
+          <div
+            ref={_prevWrapperRef}
+            key={`prev-${prevLayer.key}`}
+            style={{
+              position: 'fixed',
+              top: 0,
+              left: 0,
+              right: 0,
+              bottom: 0,
+              zIndex: 0,
+              transform: 'translateX(-30vw)',
+              willChange: 'transform',
+              pointerEvents: 'none',
+            }}
+          >
+            {prevLayer.element}
+          </div>
+        )}
+        <div
+          key={viewKey}
+          className="sinister-view-enter"
+          style={{ position: 'relative', zIndex: 1 }}
+        >
         {viewElement}
       </div></div>
       {showAlwaysModal && (
