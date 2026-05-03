@@ -876,7 +876,7 @@ const US_STATES: string[] = [
 type View =
   | { name: 'home' }
   | { name: 'stateList'; category: CategoryKey }
-  | { name: 'category'; category: CategoryKey; state: string }
+  | { name: 'category'; category: CategoryKey; state?: string }
   | { name: 'detail'; site: SinisterSite }
   | { name: 'submit' }
   | { name: 'about' };
@@ -1226,8 +1226,11 @@ export default function App() {
   // Centralized navigation helpers so sound playback is consistent and we
   // never forget to play the right sound on a transition.
   function goStateList(key: CategoryKey) {
+    // Skips the state-grid step entirely. Go directly to the location list
+    // for the category with no state filter; the user can refine by state
+    // (or anything else) using the search bar in CategoryView.
     playButton();
-    setView({ name: 'stateList', category: key });
+    setView({ name: 'category', category: key });
   }
   function goCategoryState(key: CategoryKey, state: string) {
     playButton();
@@ -1250,8 +1253,10 @@ export default function App() {
     setView({ name: 'home' });
   }
   function goStateListBack(key: CategoryKey) {
+    // No state grid anymore. Back from detail returns to the unified
+    // category list (all locations in that category, all states).
     playBackSound();
-    setView({ name: 'stateList', category: key });
+    setView({ name: 'category', category: key });
   }
   // Step back from detail to the locale list (e.g. Virginia hauntings),
   // not all the way to the state picker. The site carries its own state
@@ -1280,18 +1285,28 @@ export default function App() {
         ),
       };
     } else if (v.name === 'category') {
-      const filtered = sites.filter(s => s.category === v.category && s.state === v.state);
+      // Two modes: with v.state -> filter to that state only (legacy support
+      // in case any code path still routes here with a state). Without
+      // v.state -> show every location in the category across all states.
+      // The CategoryView search bar lets the user refine by state name,
+      // location title, or description.
+      const filtered = v.state
+        ? sites.filter(s => s.category === v.category && s.state === v.state)
+        : sites.filter(s => s.category === v.category);
       const cat = CATEGORIES.find(c => c.key === v.category);
+      const label = v.state
+        ? `${v.state} · ${cat?.label || titleCase(v.category)}`
+        : (cat?.label || titleCase(v.category));
       return {
-        key: `category:${v.category}:${v.state}`,
+        key: `category:${v.category}:${v.state || 'ALL'}`,
         element: (
           <CategoryView
-            label={`${v.state} · ${cat?.label || titleCase(v.category)}`}
+            label={label}
             color={CATEGORY_COLOR[v.category]}
             sites={filtered}
             currentLocation={currentLocation}
             onSelectSite={goDetail}
-            onBack={() => goStateListBack(v.category)}
+            onBack={goHome}
           />
         ),
       };
@@ -2316,7 +2331,10 @@ function CategoryView({ label, color, sites, currentLocation, onSelectSite, onBa
     ? sites.filter(s =>
         s.title.toLowerCase().includes(q) ||
         s.shortDescription.toLowerCase().includes(q) ||
-        s.fullDescription.toLowerCase().includes(q)
+        s.fullDescription.toLowerCase().includes(q) ||
+        // Also match state name so "vir" filters to all Virginia sites
+        // when this view is showing a whole category across all states.
+        s.state.toLowerCase().includes(q)
       )
     : sites;
 
