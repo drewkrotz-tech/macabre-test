@@ -1071,9 +1071,10 @@ export default function App() {
             prevEl.style.transition = 'none';
             prevEl.style.transform = '';
           }
-          // playBackSound() not called here — goBack() resolves to a route
-          // handler (goHome / goStateListBack / goLocaleListBack) that already
-          // plays the back sound. Calling it here too caused a double-fire.
+          // playBackSound() IS called here — goBack() pops the nav stack
+          // directly without going through the named route helpers, so the
+          // swipe-back path needs its own back sound trigger.
+          try { playBackSound(); } catch { /* silent */ }
           goBack();
           // Tear down the peek layer — the new current view IS the old
           // prev view now, so we don't need a peek layer anymore.
@@ -2029,16 +2030,20 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
                   flex: '0 0 ' + (100 / US_STATES.length) + '%',
                   height: '100%',
                   overflow: 'hidden',
-                  // Solid black sides give each slide a small black margin so
-                  // adjacent slides have a visible gap between them during
-                  // the swipe transition rather than butting up flush.
-                  paddingLeft: '4%',
-                  paddingRight: '4%',
                   backgroundColor: '#000',
-                  boxSizing: 'border-box',
                 }}>
-                  <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none' }}>
-                  <div style={{ position: 'relative', width: '100%', height: '100%', overflow: 'hidden' }}>
+                  {/* Inner content wrapper inset 4% on each side. This creates
+                      the visible black gap between projection slides during a
+                      swipe WITHOUT changing the flex layout (so the rail's
+                      transform math stays exact). */}
+                  <div style={{
+                    position: 'absolute',
+                    top: 0,
+                    bottom: 0,
+                    left: '4%',
+                    right: '4%',
+                    overflow: 'hidden',
+                  }}>
                   {/* ===== Glitch image stack — three duplicate layers =====
                       Bottom: cyan-shifted, offset left, clip-pathed
                       Middle: red-shifted, offset right, clip-pathed
@@ -2110,7 +2115,6 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
                       opacity: 0.92,
                       fontFamily: 'system-ui, -apple-system, sans-serif',
                     }}>{stateLabel}</div>
-                  </div>
                   </div>
                   </div>
                 </div>
@@ -2210,15 +2214,17 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
                 {categoryPhoto && (
                   <div style={{
                     position: 'absolute',
-                    left: '22%',
-                    right: '17%',
-                    top: '33%',
-                    bottom: '27%',
+                    // Cutout coords measured from the slide-mount.png cutout.
+                    left: '21%',
+                    right: '19%',
+                    top: '30%',
+                    bottom: '30%',
                     backgroundImage: 'url(' + categoryPhoto + ')',
                     backgroundSize: 'cover',
                     backgroundPosition: 'center',
                     filter: 'sepia(0.4) saturate(0.7) brightness(0.6)',
                     pointerEvents: 'none',
+                    overflow: 'hidden',
                   }} />
                 )}
                 <div style={{
