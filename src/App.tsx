@@ -1800,15 +1800,24 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
     if (s.category === category) counts[s.state] = (counts[s.state] || 0) + 1;
   }
 
+  const categoryPhoto = CATEGORIES.find(c => c.key === category)?.image || '';
+
   const [selectedIdx, setSelectedIdx] = useState<number>(0);
+
+  // Slide-drop transition state. Two stacked layers in the projection
+  // during a transition: outgoing drops down, incoming drops in from above.
+  const [settledIdx, setSettledIdx] = useState<number>(0);
+  const [outgoingIdx, setOutgoingIdx] = useState<number | null>(null);
+  const [incomingIdx, setIncomingIdx] = useState<number | null>(null);
+  const [transitionPhase, setTransitionPhase] = useState<'idle' | 'dropOut' | 'gap' | 'dropIn'>('idle');
+
   const stripRef = useRef<HTMLDivElement | null>(null);
   const [glitchSeed, setGlitchSeed] = useState<number>(0);
   const programmaticScrollUntil = useRef<number>(0);
 
-  // Slide dimensions match the source PNG aspect ratio (300x304, ~square).
-  const SLIDE_W = 150;
-  const SLIDE_H = 152;
-  const SLIDE_GAP = 18;
+  const SLIDE_W = 300;
+  const SLIDE_H = 304;
+  const SLIDE_GAP = 24;
 
   const scrollPosFor = (idx: number) => idx * (SLIDE_W + SLIDE_GAP);
 
@@ -1822,7 +1831,36 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
     if (clamped !== selectedIdx) setSelectedIdx(clamped);
   };
 
-  // Tap centered slide -> drill in. Tap non-centered slide -> scroll to center.
+  // Slide drop transition. Phase A: outgoing drops down (250ms).
+  // Phase B: black gap (80ms). Phase C: incoming drops in from above (280ms).
+  // First mount: selectedIdx === settledIdx === 0, so this useEffect is a
+  // no-op and the first slide is on screen with no animation. The transition
+  // only fires on actual changes.
+  useEffect(() => {
+    if (selectedIdx === settledIdx) return;
+    setOutgoingIdx(settledIdx);
+    setIncomingIdx(null);
+    setTransitionPhase('dropOut');
+    const timers: number[] = [];
+    const t1 = window.setTimeout(() => {
+      setTransitionPhase('gap');
+      const t2 = window.setTimeout(() => {
+        setIncomingIdx(selectedIdx);
+        setTransitionPhase('dropIn');
+        const t3 = window.setTimeout(() => {
+          setSettledIdx(selectedIdx);
+          setOutgoingIdx(null);
+          setIncomingIdx(null);
+          setTransitionPhase('idle');
+        }, 280);
+        timers.push(t3);
+      }, 80);
+      timers.push(t2);
+    }, 250);
+    timers.push(t1);
+    return () => { timers.forEach(t => window.clearTimeout(t)); };
+  }, [selectedIdx, settledIdx]);
+
   const onSlideTap = (idx: number) => {
     if (idx === selectedIdx) {
       onSelectState(US_STATES[idx]);
@@ -1835,8 +1873,14 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
     setSelectedIdx(idx);
   };
 
-  const goPrev = () => { if (selectedIdx > 0) onSlideTap(selectedIdx - 1); };
-  const goNext = () => { if (selectedIdx < US_STATES.length - 1) onSlideTap(selectedIdx + 1); };
+  const goPrev = () => {
+    const next = Math.max(0, selectedIdx - 2);
+    if (next !== selectedIdx) onSlideTap(next);
+  };
+  const goNext = () => {
+    const next = Math.min(US_STATES.length - 1, selectedIdx + 2);
+    if (next !== selectedIdx) onSlideTap(next);
+  };
 
   useEffect(() => {
     const el = stripRef.current;
@@ -1844,7 +1888,6 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
     el.scrollLeft = scrollPosFor(selectedIdx);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Glitch loop — re-fire jitter every 2.5-5s with a fresh key.
   useEffect(() => {
     let cancelled = false;
     const tick = () => {
@@ -1858,9 +1901,95 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
 
   const blockGlobalSwipe = (e: React.TouchEvent) => { e.stopPropagation(); };
 
-  const currentState = US_STATES[selectedIdx] || US_STATES[0];
-  const currentCount = counts[currentState] || 0;
-  const countLabel = currentCount === 1 ? '1 LOCATION' : currentCount + ' LOCATIONS';
+  // Render one stacked layer of the projection at a given Y transform/blur.
+  // Used three ways: idle settled slide, outgoing slide, incoming slide.
+  const renderProjectionLayer = (
+    layerIdx: number | null,
+    transform: string,
+    blur: number,
+    transition: string,
+    zIndex: number,
+  ) => {
+    if (layerIdx === null) return null;
+    const layerState = US_STATES[layerIdx] || US_STATES[0];
+    const layerCount = counts[layerState] || 0;
+    const layerLabel = layerCount === 1 ? '1 LOCATION' : layerCount + ' LOCATIONS';
+    return (
+      <div style={{
+        position: 'absolute', inset: 0,
+        transform: transform,
+        filter: blur > 0 ? 'blur(' + blur + 'px)' : 'none',
+        transition: transition,
+        zIndex: zIndex,
+        willChange: 'transform, filter',
+      }}>
+        <div style={{
+          position: 'absolute', inset: 0,
+          backgroundImage: categoryPhoto ? 'url(' + categoryPhoto + ')' : 'none',
+          backgroundSize: 'cover',
+          backgroundPosition: 'center',
+          filter: 'sepia(0.35) saturate(0.85) brightness(0.85) contrast(1.05)',
+        }} />
+        <div style={{
+          position: 'absolute', inset: 0,
+          background: 'linear-gradient(180deg, rgba(255, 200, 130, 0.18) 0%, rgba(180, 120, 70, 0.10) 100%)',
+          mixBlendMode: 'overlay',
+          pointerEvents: 'none',
+        }} />
+        <div style={{
+          position: 'absolute', inset: 0,
+          background: 'radial-gradient(ellipse at center, transparent 38%, rgba(0,0,0,0.85) 100%)',
+          pointerEvents: 'none',
+        }} />
+        <div style={{
+          position: 'absolute', inset: 0,
+          display: 'flex', flexDirection: 'column',
+          alignItems: 'center', justifyContent: 'center',
+          color: '#fff5e0', textAlign: 'center', padding: '0 16px',
+          textShadow: '0 2px 16px rgba(0,0,0,0.95), 0 0 32px rgba(0,0,0,0.7)',
+          letterSpacing: '0.05em',
+          pointerEvents: 'none',
+        }}>
+          <div style={{
+            fontSize: 'clamp(34px, 8.5vw, 56px)',
+            fontWeight: 700,
+            fontFamily: 'system-ui, -apple-system, sans-serif',
+            lineHeight: 1.05,
+          }}>{layerState.toUpperCase()}</div>
+          <div style={{
+            marginTop: 12,
+            fontSize: 14,
+            letterSpacing: '0.32em',
+            opacity: 0.92,
+            fontFamily: 'system-ui, -apple-system, sans-serif',
+          }}>{layerLabel}</div>
+        </div>
+      </div>
+    );
+  };
+
+  // Transforms for outgoing/incoming based on transition phase.
+  let outgoingTransform = 'translateY(0)';
+  let outgoingBlur = 0;
+  let outgoingTransition = 'none';
+  if (transitionPhase === 'dropOut') {
+    outgoingTransform = 'translateY(120%)';
+    outgoingBlur = 4;
+    outgoingTransition = 'transform 250ms cubic-bezier(0.55, 0.05, 0.7, 0.4), filter 250ms ease-out';
+  } else if (transitionPhase === 'gap' || transitionPhase === 'dropIn') {
+    outgoingTransform = 'translateY(120%)';
+    outgoingBlur = 4;
+    outgoingTransition = 'none';
+  }
+
+  let incomingTransform = 'translateY(-120%)';
+  let incomingBlur = 4;
+  let incomingTransition = 'none';
+  if (transitionPhase === 'dropIn') {
+    incomingTransform = 'translateY(0)';
+    incomingBlur = 0;
+    incomingTransition = 'transform 280ms cubic-bezier(0.3, 0.6, 0.4, 1), filter 280ms ease-in';
+  }
 
   return (
     <div style={{ ...S.appBg, overflow: 'hidden', position: 'relative' }}>
@@ -1872,139 +2001,82 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
         }}>{categoryLabel}</div>
       </header>
 
-      {/* Projector light cone */}
       <div style={{
         position: 'absolute',
-        top: '0%',
+        top: '8%',
         left: '50%',
         transform: 'translateX(-50%)',
-        width: '180vw',
-        height: '95vh',
+        width: '140vw',
+        height: '60vh',
         background:
-          'radial-gradient(ellipse 50% 45% at center 38%, ' +
-            'rgba(255, 230, 180, 0.32) 0%, ' +
-            'rgba(255, 210, 140, 0.18) 22%, ' +
-            'rgba(255, 185, 105, 0.07) 48%, ' +
-            'transparent 70%)',
+          'radial-gradient(ellipse 45% 40% at center 45%, ' +
+            'rgba(255, 230, 180, 0.18) 0%, ' +
+            'rgba(255, 210, 140, 0.10) 30%, ' +
+            'rgba(255, 185, 105, 0.04) 55%, ' +
+            'transparent 75%)',
         pointerEvents: 'none',
         zIndex: 0,
       }} />
 
-      {/* Projection screen — display-only (NOT clickable). Tap is on the slide. */}
       <div
         onTouchStart={blockGlobalSwipe}
         onTouchMove={blockGlobalSwipe}
         style={{
           position: 'relative',
-          margin: '20px auto 0',
-          width: '90%',
+          margin: '24px auto 0',
+          width: '92%',
           aspectRatio: '4 / 3',
           maxHeight: '50vh',
           zIndex: 1,
-          WebkitMaskImage: 'radial-gradient(ellipse 100% 100% at center, black 75%, transparent 100%)',
-          maskImage: 'radial-gradient(ellipse 100% 100% at center, black 75%, transparent 100%)',
+          WebkitMaskImage:
+            'radial-gradient(ellipse 75% 78% at center, black 30%, rgba(0,0,0,0.7) 60%, transparent 92%)',
+          maskImage:
+            'radial-gradient(ellipse 75% 78% at center, black 30%, rgba(0,0,0,0.7) 60%, transparent 92%)',
         }}
       >
         <div style={{
           position: 'absolute',
-          inset: '5%',
-          borderRadius: 18,
+          inset: '6%',
+          borderRadius: 16,
           overflow: 'hidden',
-          backgroundColor: '#1a1308',
-          boxShadow:
-            '0 0 100px 18px rgba(255, 225, 165, 0.5), ' +
-            '0 0 220px 50px rgba(255, 200, 125, 0.26), ' +
-            '0 0 380px 100px rgba(255, 175, 95, 0.12)',
+          backgroundColor: '#0a0805',
         }}>
+          {transitionPhase === 'idle' && renderProjectionLayer(settledIdx, 'translateY(0)', 0, 'none', 1)}
+          {outgoingIdx !== null && renderProjectionLayer(outgoingIdx, outgoingTransform, outgoingBlur, outgoingTransition, 2)}
+          {incomingIdx !== null && renderProjectionLayer(incomingIdx, incomingTransform, incomingBlur, incomingTransition, 3)}
+
           <div style={{
-            position: 'absolute',
-            inset: 0,
-            background: 'radial-gradient(ellipse at center, #5a4530 0%, #322516 50%, #14100a 100%)',
-          }} />
-          <div style={{
-            position: 'absolute',
-            inset: 0,
-            background: 'linear-gradient(180deg, rgba(255, 200, 130, 0.16) 0%, rgba(180, 120, 70, 0.10) 100%)',
-            mixBlendMode: 'overlay',
-            pointerEvents: 'none',
-          }} />
-          <div style={{
-            position: 'absolute',
-            inset: 0,
-            background: 'radial-gradient(ellipse at center, transparent 38%, rgba(0,0,0,0.8) 100%)',
-            pointerEvents: 'none',
-          }} />
-          <div style={{
-            position: 'absolute',
-            inset: 0,
+            position: 'absolute', inset: 0,
             backgroundImage:
               'repeating-linear-gradient(91deg, transparent 0px, transparent 60px, rgba(255,240,200,0.08) 60.5px, transparent 61px), ' +
               'repeating-linear-gradient(89deg, transparent 0px, transparent 130px, rgba(255,240,200,0.06) 130.4px, transparent 131px)',
             mixBlendMode: 'screen',
-            opacity: 0.6,
+            opacity: 0.55,
             pointerEvents: 'none',
+            zIndex: 4,
           }} />
-          <div className="projector-grain" style={{ position: 'absolute', inset: 0, opacity: 0.32, mixBlendMode: 'overlay', pointerEvents: 'none' }} />
-          <div className="projector-dust" style={{ position: 'absolute', inset: 0, opacity: 0.65, pointerEvents: 'none', mixBlendMode: 'screen' }} />
-          <div className="projector-jitter" key={'jit-' + glitchSeed} style={{ position: 'absolute', inset: 0, pointerEvents: 'none' }} />
+          <div className="projector-grain" style={{ position: 'absolute', inset: 0, opacity: 0.32, mixBlendMode: 'overlay', pointerEvents: 'none', zIndex: 4 }} />
+          <div className="projector-dust" style={{ position: 'absolute', inset: 0, opacity: 0.6, pointerEvents: 'none', mixBlendMode: 'screen', zIndex: 4 }} />
+          <div className="projector-jitter" key={'jit-' + glitchSeed} style={{ position: 'absolute', inset: 0, pointerEvents: 'none', zIndex: 4 }} />
           <div style={{
-            position: 'absolute',
-            inset: 0,
+            position: 'absolute', inset: 0,
             backgroundImage: 'repeating-linear-gradient(0deg, rgba(0,0,0,0.2) 0px, rgba(0,0,0,0.2) 1px, transparent 1px, transparent 3px)',
             pointerEvents: 'none',
-          }} />
-          <div style={{
-            position: 'absolute',
-            top: 0, left: 0, right: 0, height: '55%',
-            background: 'linear-gradient(180deg, rgba(255, 195, 115, 0.26) 0%, transparent 100%)',
-            pointerEvents: 'none',
+            zIndex: 4,
           }} />
           <div className="projector-flash" style={{
             position: 'absolute', inset: 0,
             backgroundColor: 'rgba(255, 235, 190, 1)',
             pointerEvents: 'none', mixBlendMode: 'screen', opacity: 0,
+            zIndex: 4,
           }} />
-          <div className="projector-flicker" style={{ position: 'absolute', inset: 0, backgroundColor: '#000', pointerEvents: 'none' }} />
-
-          <div style={{
-            position: 'absolute',
-            inset: 0,
-            display: 'flex',
-            flexDirection: 'column',
-            alignItems: 'center',
-            justifyContent: 'center',
-            color: '#fff5e0',
-            textAlign: 'center',
-            padding: '0 16px',
-            textShadow: '0 2px 16px rgba(0,0,0,0.95), 0 0 32px rgba(0,0,0,0.7)',
-            letterSpacing: '0.05em',
-            pointerEvents: 'none',
-          }}>
-            <div style={{
-              fontSize: 'clamp(34px, 8.5vw, 56px)',
-              fontWeight: 700,
-              fontFamily: 'system-ui, -apple-system, sans-serif',
-              lineHeight: 1.05,
-            }}>
-              {currentState.toUpperCase()}
-            </div>
-            <div style={{
-              marginTop: 12,
-              fontSize: 14,
-              letterSpacing: '0.32em',
-              opacity: 0.92,
-              fontFamily: 'system-ui, -apple-system, sans-serif',
-            }}>
-              {countLabel}
-            </div>
-          </div>
+          <div className="projector-flicker" style={{ position: 'absolute', inset: 0, backgroundColor: '#000', pointerEvents: 'none', zIndex: 4 }} />
         </div>
       </div>
 
-      {/* Prev / next arrows */}
       <div style={{
         position: 'absolute',
-        top: 'calc(20px + 25vh - 22px)',
+        top: 'calc(24px + 25vh - 22px)',
         left: 0, right: 0,
         display: 'flex',
         justifyContent: 'space-between',
@@ -2050,13 +2122,6 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
         >›</button>
       </div>
 
-      {/* ===== KODACHROME SLIDE FILMSTRIP =====
-          Each slide is the real PNG as background. Black surrounding pixels
-          blend invisibly into the dark app background. State name overlay
-          sits in the cardboard top band (8-22% of image). Count overlay
-          sits in the cardboard bottom band (76-90% of image). The photo
-          cutout area (22-83% horiz, 33-73% vert) gets a small location
-          count digit only when count > 0. */}
       <div
         onTouchStart={blockGlobalSwipe}
         onTouchMove={blockGlobalSwipe}
@@ -2110,16 +2175,26 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
                   opacity: opacity,
                   filter: 'brightness(' + brightness + ')',
                   transition: 'transform 240ms ease, opacity 240ms ease, filter 240ms ease',
-                  // Real Kodachrome PNG. Surrounding pixels are pure black so
-                  // they blend invisibly into the app's dark background.
                   backgroundImage: 'url(' + SlideMountUrl + ')',
                   backgroundSize: 'contain',
                   backgroundRepeat: 'no-repeat',
                   backgroundPosition: 'center',
                 }}
               >
-                {/* State name overlay — positioned in the cardboard TOP band
-                    (8% to 22% of image height, where 'MAY 82' is in the source). */}
+                {categoryPhoto && (
+                  <div style={{
+                    position: 'absolute',
+                    left: '22%',
+                    right: '17%',
+                    top: '33%',
+                    bottom: '27%',
+                    backgroundImage: 'url(' + categoryPhoto + ')',
+                    backgroundSize: 'cover',
+                    backgroundPosition: 'center',
+                    filter: 'sepia(0.4) saturate(0.7) brightness(0.6)',
+                    pointerEvents: 'none',
+                  }} />
+                )}
                 <div style={{
                   position: 'absolute',
                   top: '11%',
@@ -2129,7 +2204,7 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'center',
-                  fontSize: 9,
+                  fontSize: 17,
                   fontWeight: 700,
                   letterSpacing: '0.16em',
                   fontFamily: 'Georgia, "Times New Roman", serif',
@@ -2143,30 +2218,6 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
                 }}>
                   {state}
                 </div>
-
-                {/* Photo cutout area — show a count digit when count > 0.
-                    Positioned at 22-83% horiz, 33-73% vert (the dark window). */}
-                {count > 0 && (
-                  <div style={{
-                    position: 'absolute',
-                    left: '22%',
-                    right: '17%',
-                    top: '33%',
-                    bottom: '27%',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    fontSize: 18,
-                    fontWeight: 700,
-                    color: 'rgba(255,220,180,0.55)',
-                    fontFamily: 'system-ui, -apple-system, sans-serif',
-                    pointerEvents: 'none',
-                  }}>
-                    {count}
-                  </div>
-                )}
-
-                {/* Count label overlay — cardboard BOTTOM band (76-90%). */}
                 <div style={{
                   position: 'absolute',
                   bottom: '8%',
@@ -2176,16 +2227,17 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'center',
-                  fontSize: 7.5,
-                  fontWeight: 600,
+                  fontSize: 13,
+                  fontWeight: 700,
                   letterSpacing: '0.18em',
                   fontFamily: 'Georgia, "Times New Roman", serif',
-                  color: count > 0 ? '#5a4a30' : '#7a7060',
+                  color: count > 0 ? '#3a2f1a' : '#5a5142',
                   fontStyle: count === 0 ? 'italic' : 'normal',
                   textTransform: 'uppercase',
                   whiteSpace: 'nowrap',
                   overflow: 'hidden',
                   textOverflow: 'ellipsis',
+                  textShadow: '0 1px 0 rgba(255,255,255,0.3)',
                   pointerEvents: 'none',
                 }}>
                   {count === 0 ? 'No Sites' : (count === 1 ? '1 Location' : count + ' Locations')}
