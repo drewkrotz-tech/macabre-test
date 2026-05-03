@@ -737,6 +737,56 @@ function buildStyleCss() {
 
 /* Hide the filmstrip's WebKit scrollbar */
 .projector-filmstrip::-webkit-scrollbar { display: none; }
+
+/* ===== Projected-image glitch =====
+   Three image layers stacked behind the main image: red-shifted, cyan-shifted,
+   and a vertical-offset jitter layer. Modeled on .sinister-glitch (the home
+   title's chromatic-aberration effect) but applied to images via duplicate
+   absolute layers instead of pseudo-elements/attr(data-text).
+   Long quiet stretches with brief glitch bursts so it reads as occasional
+   malfunction, matching the title's rhythm. */
+.projector-glitch-red {
+  animation: projector-glitch-red 4.2s infinite steps(1);
+}
+.projector-glitch-cyan {
+  animation: projector-glitch-cyan 4.2s infinite steps(1);
+}
+.projector-glitch-jitter {
+  animation: projector-glitch-jitter 4.2s infinite steps(1);
+}
+@keyframes projector-glitch-red {
+  0%, 100%   { transform: translate(0, 0); clip-path: inset(0 0 0 0); opacity: 0; }
+  3%         { transform: translate(3px, 0); clip-path: inset(15% 0 70% 0); opacity: 0.85; }
+  3.5%       { transform: translate(3px, 0); clip-path: inset(60% 0 25% 0); opacity: 0.85; }
+  4.2%       { transform: translate(0, 0); opacity: 0; }
+  31%        { transform: translate(4px, 0); clip-path: inset(40% 0 40% 0); opacity: 0.85; }
+  31.6%      { transform: translate(0, 0); opacity: 0; }
+  68%        { transform: translate(2px, 1px); clip-path: inset(8% 0 78% 0); opacity: 0.85; }
+  68.7%      { transform: translate(2px, 0); clip-path: inset(72% 0 12% 0); opacity: 0.85; }
+  69.5%      { transform: translate(0, 0); opacity: 0; }
+}
+@keyframes projector-glitch-cyan {
+  0%, 100%   { transform: translate(0, 0); clip-path: inset(0 0 0 0); opacity: 0; }
+  3%         { transform: translate(-3px, 0); clip-path: inset(60% 0 25% 0); opacity: 0.85; }
+  3.5%       { transform: translate(-3px, 0); clip-path: inset(15% 0 70% 0); opacity: 0.85; }
+  4.2%       { transform: translate(0, 0); opacity: 0; }
+  31%        { transform: translate(-4px, 0); clip-path: inset(40% 0 40% 0); opacity: 0.85; }
+  31.6%      { transform: translate(0, 0); opacity: 0; }
+  68%        { transform: translate(-2px, -1px); clip-path: inset(72% 0 12% 0); opacity: 0.85; }
+  68.7%      { transform: translate(-2px, 0); clip-path: inset(8% 0 78% 0); opacity: 0.85; }
+  69.5%      { transform: translate(0, 0); opacity: 0; }
+}
+@keyframes projector-glitch-jitter {
+  0%, 100%   { transform: translate(0, 0); }
+  3%         { transform: translate(0, 1px); }
+  3.5%       { transform: translate(0, -1px); }
+  4.2%       { transform: translate(0, 0); }
+  31%        { transform: translate(0, 1px); }
+  31.6%      { transform: translate(0, 0); }
+  68%        { transform: translate(1px, 0); }
+  68.7%      { transform: translate(-1px, 0); }
+  69.5%      { transform: translate(0, 0); }
+}
 `;
 
   return css;
@@ -1007,6 +1057,7 @@ export default function App() {
             prevEl.style.transition = 'none';
             prevEl.style.transform = '';
           }
+          try { playBackSound(); } catch { /* silent */ }
           goBack();
           // Tear down the peek layer — the new current view IS the old
           // prev view now, so we don't need a peek layer anymore.
@@ -1803,14 +1854,11 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
   const categoryPhoto = CATEGORIES.find(c => c.key === category)?.image || '';
 
   const [selectedIdx, setSelectedIdx] = useState<number>(0);
-
-  // Slide-drop transition state. Two stacked layers in the projection
-  // during a transition: outgoing drops down, incoming drops in from above.
-  const [settledIdx, setSettledIdx] = useState<number>(0);
-  const [outgoingIdx, setOutgoingIdx] = useState<number | null>(null);
-  const [incomingIdx, setIncomingIdx] = useState<number | null>(null);
-  const [transitionPhase, setTransitionPhase] = useState<'idle' | 'dropOut' | 'gap' | 'dropIn'>('idle');
-
+  // scrollProgress tracks the filmstrip scroll position as a continuous
+  // float index (e.g. 2.4 means 40% of the way from slide 2 to slide 3).
+  // The projection's image rail uses this to translate horizontally in
+  // real time as the user drags the filmstrip.
+  const [scrollProgress, setScrollProgress] = useState<number>(0);
   const stripRef = useRef<HTMLDivElement | null>(null);
   const [glitchSeed, setGlitchSeed] = useState<number>(0);
   const programmaticScrollUntil = useRef<number>(0);
@@ -1822,44 +1870,28 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
   const scrollPosFor = (idx: number) => idx * (SLIDE_W + SLIDE_GAP);
 
   const handleScroll = () => {
-    if (Date.now() < programmaticScrollUntil.current) return;
     const el = stripRef.current;
     if (!el) return;
     const stride = SLIDE_W + SLIDE_GAP;
-    const idx = Math.round(el.scrollLeft / stride);
+    const progress = el.scrollLeft / stride;
+    const clampedProgress = Math.max(0, Math.min(US_STATES.length - 1, progress));
+    setScrollProgress(clampedProgress);
+
+    if (Date.now() < programmaticScrollUntil.current) return;
+    const idx = Math.round(progress);
     const clamped = Math.max(0, Math.min(US_STATES.length - 1, idx));
     if (clamped !== selectedIdx) setSelectedIdx(clamped);
   };
 
-  // Slide drop transition. Phase A: outgoing drops down (250ms).
-  // Phase B: black gap (80ms). Phase C: incoming drops in from above (280ms).
-  // First mount: selectedIdx === settledIdx === 0, so this useEffect is a
-  // no-op and the first slide is on screen with no animation. The transition
-  // only fires on actual changes.
+  // Fire the slide sound on every integer index change (matches the home
+  // page's advanceOneCell behavior — one sound per advance, no overlapping).
+  const lastPlayedIdxRef = useRef<number>(0);
   useEffect(() => {
-    if (selectedIdx === settledIdx) return;
-    setOutgoingIdx(settledIdx);
-    setIncomingIdx(null);
-    setTransitionPhase('dropOut');
-    const timers: number[] = [];
-    const t1 = window.setTimeout(() => {
-      setTransitionPhase('gap');
-      const t2 = window.setTimeout(() => {
-        setIncomingIdx(selectedIdx);
-        setTransitionPhase('dropIn');
-        const t3 = window.setTimeout(() => {
-          setSettledIdx(selectedIdx);
-          setOutgoingIdx(null);
-          setIncomingIdx(null);
-          setTransitionPhase('idle');
-        }, 280);
-        timers.push(t3);
-      }, 80);
-      timers.push(t2);
-    }, 250);
-    timers.push(t1);
-    return () => { timers.forEach(t => window.clearTimeout(t)); };
-  }, [selectedIdx, settledIdx]);
+    if (selectedIdx !== lastPlayedIdxRef.current) {
+      lastPlayedIdxRef.current = selectedIdx;
+      try { playSlide(); } catch { /* silent */ }
+    }
+  }, [selectedIdx]);
 
   const onSlideTap = (idx: number) => {
     if (idx === selectedIdx) {
@@ -1886,6 +1918,7 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
     const el = stripRef.current;
     if (!el) return;
     el.scrollLeft = scrollPosFor(selectedIdx);
+    setScrollProgress(selectedIdx);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
@@ -1901,96 +1934,6 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
 
   const blockGlobalSwipe = (e: React.TouchEvent) => { e.stopPropagation(); };
 
-  // Render one stacked layer of the projection at a given Y transform/blur.
-  // Used three ways: idle settled slide, outgoing slide, incoming slide.
-  const renderProjectionLayer = (
-    layerIdx: number | null,
-    transform: string,
-    blur: number,
-    transition: string,
-    zIndex: number,
-  ) => {
-    if (layerIdx === null) return null;
-    const layerState = US_STATES[layerIdx] || US_STATES[0];
-    const layerCount = counts[layerState] || 0;
-    const layerLabel = layerCount === 1 ? '1 LOCATION' : layerCount + ' LOCATIONS';
-    return (
-      <div style={{
-        position: 'absolute', inset: 0,
-        transform: transform,
-        filter: blur > 0 ? 'blur(' + blur + 'px)' : 'none',
-        transition: transition,
-        zIndex: zIndex,
-        willChange: 'transform, filter',
-      }}>
-        <div style={{
-          position: 'absolute', inset: 0,
-          backgroundImage: categoryPhoto ? 'url(' + categoryPhoto + ')' : 'none',
-          backgroundSize: 'cover',
-          backgroundPosition: 'center',
-          filter: 'sepia(0.35) saturate(0.85) brightness(0.85) contrast(1.05)',
-        }} />
-        <div style={{
-          position: 'absolute', inset: 0,
-          background: 'linear-gradient(180deg, rgba(255, 200, 130, 0.18) 0%, rgba(180, 120, 70, 0.10) 100%)',
-          mixBlendMode: 'overlay',
-          pointerEvents: 'none',
-        }} />
-        <div style={{
-          position: 'absolute', inset: 0,
-          background: 'radial-gradient(ellipse at center, transparent 38%, rgba(0,0,0,0.85) 100%)',
-          pointerEvents: 'none',
-        }} />
-        <div style={{
-          position: 'absolute', inset: 0,
-          display: 'flex', flexDirection: 'column',
-          alignItems: 'center', justifyContent: 'center',
-          color: '#fff5e0', textAlign: 'center', padding: '0 16px',
-          textShadow: '0 2px 16px rgba(0,0,0,0.95), 0 0 32px rgba(0,0,0,0.7)',
-          letterSpacing: '0.05em',
-          pointerEvents: 'none',
-        }}>
-          <div style={{
-            fontSize: 'clamp(34px, 8.5vw, 56px)',
-            fontWeight: 700,
-            fontFamily: 'system-ui, -apple-system, sans-serif',
-            lineHeight: 1.05,
-          }}>{layerState.toUpperCase()}</div>
-          <div style={{
-            marginTop: 12,
-            fontSize: 14,
-            letterSpacing: '0.32em',
-            opacity: 0.92,
-            fontFamily: 'system-ui, -apple-system, sans-serif',
-          }}>{layerLabel}</div>
-        </div>
-      </div>
-    );
-  };
-
-  // Transforms for outgoing/incoming based on transition phase.
-  let outgoingTransform = 'translateY(0)';
-  let outgoingBlur = 0;
-  let outgoingTransition = 'none';
-  if (transitionPhase === 'dropOut') {
-    outgoingTransform = 'translateY(120%)';
-    outgoingBlur = 4;
-    outgoingTransition = 'transform 250ms cubic-bezier(0.55, 0.05, 0.7, 0.4), filter 250ms ease-out';
-  } else if (transitionPhase === 'gap' || transitionPhase === 'dropIn') {
-    outgoingTransform = 'translateY(120%)';
-    outgoingBlur = 4;
-    outgoingTransition = 'none';
-  }
-
-  let incomingTransform = 'translateY(-120%)';
-  let incomingBlur = 4;
-  let incomingTransition = 'none';
-  if (transitionPhase === 'dropIn') {
-    incomingTransform = 'translateY(0)';
-    incomingBlur = 0;
-    incomingTransition = 'transform 280ms cubic-bezier(0.3, 0.6, 0.4, 1), filter 280ms ease-in';
-  }
-
   return (
     <div style={{ ...S.appBg, overflow: 'hidden', position: 'relative' }}>
       <header style={S.header}>
@@ -2001,6 +1944,7 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
         }}>{categoryLabel}</div>
       </header>
 
+      {/* Soft projector light cone behind the screen */}
       <div style={{
         position: 'absolute',
         top: '8%',
@@ -2018,6 +1962,12 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
         zIndex: 0,
       }} />
 
+      {/* PROJECTION SCREEN
+          The screen is a fixed window. Inside it, a horizontal "image rail"
+          translates left/right based on filmstrip scrollProgress so the
+          image follows the user's finger 1:1 during a swipe. As the
+          filmstrip moves, the image moves the same direction by the same
+          proportion, sliding off one side and revealing the next. */}
       <div
         onTouchStart={blockGlobalSwipe}
         onTouchMove={blockGlobalSwipe}
@@ -2041,10 +1991,110 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
           overflow: 'hidden',
           backgroundColor: '#0a0805',
         }}>
-          {transitionPhase === 'idle' && renderProjectionLayer(settledIdx, 'translateY(0)', 0, 'none', 1)}
-          {outgoingIdx !== null && renderProjectionLayer(outgoingIdx, outgoingTransform, outgoingBlur, outgoingTransition, 2)}
-          {incomingIdx !== null && renderProjectionLayer(incomingIdx, incomingTransform, incomingBlur, incomingTransition, 3)}
+          {/* THE IMAGE RAIL — one image layer per state, side by side.
+              Total width = 51 * 100% = 5100%. translateX of -scrollProgress*100%
+              centers the active state's image in the viewport. */}
+          <div style={{
+            position: 'absolute',
+            top: 0,
+            left: 0,
+            height: '100%',
+            width: (US_STATES.length * 100) + '%',
+            display: 'flex',
+            transform: 'translateX(-' + (scrollProgress * 100 / US_STATES.length) + '%)',
+            // ^ Each state takes 1/51 of the rail's width (since rail is 51x parent
+            // wide and rail items each fill 1/51 of that). To center state i in
+            // the parent, translate the rail left by i * (100/51)% of itself.
+            willChange: 'transform',
+          }}>
+            {US_STATES.map((state, i) => {
+              const stateCount = counts[state] || 0;
+              const stateLabel = stateCount === 1 ? '1 LOCATION' : stateCount + ' LOCATIONS';
+              return (
+                <div key={state} style={{
+                  position: 'relative',
+                  flex: '0 0 ' + (100 / US_STATES.length) + '%',
+                  height: '100%',
+                  overflow: 'hidden',
+                }}>
+                  {/* ===== Glitch image stack — three duplicate layers =====
+                      Bottom: cyan-shifted, offset left, clip-pathed
+                      Middle: red-shifted, offset right, clip-pathed
+                      Top: clean image
+                      The bottom two animate via projector-glitch-* classes
+                      with long quiet stretches and brief glitch bursts,
+                      modeled on the home page's sinister-glitch look. */}
+                  <div className="projector-glitch-cyan" style={{
+                    position: 'absolute', inset: 0,
+                    backgroundImage: categoryPhoto ? 'url(' + categoryPhoto + ')' : 'none',
+                    backgroundSize: 'cover',
+                    backgroundPosition: 'center',
+                    filter: 'sepia(0.35) saturate(0.85) brightness(0.85) contrast(1.05) hue-rotate(155deg)',
+                    mixBlendMode: 'screen',
+                    pointerEvents: 'none',
+                    opacity: 0.85,
+                  }} />
+                  <div className="projector-glitch-red" style={{
+                    position: 'absolute', inset: 0,
+                    backgroundImage: categoryPhoto ? 'url(' + categoryPhoto + ')' : 'none',
+                    backgroundSize: 'cover',
+                    backgroundPosition: 'center',
+                    filter: 'sepia(0.35) saturate(2) brightness(0.85) hue-rotate(-30deg)',
+                    mixBlendMode: 'screen',
+                    pointerEvents: 'none',
+                    opacity: 0.85,
+                  }} />
+                  <div className="projector-glitch-jitter" style={{
+                    position: 'absolute', inset: 0,
+                    backgroundImage: categoryPhoto ? 'url(' + categoryPhoto + ')' : 'none',
+                    backgroundSize: 'cover',
+                    backgroundPosition: 'center',
+                    filter: 'sepia(0.35) saturate(0.85) brightness(0.85) contrast(1.05)',
+                  }} />
 
+                  {/* Warm projector tint */}
+                  <div style={{
+                    position: 'absolute', inset: 0,
+                    background: 'linear-gradient(180deg, rgba(255, 200, 130, 0.18) 0%, rgba(180, 120, 70, 0.10) 100%)',
+                    mixBlendMode: 'overlay',
+                    pointerEvents: 'none',
+                  }} />
+                  {/* Vignette */}
+                  <div style={{
+                    position: 'absolute', inset: 0,
+                    background: 'radial-gradient(ellipse at center, transparent 38%, rgba(0,0,0,0.85) 100%)',
+                    pointerEvents: 'none',
+                  }} />
+                  {/* State name + count overlay */}
+                  <div style={{
+                    position: 'absolute', inset: 0,
+                    display: 'flex', flexDirection: 'column',
+                    alignItems: 'center', justifyContent: 'center',
+                    color: '#fff5e0', textAlign: 'center', padding: '0 16px',
+                    textShadow: '0 2px 16px rgba(0,0,0,0.95), 0 0 32px rgba(0,0,0,0.7)',
+                    letterSpacing: '0.05em',
+                    pointerEvents: 'none',
+                  }}>
+                    <div style={{
+                      fontSize: 'clamp(34px, 8.5vw, 56px)',
+                      fontWeight: 700,
+                      fontFamily: 'system-ui, -apple-system, sans-serif',
+                      lineHeight: 1.05,
+                    }}>{state.toUpperCase()}</div>
+                    <div style={{
+                      marginTop: 12,
+                      fontSize: 14,
+                      letterSpacing: '0.32em',
+                      opacity: 0.92,
+                      fontFamily: 'system-ui, -apple-system, sans-serif',
+                    }}>{stateLabel}</div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* ===== Effects layered over the entire viewport ===== */}
           <div style={{
             position: 'absolute', inset: 0,
             backgroundImage:
