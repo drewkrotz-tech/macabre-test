@@ -2385,30 +2385,116 @@ function CategoryView({ label, color, sites, currentLocation, onSelectSite, onBa
           <div style={S.emptyStateSub}>Try a different keyword.</div>
         </div>
       ) : (
-        <div style={S.sitesContainer}>
+        <div style={{
+          // Full-width slide-tile list. Each tile is the slide-mount.png
+          // cardboard at near-full screen width, with the user's photo
+          // in the cutout, the location title in the top emboss band,
+          // and the state name in the bottom band. Vertically scrolls.
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          gap: 14,
+          padding: '8px 12px 28px',
+        }}>
           {filtered.map((site) => {
-            const distM = currentLocation ? distanceMeters(currentLocation.lat, currentLocation.lng, site.coords.lat, site.coords.lng) : null;
-            const distMi = distM ? (distM / 1609.34).toFixed(1) : null;
+            // Slide aspect: slide-mount.png is 300x304 (essentially square).
+            // Use 100% width capped at 380px so on tablets it doesn't blow
+            // out to absurd sizes, and use the same ~1.013 height ratio.
             return (
-              <button
+              <div
                 key={site.id}
                 onClick={() => onSelectSite(site)}
+                className="sinister-pressable"
                 style={{
-                  ...S.siteCard,
-                  border: `2px solid ${BLUE}`,
-                  boxShadow: `0 0 22px ${BLUE}77, 0 0 42px ${BLUE}33, inset 0 0 14px ${BLUE}22`,
+                  position: 'relative',
+                  width: '100%',
+                  maxWidth: 380,
+                  aspectRatio: '300 / 304',
+                  backgroundImage: 'url(' + SlideMountUrl + ')',
+                  backgroundSize: 'contain',
+                  backgroundRepeat: 'no-repeat',
+                  backgroundPosition: 'center',
+                  cursor: 'pointer',
+                  flexShrink: 0,
                 }}
               >
-                <div style={{ ...S.siteCardImage, backgroundImage: `url(${site.imageUrl})` }} />
-                <div style={S.siteCardBody}>
-                  <div style={{ ...S.siteCardCategory, color: color, textShadow: `0 0 10px ${color}` }}>
-                    {titleCase(site.category)}
-                  </div>
-                  <div style={S.siteCardTitle}>{site.title}</div>
-                  <div style={S.siteCardDesc}>{site.shortDescription}</div>
-                  {distMi && <div style={{ ...S.siteCardDistance, color: color }}>{distMi} mi from you</div>}
+                {/* Photo cutout — user's submitted photo of the location.
+                    Empty/dark window if no photo (intentional, no fallback). */}
+                {site.imageUrl ? (
+                  <div style={{
+                    position: 'absolute',
+                    left: '21%',
+                    right: '19%',
+                    top: '30%',
+                    bottom: '30%',
+                    backgroundImage: 'url(' + site.imageUrl + ')',
+                    backgroundSize: 'cover',
+                    backgroundPosition: 'center',
+                    pointerEvents: 'none',
+                    overflow: 'hidden',
+                  }} />
+                ) : (
+                  <div style={{
+                    position: 'absolute',
+                    left: '21%',
+                    right: '19%',
+                    top: '30%',
+                    bottom: '30%',
+                    backgroundColor: '#0a0a0a',
+                    pointerEvents: 'none',
+                  }} />
+                )}
+                {/* Title in top cardboard band. Centered, supports up to 2
+                    lines for long location names. Lucida Console per design. */}
+                <div style={{
+                  position: 'absolute',
+                  top: '11%',
+                  left: '15%',
+                  right: '15%',
+                  height: '11%',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  textAlign: 'center',
+                  fontSize: 'clamp(16px, 4.8vw, 22px)',
+                  lineHeight: 1.05,
+                  fontFamily: '"Lucida Console", "Courier New", monospace',
+                  color: '#3a2f1a',
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.06em',
+                  overflow: 'hidden',
+                  display: '-webkit-box',
+                  WebkitLineClamp: 2,
+                  WebkitBoxOrient: 'vertical',
+                  pointerEvents: 'none',
+                }}>
+                  {site.title}
                 </div>
-              </button>
+                {/* State name in bottom cardboard band. Same Lucida Console
+                    treatment, slightly smaller. */}
+                <div style={{
+                  position: 'absolute',
+                  bottom: '8%',
+                  left: '15%',
+                  right: '15%',
+                  height: '11%',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  textAlign: 'center',
+                  fontSize: 'clamp(13px, 4vw, 18px)',
+                  fontFamily: '"Lucida Console", "Courier New", monospace',
+                  color: '#3a2f1a',
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.18em',
+                  whiteSpace: 'nowrap',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  pointerEvents: 'none',
+                }}>
+                  {site.state}
+                </div>
+              </div>
             );
           })}
         </div>
