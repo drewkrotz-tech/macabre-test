@@ -798,6 +798,17 @@ export default function App() {
     if (typeof window === 'undefined') return;
     if (view.name === 'home') return;
 
+    // ----- DIAGNOSTIC: log drag events to geofencing log + visual border on target -----
+    const dlog2 = (msg: string) => {
+      try {
+        const ts = new Date().toISOString().slice(11, 19);
+        const buf = (globalThis as any).__earlyLogBuf || ((globalThis as any).__earlyLogBuf = []);
+        buf.push('[' + ts + '] DRAG: ' + msg);
+        if (buf.length > 200) buf.shift();
+      } catch {}
+    };
+    dlog2('useEffect ENTER, view=' + view.name + ', refSet=' + !!_dragWrapperRef.current);
+
     let startX = 0, startY = 0, startT = 0;
     let tracking = false;
     let axis: 'none' | 'h' | 'v' = 'none';
@@ -807,7 +818,19 @@ export default function App() {
 
     const setX = (px: number, animate: boolean) => {
       const el = _dragWrapperRef.current;
-      if (!el) return;
+      if (!el) { dlog2('setX BAILOUT — ref is null'); return; }
+      if (px !== 0 && !el.style.outline) {
+        // First nonzero call: paint a bright outline so we can SEE which element is the drag target.
+        el.style.outline = '4px solid magenta';
+        el.style.outlineOffset = '-4px';
+        const parent = el.parentElement;
+        const grand = parent?.parentElement;
+        const parentRect = parent?.getBoundingClientRect();
+        const computedParent = parent ? getComputedStyle(parent) : null;
+        dlog2('TARGET found, tag=' + el.tagName + ' class=' + (el.className||'') + ' rect=' + Math.round(el.getBoundingClientRect().width) + 'x' + Math.round(el.getBoundingClientRect().height));
+        dlog2('PARENT tag=' + parent?.tagName + ' overflow=' + computedParent?.overflow + ' position=' + computedParent?.position + ' rect=' + (parentRect ? Math.round(parentRect.width) + 'x' + Math.round(parentRect.height) : 'none'));
+        dlog2('GRANDPARENT tag=' + grand?.tagName + ' id=' + (grand?.id||''));
+      }
       el.style.transition = animate ? 'transform 240ms cubic-bezier(0.22, 0.61, 0.36, 1)' : 'none';
       el.style.transform = px === 0 ? '' : 'translateX(' + px + 'px)';
     };
@@ -840,6 +863,7 @@ export default function App() {
         }
         axis = 'h';
         dragging = true;
+        dlog2('axis locked horizontal');
       }
 
       if (!dragging) return;
@@ -848,6 +872,7 @@ export default function App() {
     };
 
     const finish = (shouldFire: boolean) => {
+      dlog2('finish shouldFire=' + shouldFire);
       if (shouldFire) {
         if (view.name === 'submit') {
           try {
