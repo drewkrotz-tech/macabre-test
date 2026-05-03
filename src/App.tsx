@@ -10,7 +10,6 @@ import {
   distanceMeters,
   setSites,
   getDebugLog,
-  getDiagnostics,
 } from './geofencing';
 import LivingHellFontUrl from './assets/Living Hell.ttf';
 import SlideMountUrl from './assets/slide-mount.png';
@@ -1057,11 +1056,12 @@ export default function App() {
             }
           } catch { /* proceed */ }
         }
-        // playBackSound() temporarily REMOVED from swipe-back to test
-        // whether it's what's causing the black flash on swipe-back-to-home.
-        // If swipe-back is now flash-free, the audio path is the culprit
-        // and we can address it in isolation. Button-press back-nav still
-        // plays the sound via goHome / goStateListBack / goLocaleListBack.
+        // Fire back sound at commit time, BEFORE the 220ms slide-off
+        // animation. Audio starts while the slide-off is animating, so by
+        // the time goBack() triggers the heavy re-render the audio is
+        // already playing smoothly. Firing it inside the setTimeout was
+        // colliding with goBack's render work and causing the black flash.
+        try { playBackSound(); } catch { /* silent */ }
         setX(screenW(), true);
         window.setTimeout(() => {
           const el = _dragWrapperRef.current;
@@ -1888,12 +1888,9 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
   const [glitchSeed, setGlitchSeed] = useState<number>(0);
   const programmaticScrollUntil = useRef<number>(0);
 
-  // Slide dimensions reduced 20% to free up vertical space and visual weight,
-  // making room for the search bar below the strip while still leaving a
-  // clear edge lane on the left for swipe-back gestures.
-  const SLIDE_W = 240;
-  const SLIDE_H = 243;
-  const SLIDE_GAP = 20;
+  const SLIDE_W = 300;
+  const SLIDE_H = 304;
+  const SLIDE_GAP = 24;
 
   const scrollPosFor = (idx: number) => idx * (SLIDE_W + SLIDE_GAP);
 
@@ -2126,27 +2123,19 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
                     letterSpacing: '0.05em',
                     pointerEvents: 'none',
                   }}>
-                    <div
-                      className="sinister-glitch"
-                      data-text={state.toUpperCase()}
-                      style={{
-                        fontSize: 'clamp(34px, 8.5vw, 56px)',
-                        fontWeight: 700,
-                        fontFamily: 'system-ui, -apple-system, sans-serif',
-                        lineHeight: 1.05,
-                      }}
-                    >{state.toUpperCase()}</div>
-                    <div
-                      className="sinister-glitch"
-                      data-text={stateLabel}
-                      style={{
-                        marginTop: 12,
-                        fontSize: 14,
-                        letterSpacing: '0.32em',
-                        opacity: 0.92,
-                        fontFamily: 'system-ui, -apple-system, sans-serif',
-                      }}
-                    >{stateLabel}</div>
+                    <div style={{
+                      fontSize: 'clamp(34px, 8.5vw, 56px)',
+                      fontWeight: 700,
+                      fontFamily: 'system-ui, -apple-system, sans-serif',
+                      lineHeight: 1.05,
+                    }}>{state.toUpperCase()}</div>
+                    <div style={{
+                      marginTop: 12,
+                      fontSize: 14,
+                      letterSpacing: '0.32em',
+                      opacity: 0.92,
+                      fontFamily: 'system-ui, -apple-system, sans-serif',
+                    }}>{stateLabel}</div>
                   </div>
                   </div>
                 </div>
@@ -2185,28 +2174,23 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
       </div>
 
       {/* ===== SEARCH BAR =====
-          Sits BELOW the strip of slides, near the bottom of the screen.
-          Filters the state list as the user types, prefix-matching state
-          names. So typing "vir" filters down to Virginia (and any other
-          state name starting with "vir"), centering the first match on
-          the projection without forcing the user to scroll the whole
-          51-slide strip. Positioning it below the strip (rather than
-          between projection and strip) keeps the left edge of the screen
-          clear for swipe-back gestures to land. */}
+          Sits between the projection screen and the filmstrip. Filters the
+          state list as the user types, prefix-matching state names. So
+          typing "vir" filters down to Virginia (and any other state name
+          starting with "vir"), centering the first match on the projection
+          without forcing the user to scroll the whole 51-slide strip. */}
       <div style={{
-        position: 'absolute',
-        bottom: 36,
-        left: '50%',
-        transform: 'translateX(-50%)',
+        position: 'relative',
         width: '92%',
         maxWidth: 460,
+        margin: '14px auto 0',
         zIndex: 3,
       }}>
         <input
           type="text"
           value={searchQuery}
           onChange={(e) => setSearchQuery(e.target.value)}
-          placeholder="Swipe the slides or search states"
+          placeholder="Search states…"
           autoCorrect="off"
           autoCapitalize="characters"
           spellCheck={false}
@@ -2277,10 +2261,7 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
         onTouchEnd={blockGlobalSwipe}
         style={{
           position: 'absolute',
-          // Strip sits ~120px from bottom so the search bar can sit below
-          // it (~60px tall) and there's still a clear band at the bottom
-          // edge for swipe-back gestures to land in.
-          bottom: 120,
+          bottom: 30,
           left: 0, right: 0,
           zIndex: 2,
         }}
@@ -2416,39 +2397,6 @@ function AboutView({ onBack }: { onBack: () => void }) {
     setDebugLines(getDebugLog());
     setShowDebug(true);
   }
-
-  // Live diagnostics for the geofencing watcher. Poll every 5 seconds so
-  // the user can leave this view open while testing or come back to it
-  // after a drive and see fresh state without having to navigate away.
-  const [diag, setDiag] = useState(() => getDiagnostics());
-  useEffect(() => {
-    const id = window.setInterval(() => { setDiag(getDiagnostics()); }, 5000);
-    return () => window.clearInterval(id);
-  }, []);
-  function refreshDiag() { setDiag(getDiagnostics()); }
-
-  function fmtAgo(t: number | null): string {
-    if (t === null) return 'never';
-    const ms = Date.now() - t;
-    if (ms < 0) return 'just now';
-    if (ms < 60000) return Math.floor(ms / 1000) + 's ago';
-    if (ms < 3600000) return Math.floor(ms / 60000) + 'm ago';
-    if (ms < 86400000) return Math.floor(ms / 3600000) + 'h ago';
-    return Math.floor(ms / 86400000) + 'd ago';
-  }
-  function fmtAbsTime(t: number | null): string {
-    if (t === null) return '—';
-    const d = new Date(t);
-    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-  }
-  // Color-code the watcher freshness: green if recent (<10min), orange
-  // otherwise. The whole point of this panel is to detect whether the
-  // watcher is firing in suspension; a green reading after a drive
-  // confirms iOS is letting the JS callback run, an orange reading is
-  // strong evidence the JS engine is being suspended and we need a
-  // native plugin instead.
-  const watcherFresh = diag.lastWatcherFireAt !== null && (Date.now() - diag.lastWatcherFireAt) < 10 * 60 * 1000;
-  const watcherColor = diag.lastWatcherFireAt === null ? '#888' : (watcherFresh ? '#4ade80' : '#fb923c');
   return (
     <div style={S.appBg}>
       <header style={S.header}>
@@ -2473,88 +2421,6 @@ function AboutView({ onBack }: { onBack: () => void }) {
           User submissions require an on-site photo and GPS verification. Approved entries are credited to the submitter
           permanently.
         </p>
-        {/* ===== DIAGNOSTICS PANEL =====
-            Surfaces the geofencing watcher's live state so we can verify
-            whether it fires in iOS suspension. The "Last update" color
-            tells the story: green = recent watcher fire (working);
-            orange = stale (watcher likely suspended in background). */}
-        <div style={{
-          marginTop: 24,
-          padding: 14,
-          border: '1px solid #333',
-          borderRadius: 8,
-          backgroundColor: 'rgba(0,0,0,0.4)',
-          fontFamily: 'Menlo, Monaco, monospace',
-          fontSize: 12,
-          color: '#ccc',
-          letterSpacing: '0.02em',
-        }}>
-          <div style={{
-            fontWeight: 700,
-            fontSize: 13,
-            color: BONE,
-            letterSpacing: '0.18em',
-            textTransform: 'uppercase',
-            marginBottom: 10,
-            fontFamily: 'system-ui, -apple-system, sans-serif',
-          }}>Diagnostics</div>
-          <div style={{ marginBottom: 6 }}>
-            <span style={{ color: '#888' }}>Permissions: </span>
-            <span style={{ color: BONE }}>
-              loc=<b>{diag.lastPermissions?.location ?? 'unknown'}</b>,{' '}
-              notifs=<b>{String(diag.lastPermissions?.notifications ?? false)}</b>
-            </span>
-          </div>
-          <div style={{ marginBottom: 6 }}>
-            <span style={{ color: '#888' }}>Last update: </span>
-            <span style={{ color: watcherColor, fontWeight: 700 }}>
-              {fmtAgo(diag.lastWatcherFireAt)}
-            </span>
-            <span style={{ color: '#666', marginLeft: 8 }}>
-              ({fmtAbsTime(diag.lastWatcherFireAt)})
-            </span>
-          </div>
-          <div style={{ marginBottom: 6 }}>
-            <span style={{ color: '#888' }}>Last location: </span>
-            <span style={{ color: BONE }}>
-              {diag.lastWatcherLocation
-                ? `${diag.lastWatcherLocation.lat.toFixed(5)}, ${diag.lastWatcherLocation.lng.toFixed(5)}`
-                : '—'}
-            </span>
-          </div>
-          <div style={{ marginBottom: 6 }}>
-            <span style={{ color: '#888' }}>Anchor: </span>
-            <span style={{ color: BONE }}>
-              {diag.lastAnchor
-                ? `${diag.lastAnchor.lat.toFixed(5)}, ${diag.lastAnchor.lng.toFixed(5)}`
-                : '—'}
-            </span>
-          </div>
-          <div style={{ marginBottom: 10 }}>
-            <span style={{ color: '#888' }}>Active fences: </span>
-            <span style={{ color: BONE }}>{diag.activeFenceCount}</span>
-            <span style={{ color: '#888', marginLeft: 12 }}>Sites: </span>
-            <span style={{ color: BONE }}>{diag.siteCount}</span>
-          </div>
-          <button
-            type="button"
-            onClick={refreshDiag}
-            className="sinister-pressable"
-            style={{
-              background: 'rgba(255, 220, 160, 0.08)',
-              border: '1px solid rgba(255, 220, 160, 0.3)',
-              borderRadius: 6,
-              color: BONE,
-              padding: '7px 14px',
-              fontSize: 11,
-              letterSpacing: '0.18em',
-              textTransform: 'uppercase',
-              fontFamily: 'system-ui, -apple-system, sans-serif',
-              cursor: 'pointer',
-            }}
-          >Refresh</button>
-        </div>
-
         <div style={{ marginTop: 24 }}>
           <button
             style={{ ...S.aboutLinkBtn, border: `2px solid ${WHITE}`, color: WHITE }}

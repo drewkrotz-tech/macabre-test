@@ -201,13 +201,6 @@ let _lastNotifiedAt: Map<string, number> = new Map();
 let _onPosition: ((lat: number, lng: number) => void) | null = null;
 let _notifListenersAttached = false;
 
-// ===== Diagnostic state =====
-// Populated by the watcher callback and the permissions flow so the
-// AboutView's diagnostics panel can show whether the watcher is firing.
-let _lastWatcherFireAt: number | null = null;
-let _lastWatcherLocation: { lat: number; lng: number } | null = null;
-let _lastPermissionsResult: Permissions | null = null;
-
 export function setSites(sites: SinisterSite[]) {
   _siteList = sites;
   dlog(`setSites: ${sites.length} sites loaded`);
@@ -265,9 +258,7 @@ async function ensureAndroidChannel(): Promise<void> {
 export async function requestPermissions(): Promise<Permissions> {
   dlog('RP-1 ENTRY, isNative=' + isNative());
   if (!isNative()) {
-    const r: Permissions = { location: 'unknown', notifications: false };
-    _lastPermissionsResult = r;
-    return r;
+    return { location: 'unknown', notifications: false };
   }
 
   const result: Permissions = { location: 'unknown', notifications: false };
@@ -344,7 +335,6 @@ export async function requestPermissions(): Promise<Permissions> {
   }
 
   dlog('RP-12 returning result, location=' + result.location + ' notifs=' + result.notifications);
-  _lastPermissionsResult = result;
   return result;
 }
 
@@ -393,12 +383,6 @@ export async function startGeofencing(onPosition: (lat: number, lng: number) => 
         if (!location) return;
         const lat: number = location.latitude;
         const lng: number = location.longitude;
-
-        // Diagnostic: record that the watcher just fired with a real
-        // location. Read by getDiagnostics() to verify watcher is firing
-        // even when the app is backgrounded.
-        _lastWatcherFireAt = Date.now();
-        _lastWatcherLocation = { lat, lng };
 
         if (_onPosition) _onPosition(lat, lng);
 
@@ -518,34 +502,4 @@ export function distanceMeters(lat1: number, lng1: number, lat2: number, lng2: n
     Math.sin(dLat / 2) ** 2 +
     Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
   return 2 * R * Math.asin(Math.sqrt(a));
-}
-
-
-// ===== Diagnostics export =====
-// Snapshot of the geofencing module's runtime state, surfaced to the UI
-// (AboutView) so the user can verify whether the native watcher is firing
-// while the app is backgrounded. The most important field is
-// lastWatcherFireAt — if the user opens the app after driving past a
-// geofence and this is recent, the watcher fires fine in suspension and
-// the bug is elsewhere; if it's stale, iOS suspended the JS engine and
-// we need a real native plugin (e.g. transistorsoft) or a Swift wrapper
-// around CLLocationManager.startMonitoring().
-export interface GeofencingDiagnostics {
-  lastWatcherFireAt: number | null;
-  lastWatcherLocation: { lat: number; lng: number } | null;
-  lastPermissions: Permissions | null;
-  lastAnchor: { lat: number; lng: number } | null;
-  activeFenceCount: number;
-  siteCount: number;
-}
-
-export function getDiagnostics(): GeofencingDiagnostics {
-  return {
-    lastWatcherFireAt: _lastWatcherFireAt,
-    lastWatcherLocation: _lastWatcherLocation,
-    lastPermissions: _lastPermissionsResult,
-    lastAnchor: _lastAnchor,
-    activeFenceCount: _activeFenceIds.size,
-    siteCount: _siteList.length,
-  };
 }
