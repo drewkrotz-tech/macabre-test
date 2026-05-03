@@ -1,3 +1,6 @@
+// @ts-ignore — Vite handles .ttf imports as URL strings
+declare module '*.ttf' { const url: string; export default url; }
+
 import { forwardRef, useEffect, useRef, useState } from 'react';
 import {
   startGeofencing,
@@ -7,6 +10,15 @@ import {
   setSites,
   getDebugLog,
 } from './geofencing';
+import LivingHellFontUrl from './assets/Living Hell.ttf';
+
+// Register the Living Hell font face once at module load.
+if (typeof document !== 'undefined' && !document.getElementById('__livinghell-fontface')) {
+  const style = document.createElement('style');
+  style.id = '__livinghell-fontface';
+  style.textContent = `@font-face { font-family: 'LivingHell'; src: url('${LivingHellFontUrl}') format('truetype'); font-display: block; }`;
+  document.head.appendChild(style);
+}
 import { SINISTER_SITES as FALLBACK_SITES, SinisterSite } from './locations';
 
 // ---------- Production server URL ----------
@@ -1515,8 +1527,8 @@ function HomeView({ sites, onSelectCategory, onSubmit, onAbout }: {
         <div style={S.homeReelGroup}>
           <div style={S.homeFilmHeader}>
             <div style={S.titleStackThe}>THE</div>
-            <div style={S.titleStackTop} className="sinister-glitch" data-text="Dread">Dread</div>
-            <div style={S.titleStackBottom} className="sinister-glitch" data-text="Directory">Directory</div>
+            <div style={{ ...S.titleStackTop, fontFamily: '"LivingHell", "Jolly Lodger", system-ui, serif' }} className="sinister-glitch" data-text="Dread">Dread</div>
+            <div style={{ ...S.titleStackBottom, fontFamily: '"LivingHell", "Jolly Lodger", system-ui, serif' }} className="sinister-glitch" data-text="Directory">Directory</div>
             <div style={S.bySinister}><BySinister /></div>
           </div>
 
