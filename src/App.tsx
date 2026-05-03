@@ -737,6 +737,7 @@ function buildStyleCss() {
 
 /* Hide the filmstrip's WebKit scrollbar */
 .projector-filmstrip::-webkit-scrollbar { display: none; }
+.state-pager::-webkit-scrollbar { display: none; }
 
 /* ===== Projected-image glitch =====
    Three image layers stacked behind the main image: red-shifted, cyan-shifted,
@@ -1865,112 +1866,74 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
   onSelectState: (state: string) => void;
   onBack: () => void;
 }) {
+  // Site counts per state for this category.
   const counts: Record<string, number> = {};
   for (const s of sites) {
     if (s.category === category) counts[s.state] = (counts[s.state] || 0) + 1;
   }
 
+  // Per-category fallback photo for each tile's photo cutout window.
   const categoryPhoto = CATEGORIES.find(c => c.key === category)?.image || '';
 
-  const [selectedIdx, setSelectedIdx] = useState<number>(0);
-  // scrollProgress tracks the filmstrip scroll position as a continuous
-  // float index (e.g. 2.4 means 40% of the way from slide 2 to slide 3).
-  // The projection's image rail uses this to translate horizontally in
-  // real time as the user drags the filmstrip.
-  const [scrollProgress, setScrollProgress] = useState<number>(0);
-  // Search query — prefix-matches against state names so the user can type
-  // "vir" and have Virginia pop up centered without scrolling 51 slides.
+  // Search filtering. Prefix match against state names.
   const [searchQuery, setSearchQuery] = useState<string>('');
   const visibleStates = searchQuery
     ? US_STATES.filter(s => s.toUpperCase().startsWith(searchQuery.toUpperCase()))
     : US_STATES;
-  const stripRef = useRef<HTMLDivElement | null>(null);
-  const [glitchSeed, setGlitchSeed] = useState<number>(0);
+
+  // Paged grid layout: 2 columns x 4 rows = 8 tiles per page.
+  // 51 states -> 7 pages (6 full + 1 with 3 + 5 padded).
+  const TILES_PER_PAGE = 8;
+  const COLS = 2;
+
+  const pageCount = Math.max(1, Math.ceil(visibleStates.length / TILES_PER_PAGE));
+  const pages: (string | null)[][] = [];
+  for (let p = 0; p < pageCount; p++) {
+    const page: (string | null)[] = [];
+    for (let i = 0; i < TILES_PER_PAGE; i++) {
+      const stateIdx = p * TILES_PER_PAGE + i;
+      page.push(stateIdx < visibleStates.length ? visibleStates[stateIdx] : null);
+    }
+    pages.push(page);
+  }
+
+  const [currentPage, setCurrentPage] = useState<number>(0);
+  const pagerRef = useRef<HTMLDivElement | null>(null);
   const programmaticScrollUntil = useRef<number>(0);
 
-  const SLIDE_W = 300;
-  const SLIDE_H = 304;
-  const SLIDE_GAP = 24;
-
-  const scrollPosFor = (idx: number) => idx * (SLIDE_W + SLIDE_GAP);
-
-  const handleScroll = () => {
-    const el = stripRef.current;
-    if (!el) return;
-    const stride = SLIDE_W + SLIDE_GAP;
-    const progress = el.scrollLeft / stride;
-    const max = Math.max(0, visibleStates.length - 1);
-    const clampedProgress = Math.max(0, Math.min(max, progress));
-    setScrollProgress(clampedProgress);
-
+  const handlePagerScroll = () => {
     if (Date.now() < programmaticScrollUntil.current) return;
-    const idx = Math.round(progress);
-    const clamped = Math.max(0, Math.min(max, idx));
-    if (clamped !== selectedIdx) setSelectedIdx(clamped);
-  };
-
-  // Fire the slide sound on every integer index change (matches the home
-  // page's advanceOneCell behavior — one sound per advance, no overlapping).
-  const lastPlayedIdxRef = useRef<number>(0);
-  useEffect(() => {
-    if (selectedIdx !== lastPlayedIdxRef.current) {
-      lastPlayedIdxRef.current = selectedIdx;
+    const el = pagerRef.current;
+    if (!el) return;
+    const page = Math.round(el.scrollLeft / el.clientWidth);
+    const clamped = Math.max(0, Math.min(pageCount - 1, page));
+    if (clamped !== currentPage) {
+      setCurrentPage(clamped);
       try { playSlide(); } catch { /* silent */ }
     }
-  }, [selectedIdx]);
-
-  const onSlideTap = (idx: number) => {
-    if (idx === selectedIdx) {
-      onSelectState(visibleStates[idx]);
-      return;
-    }
-    const el = stripRef.current;
-    if (!el) return;
-    programmaticScrollUntil.current = Date.now() + 600;
-    el.scrollTo({ left: scrollPosFor(idx), behavior: 'smooth' });
-    setSelectedIdx(idx);
   };
 
+  // When search filters change, snap back to page 0 so the first match
+  // is visible without the user manually scrolling.
   useEffect(() => {
-    const el = stripRef.current;
+    setCurrentPage(0);
+    const el = pagerRef.current;
     if (!el) return;
-    el.scrollLeft = scrollPosFor(selectedIdx);
-    setScrollProgress(selectedIdx);
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
-
-  useEffect(() => {
-    let cancelled = false;
-    const tick = () => {
-      if (cancelled) return;
-      setGlitchSeed(Math.random());
-      window.setTimeout(tick, 2500 + Math.random() * 2500);
-    };
-    const id = window.setTimeout(tick, 1500);
-    return () => { cancelled = true; window.clearTimeout(id); };
-  }, []);
-
-  // When the search query changes, snap selectedIdx back to 0 of the
-  // (filtered) visibleStates and reset the filmstrip scroll position so the
-  // first match is always centered on the projection.
-  useEffect(() => {
-    setSelectedIdx(0);
-    setScrollProgress(0);
-    const el = stripRef.current;
-    if (!el) return;
-    programmaticScrollUntil.current = Date.now() + 600;
+    programmaticScrollUntil.current = Date.now() + 500;
     el.scrollTo({ left: 0, behavior: 'auto' });
   }, [searchQuery]);
 
   const blockGlobalSwipe = (e: React.TouchEvent) => { e.stopPropagation(); };
 
   return (
-    <div style={{ ...S.appBg, overflow: 'hidden', position: 'relative' }}>
+    <div style={{ ...S.appBg, overflow: 'hidden', position: 'relative', display: 'flex', flexDirection: 'column', height: '100vh' }}>
+      {/* Title at top — same Living Hell + sinister-glitch as the home title */}
       <header style={S.header}>
         <div
           style={{
             ...S.categoryViewTitle,
             fontFamily: '"LivingHell", "Jolly Lodger", system-ui, serif',
-            fontSize: 64,
+            fontSize: 56,
             color: '#FFFFFF',
             textShadow: `0 0 20px #FFFFFF, 0 0 40px #FFFFFFaa, 2px 2px 0 #000`,
           }}
@@ -1979,212 +1942,166 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
         >{categoryLabel}</div>
       </header>
 
-      {/* Soft projector light cone behind the screen */}
-      <div style={{
-        position: 'absolute',
-        top: '8%',
-        left: '50%',
-        transform: 'translateX(-50%)',
-        width: '140vw',
-        height: '60vh',
-        background:
-          'radial-gradient(ellipse 45% 40% at center 45%, ' +
-            'rgba(255, 230, 180, 0.18) 0%, ' +
-            'rgba(255, 210, 140, 0.10) 30%, ' +
-            'rgba(255, 185, 105, 0.04) 55%, ' +
-            'transparent 75%)',
-        pointerEvents: 'none',
-        zIndex: 0,
-      }} />
-
-      {/* PROJECTION SCREEN
-          The screen is a fixed window. Inside it, a horizontal "image rail"
-          translates left/right based on filmstrip scrollProgress so the
-          image follows the user's finger 1:1 during a swipe. As the
-          filmstrip moves, the image moves the same direction by the same
-          proportion, sliding off one side and revealing the next. */}
+      {/* PAGER — horizontal scroll-snap container, one full-width page per group of 8 states */}
       <div
+        ref={pagerRef}
+        onScroll={handlePagerScroll}
         onTouchStart={blockGlobalSwipe}
         onTouchMove={blockGlobalSwipe}
+        onTouchEnd={blockGlobalSwipe}
+        className="state-pager"
         style={{
-          position: 'relative',
-          margin: '24px auto 0',
-          width: '92%',
-          aspectRatio: '4 / 3',
-          maxHeight: '50vh',
-          zIndex: 1,
-          WebkitMaskImage:
-            'radial-gradient(ellipse 75% 78% at center, black 30%, rgba(0,0,0,0.7) 60%, transparent 92%)',
-          maskImage:
-            'radial-gradient(ellipse 75% 78% at center, black 30%, rgba(0,0,0,0.7) 60%, transparent 92%)',
+          flex: 1,
+          display: 'flex',
+          overflowX: 'auto',
+          overflowY: 'hidden',
+          scrollSnapType: 'x mandatory',
+          WebkitOverflowScrolling: 'touch',
+          scrollbarWidth: 'none',
         }}
       >
-        <div style={{
-          position: 'absolute',
-          inset: '6%',
-          borderRadius: 16,
-          overflow: 'hidden',
-          backgroundColor: '#0a0805',
-        }}>
-          {/* THE IMAGE RAIL — one image layer per state, side by side.
-              Total width = 51 * 100% = 5100%. translateX of -scrollProgress*100%
-              centers the active state's image in the viewport. */}
-          <div style={{
-            position: 'absolute',
-            top: 0,
-            left: 0,
-            height: '100%',
-            width: (Math.max(1, visibleStates.length) * 100) + '%',
-            display: 'flex',
-            transform: 'translateX(-' + (visibleStates.length > 0 ? (scrollProgress * 100 / visibleStates.length) : 0) + '%)',
-            // ^ Each visible state takes 1/N of the rail's width. To center
-            // state i, translate the rail left by i * (100/N)% of itself.
-            // Width and divisor scale with the filtered visibleStates count.
-            willChange: 'transform',
-          }}>
-            {visibleStates.map((state, i) => {
-              const stateCount = counts[state] || 0;
-              const stateLabel = stateCount === 1 ? '1 LOCATION' : stateCount + ' LOCATIONS';
+        {pages.map((page, pageIdx) => (
+          <div
+            key={'page-' + pageIdx}
+            style={{
+              flex: '0 0 100%',
+              width: '100%',
+              height: '100%',
+              scrollSnapAlign: 'start',
+              scrollSnapStop: 'always',
+              display: 'grid',
+              gridTemplateColumns: 'repeat(' + COLS + ', 1fr)',
+              gridTemplateRows: 'repeat(4, 1fr)',
+              gap: '12px',
+              padding: '12px 16px 24px',
+              boxSizing: 'border-box',
+            }}
+          >
+            {page.map((state, tileIdx) => {
+              if (state === null) {
+                // Padding tile so the grid stays even on the last page.
+                return <div key={'pad-' + pageIdx + '-' + tileIdx} />;
+              }
+              const count = counts[state] || 0;
               return (
-                <div key={state} style={{
-                  position: 'relative',
-                  flex: '0 0 ' + (100 / Math.max(1, visibleStates.length)) + '%',
-                  height: '100%',
-                  overflow: 'hidden',
-                  backgroundColor: '#000',
-                }}>
-                  {/* Inner content wrapper inset 4% on each side. This creates
-                      the visible black gap between projection slides during a
-                      swipe WITHOUT changing the flex layout (so the rail's
-                      transform math stays exact). */}
+                <div
+                  key={state}
+                  onClick={() => { try { playButton(); } catch { /* silent */ } onSelectState(state); }}
+                  className="sinister-pressable"
+                  style={{
+                    position: 'relative',
+                    width: '100%',
+                    height: '100%',
+                    cursor: 'pointer',
+                    backgroundImage: 'url(' + SlideMountUrl + ')',
+                    backgroundSize: 'contain',
+                    backgroundRepeat: 'no-repeat',
+                    backgroundPosition: 'center',
+                  }}
+                >
+                  {/* Photo cutout — measured from slide-mount.png */}
+                  {categoryPhoto && (
+                    <div style={{
+                      position: 'absolute',
+                      left: '21%',
+                      right: '19%',
+                      top: '30%',
+                      bottom: '30%',
+                      backgroundImage: 'url(' + categoryPhoto + ')',
+                      backgroundSize: 'cover',
+                      backgroundPosition: 'center',
+                      filter: 'sepia(0.4) saturate(0.7) brightness(0.6)',
+                      pointerEvents: 'none',
+                      overflow: 'hidden',
+                    }} />
+                  )}
+                  {/* State name in cardboard top band */}
                   <div style={{
                     position: 'absolute',
-                    top: 0,
-                    bottom: 0,
-                    left: '4%',
-                    right: '4%',
+                    top: '11%',
+                    left: '15%',
+                    right: '15%',
+                    height: '11%',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    fontSize: 14,
+                    fontWeight: 700,
+                    letterSpacing: '0.14em',
+                    fontFamily: 'Georgia, "Times New Roman", serif',
+                    color: '#3a2f1a',
+                    textTransform: 'uppercase',
+                    whiteSpace: 'nowrap',
                     overflow: 'hidden',
-                  }}>
-                  {/* ===== Glitch image stack — three duplicate layers =====
-                      Bottom: cyan-shifted, offset left, clip-pathed
-                      Middle: red-shifted, offset right, clip-pathed
-                      Top: clean image
-                      The bottom two animate via projector-glitch-* classes
-                      with long quiet stretches and brief glitch bursts,
-                      modeled on the home page's sinister-glitch look. */}
-                  <div className="projector-glitch-cyan" style={{
-                    position: 'absolute', inset: 0,
-                    backgroundImage: categoryPhoto ? 'url(' + categoryPhoto + ')' : 'none',
-                    backgroundSize: 'cover',
-                    backgroundPosition: 'center',
-                    filter: 'sepia(0.35) saturate(0.85) brightness(0.85) contrast(1.05) hue-rotate(155deg)',
-                    mixBlendMode: 'screen',
-                    pointerEvents: 'none',
-                    opacity: 0.85,
-                  }} />
-                  <div className="projector-glitch-red" style={{
-                    position: 'absolute', inset: 0,
-                    backgroundImage: categoryPhoto ? 'url(' + categoryPhoto + ')' : 'none',
-                    backgroundSize: 'cover',
-                    backgroundPosition: 'center',
-                    filter: 'sepia(0.35) saturate(2) brightness(0.85) hue-rotate(-30deg)',
-                    mixBlendMode: 'screen',
-                    pointerEvents: 'none',
-                    opacity: 0.85,
-                  }} />
-                  <div className="projector-glitch-jitter" style={{
-                    position: 'absolute', inset: 0,
-                    backgroundImage: categoryPhoto ? 'url(' + categoryPhoto + ')' : 'none',
-                    backgroundSize: 'cover',
-                    backgroundPosition: 'center',
-                    filter: 'sepia(0.35) saturate(0.85) brightness(0.85) contrast(1.05)',
-                  }} />
-
-                  {/* Warm projector tint */}
-                  <div style={{
-                    position: 'absolute', inset: 0,
-                    background: 'linear-gradient(180deg, rgba(255, 200, 130, 0.18) 0%, rgba(180, 120, 70, 0.10) 100%)',
-                    mixBlendMode: 'overlay',
-                    pointerEvents: 'none',
-                  }} />
-                  {/* Vignette */}
-                  <div style={{
-                    position: 'absolute', inset: 0,
-                    background: 'radial-gradient(ellipse at center, transparent 38%, rgba(0,0,0,0.85) 100%)',
-                    pointerEvents: 'none',
-                  }} />
-                  {/* State name + count overlay */}
-                  <div style={{
-                    position: 'absolute', inset: 0,
-                    display: 'flex', flexDirection: 'column',
-                    alignItems: 'center', justifyContent: 'center',
-                    color: '#fff5e0', textAlign: 'center', padding: '0 16px',
-                    textShadow: '0 2px 16px rgba(0,0,0,0.95), 0 0 32px rgba(0,0,0,0.7)',
-                    letterSpacing: '0.05em',
+                    textOverflow: 'ellipsis',
+                    textShadow: '0 1px 0 rgba(255,255,255,0.4), 0 -1px 0 rgba(0,0,0,0.15)',
                     pointerEvents: 'none',
                   }}>
-                    <div style={{
-                      fontSize: 'clamp(34px, 8.5vw, 56px)',
-                      fontWeight: 700,
-                      fontFamily: 'system-ui, -apple-system, sans-serif',
-                      lineHeight: 1.05,
-                    }}>{state.toUpperCase()}</div>
-                    <div style={{
-                      marginTop: 12,
-                      fontSize: 14,
-                      letterSpacing: '0.32em',
-                      opacity: 0.92,
-                      fontFamily: 'system-ui, -apple-system, sans-serif',
-                    }}>{stateLabel}</div>
+                    {state}
                   </div>
+                  {/* Count in cardboard bottom band */}
+                  <div style={{
+                    position: 'absolute',
+                    bottom: '8%',
+                    left: '15%',
+                    right: '15%',
+                    height: '11%',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    fontSize: 11,
+                    fontWeight: 700,
+                    letterSpacing: '0.18em',
+                    fontFamily: 'Georgia, "Times New Roman", serif',
+                    color: count > 0 ? '#3a2f1a' : '#5a5142',
+                    fontStyle: count === 0 ? 'italic' : 'normal',
+                    textTransform: 'uppercase',
+                    whiteSpace: 'nowrap',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    textShadow: '0 1px 0 rgba(255,255,255,0.3)',
+                    pointerEvents: 'none',
+                  }}>
+                    {count === 0 ? 'No Sites' : (count === 1 ? '1 Location' : count + ' Locations')}
                   </div>
                 </div>
               );
             })}
           </div>
-
-          {/* ===== Effects layered over the entire viewport ===== */}
-          <div style={{
-            position: 'absolute', inset: 0,
-            backgroundImage:
-              'repeating-linear-gradient(91deg, transparent 0px, transparent 60px, rgba(255,240,200,0.08) 60.5px, transparent 61px), ' +
-              'repeating-linear-gradient(89deg, transparent 0px, transparent 130px, rgba(255,240,200,0.06) 130.4px, transparent 131px)',
-            mixBlendMode: 'screen',
-            opacity: 0.55,
-            pointerEvents: 'none',
-            zIndex: 4,
-          }} />
-          <div className="projector-grain" style={{ position: 'absolute', inset: 0, opacity: 0.32, mixBlendMode: 'overlay', pointerEvents: 'none', zIndex: 4 }} />
-          <div className="projector-dust" style={{ position: 'absolute', inset: 0, opacity: 0.6, pointerEvents: 'none', mixBlendMode: 'screen', zIndex: 4 }} />
-          
-          <div style={{
-            position: 'absolute', inset: 0,
-            backgroundImage: 'repeating-linear-gradient(0deg, rgba(0,0,0,0.2) 0px, rgba(0,0,0,0.2) 1px, transparent 1px, transparent 3px)',
-            pointerEvents: 'none',
-            zIndex: 4,
-          }} />
-          <div className="projector-flash" style={{
-            position: 'absolute', inset: 0,
-            backgroundColor: 'rgba(255, 235, 190, 1)',
-            pointerEvents: 'none', mixBlendMode: 'screen', opacity: 0,
-            zIndex: 4,
-          }} />
-          <div className="projector-flicker" style={{ position: 'absolute', inset: 0, backgroundColor: '#000', pointerEvents: 'none', zIndex: 4 }} />
-        </div>
+        ))}
       </div>
 
-      {/* ===== SEARCH BAR =====
-          Sits between the projection screen and the filmstrip. Filters the
-          state list as the user types, prefix-matching state names. So
-          typing "vir" filters down to Virginia (and any other state name
-          starting with "vir"), centering the first match on the projection
-          without forcing the user to scroll the whole 51-slide strip. */}
+      {/* Page indicator dots — only show if more than 1 page (so empty search results
+          don't show a stranded dot, and the indicator stays meaningful). */}
+      {pageCount > 1 && (
+        <div style={{
+          display: 'flex',
+          justifyContent: 'center',
+          alignItems: 'center',
+          gap: 8,
+          padding: '6px 0 10px',
+          flexShrink: 0,
+        }}>
+          {Array.from({ length: pageCount }).map((_, i) => (
+            <div
+              key={'dot-' + i}
+              style={{
+                width: 7,
+                height: 7,
+                borderRadius: '50%',
+                backgroundColor: i === currentPage ? '#fff5e0' : 'rgba(255, 245, 224, 0.3)',
+                transition: 'background-color 200ms ease',
+              }}
+            />
+          ))}
+        </div>
+      )}
+
+      {/* Search bar — sits at the bottom of the screen */}
       <div style={{
+        flexShrink: 0,
+        padding: '8px 16px 20px',
         position: 'relative',
-        width: '92%',
-        maxWidth: 460,
-        margin: '14px auto 0',
-        zIndex: 3,
       }}>
         <input
           type="text"
@@ -2206,7 +2123,7 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
             fontSize: 15,
             letterSpacing: '0.18em',
             textTransform: 'uppercase',
-            padding: '11px 38px 11px 14px',
+            padding: '12px 38px 12px 14px',
             outline: 'none',
             boxSizing: 'border-box',
             boxShadow: 'inset 0 1px 4px rgba(0,0,0,0.5), 0 0 18px rgba(255, 200, 130, 0.08)',
@@ -2220,8 +2137,8 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
             className="sinister-pressable"
             style={{
               position: 'absolute',
-              right: 6,
-              top: '50%',
+              right: 22,
+              top: 'calc(50% - 2px)',
               transform: 'translateY(-50%)',
               background: 'transparent',
               border: 'none',
@@ -2241,11 +2158,11 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
         {searchQuery && visibleStates.length === 0 && (
           <div style={{
             position: 'absolute',
-            top: 'calc(100% + 6px)',
+            top: 'calc(100% - 12px)',
             left: 0,
             right: 0,
             textAlign: 'center',
-            fontSize: 12,
+            fontSize: 11,
             color: '#fff5e088',
             letterSpacing: '0.18em',
             textTransform: 'uppercase',
@@ -2253,134 +2170,6 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
             pointerEvents: 'none',
           }}>No matches</div>
         )}
-      </div>
-
-      <div
-        onTouchStart={blockGlobalSwipe}
-        onTouchMove={blockGlobalSwipe}
-        onTouchEnd={blockGlobalSwipe}
-        style={{
-          position: 'absolute',
-          bottom: 30,
-          left: 0, right: 0,
-          zIndex: 2,
-        }}
-      >
-        <div
-          ref={stripRef}
-          onScroll={handleScroll}
-          className="projector-filmstrip"
-          style={{
-            display: 'flex',
-            gap: SLIDE_GAP + 'px',
-            overflowX: 'auto',
-            overflowY: 'hidden',
-            scrollSnapType: 'x mandatory',
-            WebkitOverflowScrolling: 'touch',
-            scrollbarWidth: 'none',
-            paddingLeft: 'calc(50vw - ' + (SLIDE_W / 2) + 'px)',
-            paddingRight: 'calc(50vw - ' + (SLIDE_W / 2) + 'px)',
-            paddingTop: 22,
-            paddingBottom: 22,
-          }}
-        >
-          {visibleStates.map((state, i) => {
-            const dist = Math.abs(i - selectedIdx);
-            const isActive = dist === 0;
-            const count = counts[state] || 0;
-            const opacity = isActive ? 1 : (dist === 1 ? 0.5 : (dist === 2 ? 0.28 : 0.15));
-            const brightness = isActive ? 1 : (dist === 1 ? 0.45 : (dist === 2 ? 0.30 : 0.22));
-            const scale = isActive ? 1.0 : (dist === 1 ? 0.86 : (dist === 2 ? 0.78 : 0.74));
-            return (
-              <div
-                key={state}
-                onClick={() => onSlideTap(i)}
-                className="sinister-pressable"
-                style={{
-                  flex: '0 0 auto',
-                  width: SLIDE_W,
-                  height: SLIDE_H,
-                  scrollSnapAlign: 'center',
-                  scrollSnapStop: 'normal',
-                  position: 'relative',
-                  cursor: 'pointer',
-                  transform: 'scale(' + scale + ')',
-                  opacity: opacity,
-                  filter: 'brightness(' + brightness + ')',
-                  transition: 'transform 240ms ease, opacity 240ms ease, filter 240ms ease',
-                  backgroundImage: 'url(' + SlideMountUrl + ')',
-                  backgroundSize: 'contain',
-                  backgroundRepeat: 'no-repeat',
-                  backgroundPosition: 'center',
-                }}
-              >
-                {categoryPhoto && (
-                  <div style={{
-                    position: 'absolute',
-                    // Cutout coords measured from the slide-mount.png cutout.
-                    left: '21%',
-                    right: '19%',
-                    top: '30%',
-                    bottom: '30%',
-                    backgroundImage: 'url(' + categoryPhoto + ')',
-                    backgroundSize: 'cover',
-                    backgroundPosition: 'center',
-                    filter: 'sepia(0.4) saturate(0.7) brightness(0.6)',
-                    pointerEvents: 'none',
-                    overflow: 'hidden',
-                  }} />
-                )}
-                <div style={{
-                  position: 'absolute',
-                  top: '11%',
-                  left: '15%',
-                  right: '15%',
-                  height: '11%',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  fontSize: 17,
-                  fontWeight: 700,
-                  letterSpacing: '0.16em',
-                  fontFamily: 'Georgia, "Times New Roman", serif',
-                  color: '#3a2f1a',
-                  textTransform: 'uppercase',
-                  whiteSpace: 'nowrap',
-                  overflow: 'hidden',
-                  textOverflow: 'ellipsis',
-                  textShadow: '0 1px 0 rgba(255,255,255,0.4), 0 -1px 0 rgba(0,0,0,0.15)',
-                  pointerEvents: 'none',
-                }}>
-                  {state}
-                </div>
-                <div style={{
-                  position: 'absolute',
-                  bottom: '8%',
-                  left: '15%',
-                  right: '15%',
-                  height: '11%',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  fontSize: 13,
-                  fontWeight: 700,
-                  letterSpacing: '0.18em',
-                  fontFamily: 'Georgia, "Times New Roman", serif',
-                  color: count > 0 ? '#3a2f1a' : '#5a5142',
-                  fontStyle: count === 0 ? 'italic' : 'normal',
-                  textTransform: 'uppercase',
-                  whiteSpace: 'nowrap',
-                  overflow: 'hidden',
-                  textOverflow: 'ellipsis',
-                  textShadow: '0 1px 0 rgba(255,255,255,0.3)',
-                  pointerEvents: 'none',
-                }}>
-                  {count === 0 ? 'No Sites' : (count === 1 ? '1 Location' : count + ' Locations')}
-                </div>
-              </div>
-            );
-          })}
-        </div>
       </div>
     </div>
   );
