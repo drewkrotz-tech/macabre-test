@@ -1,6 +1,6 @@
 // @ts-ignore — Vite handles .ttf imports as URL strings
 declare module '*.ttf' { const url: string; export default url; }
-declare module '*.jpg' { const url: string; export default url; }
+declare module '*.png' { const url: string; export default url; }
 
 import { forwardRef, useEffect, useRef, useState } from 'react';
 import {
@@ -12,7 +12,7 @@ import {
   getDebugLog,
 } from './geofencing';
 import LivingHellFontUrl from './assets/Living Hell.ttf';
-import SlideMountUrl from './assets/slide-mount.jpg';
+import SlideMountUrl from './assets/slide-mount.png';
 
 // Register the Living Hell font face once at module load.
 if (typeof document !== 'undefined' && !document.getElementById('__livinghell-fontface')) {
@@ -1795,7 +1795,6 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
   onSelectState: (state: string) => void;
   onBack: () => void;
 }) {
-  // Count locations per state for THIS category.
   const counts: Record<string, number> = {};
   for (const s of sites) {
     if (s.category === category) counts[s.state] = (counts[s.state] || 0) + 1;
@@ -1806,10 +1805,9 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
   const [glitchSeed, setGlitchSeed] = useState<number>(0);
   const programmaticScrollUntil = useRef<number>(0);
 
-  // Slide dimensions. The reference JPG is 377x360 (almost square). We render
-  // bigger so the printed detail (date stamp, red number) reads.
+  // Slide dimensions match the source PNG aspect ratio (300x304, ~square).
   const SLIDE_W = 150;
-  const SLIDE_H = 144;
+  const SLIDE_H = 152;
   const SLIDE_GAP = 18;
 
   const scrollPosFor = (idx: number) => idx * (SLIDE_W + SLIDE_GAP);
@@ -1824,8 +1822,7 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
     if (clamped !== selectedIdx) setSelectedIdx(clamped);
   };
 
-  // Tap a slide: if it's the centered one, drill in. Otherwise, scroll it
-  // to the center.
+  // Tap centered slide -> drill in. Tap non-centered slide -> scroll to center.
   const onSlideTap = (idx: number) => {
     if (idx === selectedIdx) {
       onSelectState(US_STATES[idx]);
@@ -1838,38 +1835,28 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
     setSelectedIdx(idx);
   };
 
-  const goPrev = () => {
-    if (selectedIdx === 0) return;
-    onSlideTap(selectedIdx - 1);
-  };
-  const goNext = () => {
-    if (selectedIdx === US_STATES.length - 1) return;
-    onSlideTap(selectedIdx + 1);
-  };
+  const goPrev = () => { if (selectedIdx > 0) onSlideTap(selectedIdx - 1); };
+  const goNext = () => { if (selectedIdx < US_STATES.length - 1) onSlideTap(selectedIdx + 1); };
 
-  // Center the strip on mount.
   useEffect(() => {
     const el = stripRef.current;
     if (!el) return;
     el.scrollLeft = scrollPosFor(selectedIdx);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Glitch loop — re-fire the jitter sweep every 2.5-5s with a fresh key.
+  // Glitch loop — re-fire jitter every 2.5-5s with a fresh key.
   useEffect(() => {
     let cancelled = false;
     const tick = () => {
       if (cancelled) return;
       setGlitchSeed(Math.random());
-      const next = 2500 + Math.random() * 2500;
-      window.setTimeout(tick, next);
+      window.setTimeout(tick, 2500 + Math.random() * 2500);
     };
     const id = window.setTimeout(tick, 1500);
     return () => { cancelled = true; window.clearTimeout(id); };
   }, []);
 
-  const blockGlobalSwipe = (e: React.TouchEvent) => {
-    e.stopPropagation();
-  };
+  const blockGlobalSwipe = (e: React.TouchEvent) => { e.stopPropagation(); };
 
   const currentState = US_STATES[selectedIdx] || US_STATES[0];
   const currentCount = counts[currentState] || 0;
@@ -1885,9 +1872,7 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
         }}>{categoryLabel}</div>
       </header>
 
-      {/* ===== PROJECTOR LIGHT CONE =====
-          Big warm radial glow. Fades from bright warm-yellow at the projection
-          out to nothing well past the screen edges. */}
+      {/* Projector light cone */}
       <div style={{
         position: 'absolute',
         top: '0%',
@@ -1905,10 +1890,7 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
         zIndex: 0,
       }} />
 
-      {/* ===== THE PROJECTION SCREEN =====
-          A real movie/slide screen: rounded corners, feathered glow edges, the
-          projected image is bright and warm, gets glitches and flashes. NOT
-          tappable now — only the centered slide drills into the state. */}
+      {/* Projection screen — display-only (NOT clickable). Tap is on the slide. */}
       <div
         onTouchStart={blockGlobalSwipe}
         onTouchMove={blockGlobalSwipe}
@@ -1919,15 +1901,10 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
           aspectRatio: '4 / 3',
           maxHeight: '50vh',
           zIndex: 1,
-          // Feather the OUTER frame edges so the screen doesn't look like a
-          // hard rectangle pasted on the wall.
-          WebkitMaskImage:
-            'radial-gradient(ellipse 100% 100% at center, black 75%, transparent 100%)',
-          maskImage:
-            'radial-gradient(ellipse 100% 100% at center, black 75%, transparent 100%)',
+          WebkitMaskImage: 'radial-gradient(ellipse 100% 100% at center, black 75%, transparent 100%)',
+          maskImage: 'radial-gradient(ellipse 100% 100% at center, black 75%, transparent 100%)',
         }}
       >
-        {/* Inner screen — rounded corners, the projection lives here. */}
         <div style={{
           position: 'absolute',
           inset: '5%',
@@ -1939,14 +1916,11 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
             '0 0 220px 50px rgba(255, 200, 125, 0.26), ' +
             '0 0 380px 100px rgba(255, 175, 95, 0.12)',
         }}>
-          {/* Photo placeholder — warm sepia gradient until per-state photos drop in */}
           <div style={{
             position: 'absolute',
             inset: 0,
             background: 'radial-gradient(ellipse at center, #5a4530 0%, #322516 50%, #14100a 100%)',
           }} />
-
-          {/* Sepia overlay — projected slides have a warm tone */}
           <div style={{
             position: 'absolute',
             inset: 0,
@@ -1954,16 +1928,12 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
             mixBlendMode: 'overlay',
             pointerEvents: 'none',
           }} />
-
-          {/* Vignette — focus the eye on the center */}
           <div style={{
             position: 'absolute',
             inset: 0,
             background: 'radial-gradient(ellipse at center, transparent 38%, rgba(0,0,0,0.8) 100%)',
             pointerEvents: 'none',
           }} />
-
-          {/* Scratched film effect — diagonal scratches via repeating gradient */}
           <div style={{
             position: 'absolute',
             inset: 0,
@@ -1974,67 +1944,28 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
             opacity: 0.6,
             pointerEvents: 'none',
           }} />
-
-          {/* Animated grain */}
-          <div className="projector-grain" style={{
-            position: 'absolute',
-            inset: 0,
-            opacity: 0.32,
-            mixBlendMode: 'overlay',
-            pointerEvents: 'none',
-          }} />
-
-          {/* Drifting dust speckles */}
-          <div className="projector-dust" style={{
-            position: 'absolute',
-            inset: 0,
-            opacity: 0.65,
-            pointerEvents: 'none',
-            mixBlendMode: 'screen',
-          }} />
-
-          {/* Vertical jitter sweep — re-fired by changing key on glitchSeed */}
-          <div className="projector-jitter" key={'jit-' + glitchSeed} style={{
-            position: 'absolute',
-            inset: 0,
-            pointerEvents: 'none',
-          }} />
-
-          {/* Scanlines */}
+          <div className="projector-grain" style={{ position: 'absolute', inset: 0, opacity: 0.32, mixBlendMode: 'overlay', pointerEvents: 'none' }} />
+          <div className="projector-dust" style={{ position: 'absolute', inset: 0, opacity: 0.65, pointerEvents: 'none', mixBlendMode: 'screen' }} />
+          <div className="projector-jitter" key={'jit-' + glitchSeed} style={{ position: 'absolute', inset: 0, pointerEvents: 'none' }} />
           <div style={{
             position: 'absolute',
             inset: 0,
             backgroundImage: 'repeating-linear-gradient(0deg, rgba(0,0,0,0.2) 0px, rgba(0,0,0,0.2) 1px, transparent 1px, transparent 3px)',
             pointerEvents: 'none',
           }} />
-
-          {/* Top-edge warm light leak */}
           <div style={{
             position: 'absolute',
             top: 0, left: 0, right: 0, height: '55%',
             background: 'linear-gradient(180deg, rgba(255, 195, 115, 0.26) 0%, transparent 100%)',
             pointerEvents: 'none',
           }} />
-
-          {/* Brightness flash glitch */}
           <div className="projector-flash" style={{
-            position: 'absolute',
-            inset: 0,
+            position: 'absolute', inset: 0,
             backgroundColor: 'rgba(255, 235, 190, 1)',
-            pointerEvents: 'none',
-            mixBlendMode: 'screen',
-            opacity: 0,
+            pointerEvents: 'none', mixBlendMode: 'screen', opacity: 0,
           }} />
+          <div className="projector-flicker" style={{ position: 'absolute', inset: 0, backgroundColor: '#000', pointerEvents: 'none' }} />
 
-          {/* Black flicker overlay */}
-          <div className="projector-flicker" style={{
-            position: 'absolute',
-            inset: 0,
-            backgroundColor: '#000',
-            pointerEvents: 'none',
-          }} />
-
-          {/* State name + count overlaid on the projection */}
           <div style={{
             position: 'absolute',
             inset: 0,
@@ -2070,12 +2001,11 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
         </div>
       </div>
 
-      {/* ===== PREV / NEXT ARROWS ===== */}
+      {/* Prev / next arrows */}
       <div style={{
         position: 'absolute',
         top: 'calc(20px + 25vh - 22px)',
-        left: 0,
-        right: 0,
+        left: 0, right: 0,
         display: 'flex',
         justifyContent: 'space-between',
         padding: '0 6px',
@@ -2092,15 +2022,11 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
             background: 'rgba(0,0,0,0.55)',
             border: '1px solid rgba(255,220,160,0.35)',
             color: '#fff',
-            width: 42,
-            height: 42,
-            borderRadius: 21,
+            width: 42, height: 42, borderRadius: 21,
             fontSize: 22,
             cursor: selectedIdx === 0 ? 'default' : 'pointer',
             opacity: selectedIdx === 0 ? 0.2 : 0.85,
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
             paddingBottom: 3,
           }}
         >‹</button>
@@ -2114,25 +2040,23 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
             background: 'rgba(0,0,0,0.55)',
             border: '1px solid rgba(255,220,160,0.35)',
             color: '#fff',
-            width: 42,
-            height: 42,
-            borderRadius: 21,
+            width: 42, height: 42, borderRadius: 21,
             fontSize: 22,
             cursor: selectedIdx === US_STATES.length - 1 ? 'default' : 'pointer',
             opacity: selectedIdx === US_STATES.length - 1 ? 0.2 : 0.85,
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
             paddingBottom: 3,
           }}
         >›</button>
       </div>
 
       {/* ===== KODACHROME SLIDE FILMSTRIP =====
-          Each slide uses the real slide reference image as its background,
-          so they look like actual cardboard mounts (not CSS approximations).
-          The state name is overlaid in the embossed text region (top of
-          the mount where the date stamp lives in the reference). */}
+          Each slide is the real PNG as background. Black surrounding pixels
+          blend invisibly into the dark app background. State name overlay
+          sits in the cardboard top band (8-22% of image). Count overlay
+          sits in the cardboard bottom band (76-90% of image). The photo
+          cutout area (22-83% horiz, 33-73% vert) gets a small location
+          count digit only when count > 0. */}
       <div
         onTouchStart={blockGlobalSwipe}
         onTouchMove={blockGlobalSwipe}
@@ -2140,8 +2064,7 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
         style={{
           position: 'absolute',
           bottom: 30,
-          left: 0,
-          right: 0,
+          left: 0, right: 0,
           zIndex: 2,
         }}
       >
@@ -2167,8 +2090,6 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
             const dist = Math.abs(i - selectedIdx);
             const isActive = dist === 0;
             const count = counts[state] || 0;
-            // Falloff curve: distance 0 = full bright, distance 1 dim,
-            // distance 2+ very dim. Same idea as the home page filmstrip.
             const opacity = isActive ? 1 : (dist === 1 ? 0.5 : (dist === 2 ? 0.28 : 0.15));
             const brightness = isActive ? 1 : (dist === 1 ? 0.45 : (dist === 2 ? 0.30 : 0.22));
             const scale = isActive ? 1.0 : (dist === 1 ? 0.86 : (dist === 2 ? 0.78 : 0.74));
@@ -2189,57 +2110,83 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
                   opacity: opacity,
                   filter: 'brightness(' + brightness + ')',
                   transition: 'transform 240ms ease, opacity 240ms ease, filter 240ms ease',
-                  // The slide image as background. background-size:contain
-                  // so the entire mount is visible regardless of slot ratio.
+                  // Real Kodachrome PNG. Surrounding pixels are pure black so
+                  // they blend invisibly into the app's dark background.
                   backgroundImage: 'url(' + SlideMountUrl + ')',
-                  backgroundSize: '100% 100%',
+                  backgroundSize: 'contain',
                   backgroundRepeat: 'no-repeat',
                   backgroundPosition: 'center',
-                  // Soft cast shadow only when active.
-                  boxShadow: isActive
-                    ? '0 12px 26px rgba(0,0,0,0.75), 0 0 0 1px rgba(255,220,160,0.3)'
-                    : 'none',
-                  borderRadius: 4,
                 }}
               >
-                {/* State name overlay — sits in the embossed top-region of
-                    the slide, where the date stamp ("MAY 82") appears in
-                    the reference image. */}
+                {/* State name overlay — positioned in the cardboard TOP band
+                    (8% to 22% of image height, where 'MAY 82' is in the source). */}
                 <div style={{
                   position: 'absolute',
-                  top: '8%',
-                  left: '12%',
-                  right: '12%',
-                  textAlign: 'center',
-                  fontSize: 11,
+                  top: '11%',
+                  left: '15%',
+                  right: '15%',
+                  height: '11%',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  fontSize: 9,
                   fontWeight: 700,
-                  letterSpacing: '0.14em',
+                  letterSpacing: '0.16em',
                   fontFamily: 'Georgia, "Times New Roman", serif',
                   color: '#3a2f1a',
                   textTransform: 'uppercase',
                   whiteSpace: 'nowrap',
                   overflow: 'hidden',
                   textOverflow: 'ellipsis',
-                  // Subtle emboss effect — light shadow up, dark shadow down
                   textShadow: '0 1px 0 rgba(255,255,255,0.4), 0 -1px 0 rgba(0,0,0,0.15)',
+                  pointerEvents: 'none',
                 }}>
                   {state}
                 </div>
 
-                {/* Location count — small, sits below the photo cutout area
-                    where the slide bottom edge has its tactile shadow. */}
+                {/* Photo cutout area — show a count digit when count > 0.
+                    Positioned at 22-83% horiz, 33-73% vert (the dark window). */}
+                {count > 0 && (
+                  <div style={{
+                    position: 'absolute',
+                    left: '22%',
+                    right: '17%',
+                    top: '33%',
+                    bottom: '27%',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    fontSize: 18,
+                    fontWeight: 700,
+                    color: 'rgba(255,220,180,0.55)',
+                    fontFamily: 'system-ui, -apple-system, sans-serif',
+                    pointerEvents: 'none',
+                  }}>
+                    {count}
+                  </div>
+                )}
+
+                {/* Count label overlay — cardboard BOTTOM band (76-90%). */}
                 <div style={{
                   position: 'absolute',
                   bottom: '8%',
-                  left: '12%',
-                  right: '12%',
-                  textAlign: 'center',
-                  fontSize: 9,
+                  left: '15%',
+                  right: '15%',
+                  height: '11%',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  fontSize: 7.5,
+                  fontWeight: 600,
                   letterSpacing: '0.18em',
                   fontFamily: 'Georgia, "Times New Roman", serif',
-                  color: count > 0 ? '#5a4a30' : '#8a8070',
+                  color: count > 0 ? '#5a4a30' : '#7a7060',
                   fontStyle: count === 0 ? 'italic' : 'normal',
                   textTransform: 'uppercase',
+                  whiteSpace: 'nowrap',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  pointerEvents: 'none',
                 }}>
                   {count === 0 ? 'No Sites' : (count === 1 ? '1 Location' : count + ' Locations')}
                 </div>
