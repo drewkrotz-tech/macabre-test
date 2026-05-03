@@ -1056,6 +1056,12 @@ export default function App() {
             }
           } catch { /* proceed */ }
         }
+        // Fire back sound at commit time, BEFORE the 220ms slide-off
+        // animation. Audio starts while the slide-off is animating, so by
+        // the time goBack() triggers the heavy re-render the audio is
+        // already playing smoothly. Firing it inside the setTimeout was
+        // colliding with goBack's render work and causing the black flash.
+        try { playBackSound(); } catch { /* silent */ }
         setX(screenW(), true);
         window.setTimeout(() => {
           const el = _dragWrapperRef.current;
@@ -1071,10 +1077,6 @@ export default function App() {
             prevEl.style.transition = 'none';
             prevEl.style.transform = '';
           }
-          // playBackSound() IS called here — goBack() pops the nav stack
-          // directly without going through the named route helpers, so the
-          // swipe-back path needs its own back sound trigger.
-          try { playBackSound(); } catch { /* silent */ }
           goBack();
           // Tear down the peek layer — the new current view IS the old
           // prev view now, so we don't need a peek layer anymore.
@@ -1876,6 +1878,12 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
   // The projection's image rail uses this to translate horizontally in
   // real time as the user drags the filmstrip.
   const [scrollProgress, setScrollProgress] = useState<number>(0);
+  // Search query — prefix-matches against state names so the user can type
+  // "vir" and have Virginia pop up centered without scrolling 51 slides.
+  const [searchQuery, setSearchQuery] = useState<string>('');
+  const visibleStates = searchQuery
+    ? US_STATES.filter(s => s.toUpperCase().startsWith(searchQuery.toUpperCase()))
+    : US_STATES;
   const stripRef = useRef<HTMLDivElement | null>(null);
   const [glitchSeed, setGlitchSeed] = useState<number>(0);
   const programmaticScrollUntil = useRef<number>(0);
@@ -1891,12 +1899,13 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
     if (!el) return;
     const stride = SLIDE_W + SLIDE_GAP;
     const progress = el.scrollLeft / stride;
-    const clampedProgress = Math.max(0, Math.min(US_STATES.length - 1, progress));
+    const max = Math.max(0, visibleStates.length - 1);
+    const clampedProgress = Math.max(0, Math.min(max, progress));
     setScrollProgress(clampedProgress);
 
     if (Date.now() < programmaticScrollUntil.current) return;
     const idx = Math.round(progress);
-    const clamped = Math.max(0, Math.min(US_STATES.length - 1, idx));
+    const clamped = Math.max(0, Math.min(max, idx));
     if (clamped !== selectedIdx) setSelectedIdx(clamped);
   };
 
@@ -1912,7 +1921,7 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
 
   const onSlideTap = (idx: number) => {
     if (idx === selectedIdx) {
-      onSelectState(US_STATES[idx]);
+      onSelectState(visibleStates[idx]);
       return;
     }
     const el = stripRef.current;
@@ -1939,6 +1948,18 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
     const id = window.setTimeout(tick, 1500);
     return () => { cancelled = true; window.clearTimeout(id); };
   }, []);
+
+  // When the search query changes, snap selectedIdx back to 0 of the
+  // (filtered) visibleStates and reset the filmstrip scroll position so the
+  // first match is always centered on the projection.
+  useEffect(() => {
+    setSelectedIdx(0);
+    setScrollProgress(0);
+    const el = stripRef.current;
+    if (!el) return;
+    programmaticScrollUntil.current = Date.now() + 600;
+    el.scrollTo({ left: 0, behavior: 'auto' });
+  }, [searchQuery]);
 
   const blockGlobalSwipe = (e: React.TouchEvent) => { e.stopPropagation(); };
 
@@ -2013,21 +2034,21 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
             top: 0,
             left: 0,
             height: '100%',
-            width: (US_STATES.length * 100) + '%',
+            width: (Math.max(1, visibleStates.length) * 100) + '%',
             display: 'flex',
-            transform: 'translateX(-' + (scrollProgress * 100 / US_STATES.length) + '%)',
-            // ^ Each state takes 1/51 of the rail's width (since rail is 51x parent
-            // wide and rail items each fill 1/51 of that). To center state i in
-            // the parent, translate the rail left by i * (100/51)% of itself.
+            transform: 'translateX(-' + (visibleStates.length > 0 ? (scrollProgress * 100 / visibleStates.length) : 0) + '%)',
+            // ^ Each visible state takes 1/N of the rail's width. To center
+            // state i, translate the rail left by i * (100/N)% of itself.
+            // Width and divisor scale with the filtered visibleStates count.
             willChange: 'transform',
           }}>
-            {US_STATES.map((state, i) => {
+            {visibleStates.map((state, i) => {
               const stateCount = counts[state] || 0;
               const stateLabel = stateCount === 1 ? '1 LOCATION' : stateCount + ' LOCATIONS';
               return (
                 <div key={state} style={{
                   position: 'relative',
-                  flex: '0 0 ' + (100 / US_STATES.length) + '%',
+                  flex: '0 0 ' + (100 / Math.max(1, visibleStates.length)) + '%',
                   height: '100%',
                   overflow: 'hidden',
                   backgroundColor: '#000',
@@ -2152,6 +2173,88 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
         </div>
       </div>
 
+      {/* ===== SEARCH BAR =====
+          Sits between the projection screen and the filmstrip. Filters the
+          state list as the user types, prefix-matching state names. So
+          typing "vir" filters down to Virginia (and any other state name
+          starting with "vir"), centering the first match on the projection
+          without forcing the user to scroll the whole 51-slide strip. */}
+      <div style={{
+        position: 'relative',
+        width: '92%',
+        maxWidth: 460,
+        margin: '14px auto 0',
+        zIndex: 3,
+      }}>
+        <input
+          type="text"
+          value={searchQuery}
+          onChange={(e) => setSearchQuery(e.target.value)}
+          placeholder="Search states…"
+          autoCorrect="off"
+          autoCapitalize="characters"
+          spellCheck={false}
+          enterKeyHint="search"
+          aria-label="Search states"
+          style={{
+            width: '100%',
+            background: 'rgba(20, 14, 8, 0.85)',
+            border: '1px solid rgba(255, 220, 160, 0.35)',
+            borderRadius: 8,
+            color: '#fff5e0',
+            fontFamily: 'system-ui, -apple-system, sans-serif',
+            fontSize: 15,
+            letterSpacing: '0.18em',
+            textTransform: 'uppercase',
+            padding: '11px 38px 11px 14px',
+            outline: 'none',
+            boxSizing: 'border-box',
+            boxShadow: 'inset 0 1px 4px rgba(0,0,0,0.5), 0 0 18px rgba(255, 200, 130, 0.08)',
+          }}
+        />
+        {searchQuery && (
+          <button
+            type="button"
+            onClick={() => setSearchQuery('')}
+            aria-label="Clear search"
+            className="sinister-pressable"
+            style={{
+              position: 'absolute',
+              right: 6,
+              top: '50%',
+              transform: 'translateY(-50%)',
+              background: 'transparent',
+              border: 'none',
+              color: '#fff5e0',
+              fontSize: 18,
+              width: 28,
+              height: 28,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              cursor: 'pointer',
+              opacity: 0.7,
+              padding: 0,
+            }}
+          >×</button>
+        )}
+        {searchQuery && visibleStates.length === 0 && (
+          <div style={{
+            position: 'absolute',
+            top: 'calc(100% + 6px)',
+            left: 0,
+            right: 0,
+            textAlign: 'center',
+            fontSize: 12,
+            color: '#fff5e088',
+            letterSpacing: '0.18em',
+            textTransform: 'uppercase',
+            fontFamily: 'system-ui, -apple-system, sans-serif',
+            pointerEvents: 'none',
+          }}>No matches</div>
+        )}
+      </div>
+
       <div
         onTouchStart={blockGlobalSwipe}
         onTouchMove={blockGlobalSwipe}
@@ -2181,7 +2284,7 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
             paddingBottom: 22,
           }}
         >
-          {US_STATES.map((state, i) => {
+          {visibleStates.map((state, i) => {
             const dist = Math.abs(i - selectedIdx);
             const isActive = dist === 0;
             const count = counts[state] || 0;
