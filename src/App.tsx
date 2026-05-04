@@ -2602,7 +2602,7 @@ function DetailView({ site, currentLocation, onBack }: {
   const distM = currentLocation ? distanceMeters(currentLocation.lat, currentLocation.lng, site.coords.lat, site.coords.lng) : null;
   const distMi = distM ? (distM / 1609.34).toFixed(1) : null;
   const handleDirections = () => {
-    playForward();
+    playBell();
     // Smart cross-platform directions opener:
     //   1. Try `geo:` scheme — iOS/Android show an "open with..." picker so
     //      the user lands in their preferred maps app (Apple Maps, Google Maps,
@@ -2758,7 +2758,7 @@ function SubmitView({ currentLocation, onBack }: {
 
   const pin = pinLatLng();
   const titleOk     = title.trim().length >= 3 && title.trim().length <= 120;
-  const fullOk      = fullDesc.trim().length >= 20 && fullDesc.trim().length <= 1000;
+  const fullOk      = fullDesc.trim().length >= 20 && fullDesc.trim().length <= 500;
   const submitterOk = submitter.trim().length >= 2 && submitter.trim().length <= 30;
   const photoOk     = !!photoFile;
   const locOk       = pin !== null;
@@ -2867,10 +2867,10 @@ function SubmitView({ currentLocation, onBack }: {
                  placeholder="e.g. The Cavalier Hotel" maxLength={120} style={S.input} />
         </Field>
 
-        <Field label="Description" valid={fullOk} hint="20-1000 characters — the full story">
+        <Field label="Description" valid={fullOk} hint="20-500 characters — the full story">
           <textarea value={fullDesc} onChange={(e) => setFullDesc(e.target.value)}
                     placeholder="When, who, what happened — the whole story."
-                    maxLength={1000} rows={6} style={{ ...S.input, ...S.textarea }} />
+                    maxLength={500} rows={6} style={{ ...S.input, ...S.textarea }} />
         </Field>
 
         <Field label="Category" valid={true}>
