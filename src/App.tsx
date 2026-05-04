@@ -177,7 +177,7 @@ async function apiLeaderboardSubmitters(limit = 25): Promise<LeaderRow[]> {
   try {
     const res = await fetch(`${API_BASE}/leaderboard/submitters?limit=${limit}`);
     const data = await res.json();
-    const rows = data?.leaderboard || data?.rows || data?.results || [];
+    const rows = data?.entries || data?.leaderboard || data?.rows || data?.results || [];
     return Array.isArray(rows) ? rows : [];
   } catch { return []; }
 }
@@ -186,7 +186,7 @@ async function apiLeaderboardVisitors(limit = 25): Promise<LeaderRow[]> {
   try {
     const res = await fetch(`${API_BASE}/leaderboard/visitors?limit=${limit}`);
     const data = await res.json();
-    const rows = data?.leaderboard || data?.rows || data?.results || [];
+    const rows = data?.entries || data?.leaderboard || data?.rows || data?.results || [];
     return Array.isArray(rows) ? rows : [];
   } catch { return []; }
 }
