@@ -4126,7 +4126,7 @@ const S: Record<string, React.CSSProperties> = {
   detailDivider: { height: 2, margin: '18px 0', borderRadius: 2 },
   detailDescription: { fontSize: 15, lineHeight: 1.65, color: BONE },
   detailPara: { marginBottom: 16 },
-  directionsButton: { width: '100%', backgroundColor: 'transparent', padding: '16px', fontSize: 14, fontWeight: 900, letterSpacing: '0.15em', cursor: 'pointer', marginTop: 18, fontFamily: 'inherit', borderRadius: 16 },
+  directionsButton: { width: '100%', boxSizing: 'border-box', backgroundColor: 'transparent', padding: '16px', fontSize: 14, fontWeight: 900, letterSpacing: '0.15em', cursor: 'pointer', marginTop: 18, fontFamily: 'inherit', borderRadius: 16 },
   imageCredit: { fontSize: 10, color: GRAY_MID, textAlign: 'center', marginTop: 18, letterSpacing: '0.15em' },
 
   formBody: { padding: '16px 20px 60px', display: 'flex', flexDirection: 'column', gap: 18, position: 'relative', zIndex: 1, maxWidth: '100%', overflowX: 'hidden', boxSizing: 'border-box' },
