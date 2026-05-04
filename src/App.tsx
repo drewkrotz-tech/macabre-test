@@ -2277,61 +2277,136 @@ function BadgeGroup({ title, badges, accent }: {
 // Performance note: useMemo on the grouped structure keeps re-renders
 // cheap as the user types. We're well under 1000 sites for now so this is
 // already overkill, but it costs nothing and pays off as the catalog grows.
+// ---------- List View ----------
+// Three-level drill-down for browsing the catalog without going through the
+// home filmstrip:
+//
+//   Level 1: Categories   (Hauntings • 6 locations)
+//   Level 2: States       (Virginia • 6 locations)
+//   Level 3: Locations    (rows that open DetailView on tap)
+//
+// All three levels share one persistent search bar at the top — a search
+// term applied at the category level filters out categories that have zero
+// matching sites, applied at the state level filters states the same way,
+// and on the locations level filters individual rows. This gives the user
+// one mental model regardless of where they are.
+//
+// Empty categories (zero approved sites) are hidden from level 1 entirely
+// so users only see categories with content. Same for empty states.
+//
+// Tapping a row at level 3 calls onSelectSite which opens the existing
+// DetailView — same flow as everywhere else, no changes needed there.
+//
+// This component manages its own internal back-stack rather than going
+// through App's view system. That keeps app-level swipe-back simple
+// (one swipe right closes ListView entirely from anywhere inside it),
+// and matches what users would expect on a drill-down browser.
 function ListView({ sites, currentLocation, onSelectSite, onBack }: {
   sites: SinisterSite[];
   currentLocation: { lat: number; lng: number } | null;
   onSelectSite: (site: SinisterSite) => void;
   onBack: () => void;
 }) {
+  type Level =
+    | { kind: 'categories' }
+    | { kind: 'states'; category: CategoryKey }
+    | { kind: 'sites'; category: CategoryKey; state: string };
+  const [level, setLevel] = useState<Level>({ kind: 'categories' });
   const [query, setQuery] = useState('');
   const q = query.trim().toLowerCase();
 
-  // Group sites: { [categoryKey]: { [state]: site[] } }
-  // Built once per render with useMemo — recomputes when sites or query
-  // change, which is exactly what we want.
-  const grouped = useMemo(() => {
-    const out: Record<string, Record<string, SinisterSite[]>> = {};
-    for (const site of sites) {
-      // Apply search filter early so groups with zero matches collapse.
-      if (q) {
-        const cat = CATEGORIES.find(c => c.key === site.category);
-        const catLabel = (cat?.label || site.category).toLowerCase();
-        const hay = `${site.title} ${site.state} ${catLabel}`.toLowerCase();
-        if (!hay.includes(q)) continue;
-      }
-      const cat = site.category as string;
-      if (!out[cat]) out[cat] = {};
-      const state = site.state || 'Unknown';
-      if (!out[cat][state]) out[cat][state] = [];
-      out[cat][state].push(site);
+  // Helper — does a site match the current search query? Empty query
+  // matches everything. Used by every level.
+  const siteMatches = (site: SinisterSite): boolean => {
+    if (!q) return true;
+    const cat = CATEGORIES.find(c => c.key === site.category);
+    const catLabel = (cat?.label || site.category).toLowerCase();
+    const hay = `${site.title} ${site.state} ${catLabel}`.toLowerCase();
+    return hay.includes(q);
+  };
+
+  // Level 1: list of categories that have at least one matching site.
+  // Counts only matching sites — searching "virginia" with one VA cult site
+  // would show "Cults • 1" alongside "Hauntings • N" rather than the full
+  // catalog count.
+  const categoryRows = useMemo(() => {
+    const rows: { cat: typeof CATEGORIES[number]; count: number }[] = [];
+    for (const cat of CATEGORIES) {
+      const count = sites.filter(s => s.category === cat.key && siteMatches(s)).length;
+      if (count > 0) rows.push({ cat, count });
     }
-    // Sort sites alphabetically within each state for predictable ordering.
-    for (const cat of Object.keys(out)) {
-      for (const state of Object.keys(out[cat])) {
-        out[cat][state].sort((a, b) => a.title.localeCompare(b.title));
-      }
-    }
-    return out;
+    return rows;
   }, [sites, q]);
 
-  // Iterate categories in the same order as the home page filmstrip so
-  // the visual hierarchy matches what users already learned. States are
-  // sorted alphabetically within each category — simple and predictable.
-  const orderedCategories = CATEGORIES.filter(c => grouped[c.key] && Object.keys(grouped[c.key]).length > 0);
-  const totalMatches = sites.length === 0 ? 0 :
-    Object.values(grouped).reduce((sum, byState) =>
-      sum + Object.values(byState).reduce((s2, list) => s2 + list.length, 0), 0);
+  // Level 2: list of states for the chosen category, with matching counts.
+  const stateRows = useMemo(() => {
+    if (level.kind !== 'states') return [];
+    const filtered = sites.filter(s => s.category === level.category && siteMatches(s));
+    const counts = new Map<string, number>();
+    for (const s of filtered) {
+      const st = s.state || 'Unknown';
+      counts.set(st, (counts.get(st) || 0) + 1);
+    }
+    return Array.from(counts.entries())
+      .map(([state, count]) => ({ state, count }))
+      .sort((a, b) => a.state.localeCompare(b.state));
+  }, [sites, q, level]);
+
+  // Level 3: list of sites for the chosen category + state.
+  const siteRows = useMemo(() => {
+    if (level.kind !== 'sites') return [];
+    return sites
+      .filter(s => s.category === level.category && s.state === level.state && siteMatches(s))
+      .sort((a, b) => a.title.localeCompare(b.title));
+  }, [sites, q, level]);
+
+  // Title in the header reflects the current level so the user always knows
+  // where they are in the drill-down.
+  const titleText =
+    level.kind === 'categories' ? 'List View' :
+    level.kind === 'states' ? (CATEGORIES.find(c => c.key === level.category)?.label || 'States') :
+    level.state;
+
+  // Subtitle on level 2/3 — gives breadcrumb context. On level 1 it's hidden.
+  const subtitleText =
+    level.kind === 'states' ? 'Choose a state' :
+    level.kind === 'sites' ? (CATEGORIES.find(c => c.key === level.category)?.label || '') :
+    '';
+
+  // In-component back: at level 3 -> level 2, at level 2 -> level 1, at
+  // level 1 -> close the whole ListView (delegate to onBack from parent).
+  const goBackInternal = () => {
+    playBackSound();
+    if (level.kind === 'sites') {
+      setLevel({ kind: 'states', category: level.category });
+    } else if (level.kind === 'states') {
+      setLevel({ kind: 'categories' });
+    } else {
+      onBack();
+    }
+  };
 
   return (
     <div style={S.appBg}>
       <header style={S.header}>
         <div style={{ ...S.categoryViewTitle, color: WHITE, textShadow: `0 0 14px ${WHITE}cc` }}>
-          List View
+          {titleText}
         </div>
+        {subtitleText && (
+          <div style={S.listSubtitle}>{subtitleText}</div>
+        )}
       </header>
 
-      {/* Search bar — title / state / category text match. Same visual
-          language as the search bar on CategoryView. */}
+      {/* In-component back button — rendered only at level 2 or 3 since
+          level 1's back is the swipe-right gesture handled by App. We give
+          users an explicit visible way to step back one level without
+          swiping all the way out and re-entering. */}
+      {level.kind !== 'categories' && (
+        <div style={S.listBackBar}>
+          <button style={S.listBackBtn} onClick={goBackInternal}>← Back</button>
+        </div>
+      )}
+
       <div style={S.listSearchWrap}>
         <div style={{ position: 'relative', flex: 1 }}>
           <input
@@ -2356,44 +2431,80 @@ function ListView({ sites, currentLocation, onSelectSite, onBack }: {
       <div style={S.leaderBody}>
         {sites.length === 0 ? (
           <p style={S.aboutPara}>Loading sites…</p>
-        ) : totalMatches === 0 ? (
-          <p style={S.aboutPara}>
-            No matches for "{query}". Try a different search.
-          </p>
+        ) : level.kind === 'categories' ? (
+          // ---- Level 1: Categories ----
+          categoryRows.length === 0 ? (
+            <p style={S.aboutPara}>
+              No matches for "{query}". Try a different search.
+            </p>
+          ) : (
+            <div style={S.listSitesWrap}>
+              {categoryRows.map(({ cat, count }) => {
+                const color = CATEGORY_COLOR[cat.key];
+                return (
+                  <button
+                    key={cat.key}
+                    style={{ ...S.listCategoryRow, borderColor: `${color}55`, boxShadow: `0 0 10px ${color}22, inset 0 0 6px ${color}11` }}
+                    onClick={() => { playForward(); setLevel({ kind: 'states', category: cat.key }); }}
+                  >
+                    <span style={{ ...S.listRowDot, background: color, boxShadow: `0 0 6px ${color}` }} />
+                    <span style={{ ...S.listRowTitle, color, textShadow: `0 0 8px ${color}88` }}>{cat.label}</span>
+                    <span style={S.listRowCount}>{count} {count === 1 ? 'location' : 'locations'}</span>
+                    <span style={S.listChevron}>›</span>
+                  </button>
+                );
+              })}
+            </div>
+          )
+        ) : level.kind === 'states' ? (
+          // ---- Level 2: States ----
+          stateRows.length === 0 ? (
+            <p style={S.aboutPara}>
+              No matches for "{query}" in this category.
+            </p>
+          ) : (
+            <div style={S.listSitesWrap}>
+              {(() => {
+                const color = CATEGORY_COLOR[level.category];
+                return stateRows.map(({ state, count }) => (
+                  <button
+                    key={state}
+                    style={S.listRow}
+                    onClick={() => { playForward(); setLevel({ kind: 'sites', category: level.category, state }); }}
+                  >
+                    <span style={{ ...S.listRowDot, background: color, boxShadow: `0 0 6px ${color}` }} />
+                    <span style={S.listRowTitle}>{state}</span>
+                    <span style={S.listRowCount}>{count} {count === 1 ? 'location' : 'locations'}</span>
+                    <span style={S.listChevron}>›</span>
+                  </button>
+                ));
+              })()}
+            </div>
+          )
         ) : (
-          orderedCategories.map((cat) => {
-            const byState = grouped[cat.key];
-            const states = Object.keys(byState).sort();
-            const color = CATEGORY_COLOR[cat.key];
-            return (
-              <div key={cat.key} style={{ marginBottom: 28 }}>
-                <div style={{ ...S.listCategoryHeader, color, textShadow: `0 0 10px ${color}88`, borderBottom: `1px solid ${color}44` }}>
-                  {cat.label}
-                </div>
-                {states.map((state) => {
-                  const stateSites = byState[state];
-                  return (
-                    <div key={state} style={{ marginTop: 12 }}>
-                      <div style={S.listStateHeader}>{state}</div>
-                      <div style={S.listSitesWrap}>
-                        {stateSites.map((site) => (
-                          <button
-                            key={site.id}
-                            style={S.listRow}
-                            onClick={() => { playForward(); onSelectSite(site); }}
-                          >
-                            <span style={{ ...S.listRowDot, background: color, boxShadow: `0 0 6px ${color}` }} />
-                            <span style={S.listRowTitle}>{site.title}</span>
-                            <span style={S.listRowState}>{site.state}</span>
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            );
-          })
+          // ---- Level 3: Sites ----
+          siteRows.length === 0 ? (
+            <p style={S.aboutPara}>
+              No matches for "{query}" in this state.
+            </p>
+          ) : (
+            <div style={S.listSitesWrap}>
+              {(() => {
+                const color = CATEGORY_COLOR[level.category];
+                return siteRows.map((site) => (
+                  <button
+                    key={site.id}
+                    style={S.listRow}
+                    onClick={() => { playForward(); onSelectSite(site); }}
+                  >
+                    <span style={{ ...S.listRowDot, background: color, boxShadow: `0 0 6px ${color}` }} />
+                    <span style={S.listRowTitle}>{site.title}</span>
+                    <span style={S.listChevron}>›</span>
+                  </button>
+                ));
+              })()}
+            </div>
+          )
         )}
       </div>
     </div>
@@ -3342,8 +3453,6 @@ function CategoryView({ label, color, sites, currentLocation, onSelectSite, onSu
       >
         <span style={S.submitFixedButtonText}>Submit a Location</span>
       </button>
-
-      <SocialBar onAbout={onBack} />
     </div>
   );
 }
@@ -4546,7 +4655,11 @@ const S: Record<string, React.CSSProperties> = {
   submitFixedButton: {
     position: 'fixed',
     left: '50%',
-    bottom: 70,
+    // Lifted from bottom: 70 to 110 so there's a clear visual gap above
+    // the bottom social bar (Dread Leaders / List / About) at bottom: 14.
+    // That separation makes Submit read as the primary action, since
+    // submissions are how the app's catalog grows.
+    bottom: 110,
     transform: 'translateX(-50%)',
     zIndex: 3,
     backgroundColor: 'transparent',
@@ -4799,27 +4912,62 @@ const S: Record<string, React.CSSProperties> = {
     boxSizing: 'border-box' as const,
     width: '100%',
   },
-  listCategoryHeader: {
-    fontSize: 16,
-    fontWeight: 900,
-    letterSpacing: '0.22em',
-    textTransform: 'uppercase' as const,
-    paddingBottom: 8,
-    marginBottom: 4,
-  },
-  listStateHeader: {
+  // Subtitle under the level title — used at level 2/3 to give a hint of
+  // what the user is choosing from. Small, dim, all-caps for that catalog feel.
+  listSubtitle: {
     fontSize: 11,
-    fontWeight: 800,
+    color: '#888',
     letterSpacing: '0.22em',
     textTransform: 'uppercase' as const,
-    color: '#888',
-    marginBottom: 6,
-    marginTop: 8,
+    fontWeight: 700,
+    marginTop: 4,
+    textAlign: 'center' as const,
+  },
+  // In-component back bar — sits between header and search to give users
+  // a visible "step back one level" affordance without forcing them to
+  // swipe out of List View entirely.
+  listBackBar: {
+    padding: '0 20px 4px',
+    maxWidth: 600,
+    margin: '0 auto',
+    boxSizing: 'border-box' as const,
+    width: '100%',
+  },
+  listBackBtn: {
+    background: 'transparent',
+    border: '1px solid #2a2a2a',
+    color: '#aaa',
+    padding: '8px 14px',
+    fontSize: 12,
+    fontWeight: 700,
+    letterSpacing: '0.15em',
+    borderRadius: 8,
+    cursor: 'pointer',
+    fontFamily: 'inherit',
+    textTransform: 'uppercase' as const,
   },
   listSitesWrap: {
     display: 'flex',
     flexDirection: 'column' as const,
     gap: 6,
+  },
+  // Category-row variant — slightly taller and uses a border/glow tint
+  // matched to the category color so the level-1 picker feels distinct
+  // from the state and site rows below it.
+  listCategoryRow: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 12,
+    width: '100%',
+    boxSizing: 'border-box' as const,
+    padding: '16px 14px',
+    background: '#0d0d0d',
+    border: '1px solid',
+    borderRadius: 10,
+    color: BONE,
+    fontFamily: 'inherit',
+    cursor: 'pointer',
+    textAlign: 'left' as const,
   },
   listRow: {
     display: 'flex',
@@ -4844,9 +4992,9 @@ const S: Record<string, React.CSSProperties> = {
   },
   listRowTitle: {
     flex: 1,
-    fontSize: 13,
-    fontWeight: 600,
-    letterSpacing: '0.02em',
+    fontSize: 14,
+    fontWeight: 700,
+    letterSpacing: '0.04em',
     overflow: 'hidden' as const,
     textOverflow: 'ellipsis' as const,
     whiteSpace: 'nowrap' as const,
@@ -4858,6 +5006,22 @@ const S: Record<string, React.CSSProperties> = {
     letterSpacing: '0.12em',
     textTransform: 'uppercase' as const,
     flexShrink: 0,
+  },
+  // "6 locations" count text — used on category and state rows.
+  listRowCount: {
+    fontSize: 11,
+    color: '#888',
+    fontWeight: 600,
+    letterSpacing: '0.08em',
+    flexShrink: 0,
+  },
+  // Right-side chevron indicating drill-down. Subtle, monochrome.
+  listChevron: {
+    fontSize: 18,
+    color: '#555',
+    flexShrink: 0,
+    marginLeft: 4,
+    lineHeight: 1,
   },
   aboutLinkBtn: {
     width: '100%',
