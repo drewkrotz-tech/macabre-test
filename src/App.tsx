@@ -3201,38 +3201,29 @@ function AboutView({ onBack }: { onBack: () => void }) {
           cults, serial killers, and unsettling history hiding all around you.
         </p>
 
-        <div style={S.aboutSectionHeader}>How to Use the App</div>
+        <div style={S.aboutSectionHeader}>What This App Does</div>
 
         <p style={S.aboutPara}>
-          <b>Browse the catalog.</b> Tap any category on the home page (Hauntings, True Crime, Cults, etc.) to
-          see locations in that category. Or tap <b>List View</b> at the bottom to drill down by Category → State → Location.
+          <b>Notifies you when you're near sinister sites.</b> The app runs in the background and pings you when
+          you come within range of a haunting, crime scene, or other macabre location — even when the app is closed.
+          Set location access to "Always" for this to work.
         </p>
         <p style={S.aboutPara}>
-          <b>Get details on a location.</b> Tap any location to see its full story, exact coordinates, and distance from you.
-          Tap <b>Get Directions</b> to open it in your maps app.
+          <b>Tells the story behind every location.</b> Each site has its full history, exact coordinates, and
+          turn-by-turn directions in your maps app.
         </p>
         <p style={S.aboutPara}>
-          <b>Get pinged when you're near one.</b> The app runs in the background and notifies you when you come within
-          range of a sinister site — even if the app is closed. Make sure location access is set to "Always."
+          <b>Lets you claim visits.</b> Stand within 100 feet of any site and tap "I'm Here" to log your visit.
+          Visits earn you badges and rank you on the Dread Leaders board.
         </p>
         <p style={S.aboutPara}>
-          <b>Claim your visits.</b> When you're within 100 feet of a site, the <b>I'm Here</b> button appears on its detail page.
-          Tap it to log the visit. Your visits are tied to your handle and earn you badges.
+          <b>Lets you add your own locations.</b> Found a sinister spot we don't have? Tap Submit a Location while
+          you're physically on-site — the app verifies your GPS and requires an on-site photo. Approved entries
+          are credited to your handle permanently.
         </p>
         <p style={S.aboutPara}>
-          <b>Submit a new location.</b> Found a sinister spot we don't have yet? Tap <b>Submit a Location</b> on the
-          home page. You must be <b>physically on-site</b> to submit — the app requires GPS verification plus an
-          on-site photo. Approved submissions are permanently credited to your handle.
-        </p>
-        <p style={S.aboutPara}>
-          <b>Earn badges.</b> Submit and visit sites to unlock tiered badges. Tap <b>Dread Leaders</b> on the home page,
-          then tap your handle to see what you've earned. There are also category-specific badges and rare special achievements.
-        </p>
-        <p style={S.aboutPara}>
-          <b>See the leaderboards.</b> Dread Leaders ranks the top submitters and top visitors. Tap any handle to see their badges.
-        </p>
-        <p style={S.aboutPara}>
-          <b>Swipe to go back.</b> Anywhere in the app, swipe right from the left edge of the screen to return to the previous page.
+          <b>Tracks your achievements.</b> Earn tiered badges for submissions and visits. Unlock special badges
+          for milestones like visiting all six categories or reaching new states.
         </p>
 
         <div style={S.aboutSectionHeader}>About</div>
