@@ -1184,21 +1184,12 @@ export default function App() {
   // the DOM yet at that moment.
   const _pendingScrollRestore = useRef<number | null>(null);
   const setView = (next: View) => {
-    // Capture scroll position SYNCHRONOUSLY before any state update. Doing
-    // this inside the state updater is unsafe — React may run the updater
-    // multiple times (Strict Mode) or asynchronously, and by then the
-    // scroll position can have changed (e.g. the button tap that triggered
-    // the nav fired focus events that scrolled the page). Reading it here,
-    // before _setViewRaw is even called, guarantees we record the user's
-    // actual position when they initiated the navigation.
     const sy = (typeof window !== 'undefined')
       ? (window.scrollY || document.documentElement.scrollTop || 0)
       : 0;
     _setViewRaw((prev) => {
-      // Don't push if the new view is the same as current (no-op nav).
       if (JSON.stringify(prev) !== JSON.stringify(next)) {
         _navHistory.current.push({ view: prev, scrollY: sy });
-        // Cap history at 50 to avoid unbounded growth.
         if (_navHistory.current.length > 50) _navHistory.current.shift();
       }
       return next;
@@ -1206,7 +1197,7 @@ export default function App() {
   };
   const goBack = () => {
     const stack = _navHistory.current;
-    if (stack.length === 0) return; // already at oldest, no-op
+    if (stack.length === 0) return;
     const entry = stack.pop()!;
     _pendingScrollRestore.current = entry.scrollY;
     _setViewRaw(entry.view);
@@ -1388,9 +1379,30 @@ export default function App() {
         // previous view so the peek layer mounts. This is the right
         // moment - we know the user wants to swipe back, and the layer
         // wasn't bleeding into normal page interaction beforehand.
+        //
+        // We also set document scroll to the saved position from the top
+        // of the history stack RIGHT NOW, before goBack() fires later
+        // (after the slide animation completes). The peek layer is fixed-
+        // position and renders the previous view at scroll 0, but the
+        // moment goBack() unmounts the current view and mounts the
+        // previous one, that previous view's content lands inside the
+        // normal document flow — and the document needs to already be at
+        // the right scroll offset for the user to land where they were.
+        // Setting it here, ~220ms before goBack runs, gives the document
+        // plenty of time to settle without any visible flicker.
         const stack = _navHistory.current;
         if (stack.length > 0) {
-          setPrevView(stack[stack.length - 1].view);
+          const top = stack[stack.length - 1];
+          setPrevView(top.view);
+          // Stash the value so the restore effect can re-confirm it
+          // after the new view mounts (handles the edge case where the
+          // page hasn't laid out tall enough yet at this exact moment).
+          _pendingScrollRestore.current = top.scrollY;
+          if (typeof window !== 'undefined') {
+            try {
+              window.scrollTo({ top: top.scrollY, left: 0, behavior: 'auto' as ScrollBehavior });
+            } catch { /* silent */ }
+          }
         }
       }
 
@@ -3186,9 +3198,45 @@ function AboutView({ onBack }: { onBack: () => void }) {
       <div style={S.aboutBody}>
         <p style={S.aboutPara}>
           <b>Sinister Locations</b> is a field guide to the macabre — historic crimes, hauntings, horror film locations,
-          cults, serial killers, and unsettling history hiding all around you. The app pings you when you're near a site
-          worth knowing about.
+          cults, serial killers, and unsettling history hiding all around you.
         </p>
+
+        <div style={S.aboutSectionHeader}>How to Use the App</div>
+
+        <p style={S.aboutPara}>
+          <b>Browse the catalog.</b> Tap any category on the home page (Hauntings, True Crime, Cults, etc.) to
+          see locations in that category. Or tap <b>List View</b> at the bottom to drill down by Category → State → Location.
+        </p>
+        <p style={S.aboutPara}>
+          <b>Get details on a location.</b> Tap any location to see its full story, exact coordinates, and distance from you.
+          Tap <b>Get Directions</b> to open it in your maps app.
+        </p>
+        <p style={S.aboutPara}>
+          <b>Get pinged when you're near one.</b> The app runs in the background and notifies you when you come within
+          range of a sinister site — even if the app is closed. Make sure location access is set to "Always."
+        </p>
+        <p style={S.aboutPara}>
+          <b>Claim your visits.</b> When you're within 100 feet of a site, the <b>I'm Here</b> button appears on its detail page.
+          Tap it to log the visit. Your visits are tied to your handle and earn you badges.
+        </p>
+        <p style={S.aboutPara}>
+          <b>Submit a new location.</b> Found a sinister spot we don't have yet? Tap <b>Submit a Location</b> on the
+          home page. You must be <b>physically on-site</b> to submit — the app requires GPS verification plus an
+          on-site photo. Approved submissions are permanently credited to your handle.
+        </p>
+        <p style={S.aboutPara}>
+          <b>Earn badges.</b> Submit and visit sites to unlock tiered badges. Tap <b>Dread Leaders</b> on the home page,
+          then tap your handle to see what you've earned. There are also category-specific badges and rare special achievements.
+        </p>
+        <p style={S.aboutPara}>
+          <b>See the leaderboards.</b> Dread Leaders ranks the top submitters and top visitors. Tap any handle to see their badges.
+        </p>
+        <p style={S.aboutPara}>
+          <b>Swipe to go back.</b> Anywhere in the app, swipe right from the left edge of the screen to return to the previous page.
+        </p>
+
+        <div style={S.aboutSectionHeader}>About</div>
+
         <p style={S.aboutPara}>
           Part of the Sinister family — alongside Sinister Trivia and the Sinister Vids YouTube channel.
         </p>
@@ -3196,6 +3244,7 @@ function AboutView({ onBack }: { onBack: () => void }) {
           User submissions require an on-site photo and GPS verification. Approved entries are credited to the submitter
           permanently.
         </p>
+
         <div style={{ marginTop: 24 }}>
           <button
             style={{ ...S.aboutLinkBtn, border: `2px solid ${WHITE}`, color: WHITE }}
@@ -4758,6 +4807,22 @@ const S: Record<string, React.CSSProperties> = {
     margin: '0 auto',
   },
   aboutPara: { fontSize: 14, lineHeight: 1.6, marginBottom: 14 },
+  // Section divider for the About page — small caps banner with a thin
+  // underline. Used to separate the How-To content from the brand /
+  // submission policy blurb so the page scans cleanly without feeling like
+  // a wall of text.
+  aboutSectionHeader: {
+    fontSize: 12,
+    fontWeight: 900,
+    letterSpacing: '0.28em',
+    textTransform: 'uppercase' as const,
+    color: WHITE,
+    textShadow: `0 0 8px ${WHITE}88`,
+    marginTop: 28,
+    marginBottom: 14,
+    paddingBottom: 8,
+    borderBottom: '1px solid #2a2a2a',
+  },
 
   // ---- Dread Leaders / Badges styles ----
   // Body uses the same width constraint as aboutBody so the leaderboard
