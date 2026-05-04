@@ -2,7 +2,7 @@
 declare module '*.ttf' { const url: string; export default url; }
 declare module '*.png' { const url: string; export default url; }
 
-import { forwardRef, useEffect, useRef, useState } from 'react';
+import { forwardRef, useEffect, useMemo, useRef, useState } from 'react';
 import {
   startGeofencing,
   stopGeofencing,
@@ -191,13 +191,17 @@ async function apiLeaderboardVisitors(limit = 25): Promise<LeaderRow[]> {
   } catch { return []; }
 }
 
-async function apiGetBadges(handle: string): Promise<BadgeRow[]> {
+async function apiGetBadges(handle: string): Promise<{ badges: BadgeRow[]; submitCount: number; visitCount: number }> {
   try {
     const res = await fetch(`${API_BASE}/badges/${encodeURIComponent(handle)}`);
     const data = await res.json();
     const list = data?.badges || [];
-    return Array.isArray(list) ? list : [];
-  } catch { return []; }
+    return {
+      badges: Array.isArray(list) ? list : [],
+      submitCount: typeof data?.submitCount === 'number' ? data.submitCount : 0,
+      visitCount: typeof data?.visitCount === 'number' ? data.visitCount : 0,
+    };
+  } catch { return { badges: [], submitCount: 0, visitCount: 0 }; }
 }
 
 // ---------- Live site fetch ----------
@@ -366,13 +370,22 @@ function playSlide() {
     if (!_slideAudioCtx || !_slideAudioBuffer || !_slideAudioGain) {
       return;
     }
-    if (_slideAudioCtx.state === 'suspended') {
-      _slideAudioCtx.resume().catch(() => { /* silent */ });
+    const ctx = _slideAudioCtx;
+    const buf = _slideAudioBuffer;
+    const gain = _slideAudioGain;
+    const fire = () => {
+      try {
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        src.connect(gain);
+        src.start(0);
+      } catch { /* silent */ }
+    };
+    if (ctx.state !== 'running') {
+      ctx.resume().then(fire).catch(() => { /* silent */ });
+    } else {
+      fire();
     }
-    const src = _slideAudioCtx.createBufferSource();
-    src.buffer = _slideAudioBuffer;
-    src.connect(_slideAudioGain);
-    src.start(0);
   } catch { /* silent */ }
 }
 
@@ -412,13 +425,33 @@ function playButton() {
   try {
     ensureButtonAudio();
     if (_buttonAudioCtx && _buttonAudioBuffer && _buttonAudioGain) {
-      if (_buttonAudioCtx.state === 'suspended') {
-        _buttonAudioCtx.resume().catch(() => { /* silent */ });
+      const ctx = _buttonAudioCtx;
+      const buf = _buttonAudioBuffer;
+      const gain = _buttonAudioGain;
+      // If suspended/interrupted, resume() is async. Without awaiting, the
+      // first start(0) after foregrounding fires while the clock is still
+      // frozen and the sample is silently dropped. Defer the start until
+      // resume completes; on the happy path (already running) this is just
+      // an immediate fire-and-forget.
+      const fire = () => {
+        try {
+          const src = ctx.createBufferSource();
+          src.buffer = buf;
+          src.connect(gain);
+          src.start(0);
+        } catch { /* silent */ }
+      };
+      if (ctx.state !== 'running') {
+        ctx.resume().then(fire).catch(() => {
+          // Resume failed (e.g. no user gesture yet) — fall through to
+          // HTMLAudioElement which is more permissive.
+          if (_buttonAudio) {
+            try { _buttonAudio.currentTime = 0; void _buttonAudio.play(); } catch { /* silent */ }
+          }
+        });
+      } else {
+        fire();
       }
-      const src = _buttonAudioCtx.createBufferSource();
-      src.buffer = _buttonAudioBuffer;
-      src.connect(_buttonAudioGain);
-      src.start(0);
       return;
     }
     if (_buttonAudio) {
@@ -463,13 +496,26 @@ function playBackSound() {
   try {
     ensureBackAudio();
     if (_backAudioCtx && _backAudioBuffer && _backAudioGain) {
-      if (_backAudioCtx.state === 'suspended') {
-        _backAudioCtx.resume().catch(() => { /* silent */ });
+      const ctx = _backAudioCtx;
+      const buf = _backAudioBuffer;
+      const gain = _backAudioGain;
+      const fire = () => {
+        try {
+          const src = ctx.createBufferSource();
+          src.buffer = buf;
+          src.connect(gain);
+          src.start(0);
+        } catch { /* silent */ }
+      };
+      if (ctx.state !== 'running') {
+        ctx.resume().then(fire).catch(() => {
+          if (_backAudio) {
+            try { _backAudio.currentTime = 0; void _backAudio.play(); } catch { /* silent */ }
+          }
+        });
+      } else {
+        fire();
       }
-      const src = _backAudioCtx.createBufferSource();
-      src.buffer = _backAudioBuffer;
-      src.connect(_backAudioGain);
-      src.start(0);
       return;
     }
     if (_backAudio) {
@@ -514,13 +560,26 @@ function playBell() {
   try {
     ensureBellAudio();
     if (_bellAudioCtx && _bellAudioBuffer && _bellAudioGain) {
-      if (_bellAudioCtx.state === 'suspended') {
-        _bellAudioCtx.resume().catch(() => { /* silent */ });
+      const ctx = _bellAudioCtx;
+      const buf = _bellAudioBuffer;
+      const gain = _bellAudioGain;
+      const fire = () => {
+        try {
+          const src = ctx.createBufferSource();
+          src.buffer = buf;
+          src.connect(gain);
+          src.start(0);
+        } catch { /* silent */ }
+      };
+      if (ctx.state !== 'running') {
+        ctx.resume().then(fire).catch(() => {
+          if (_bellAudio) {
+            try { _bellAudio.currentTime = 0; void _bellAudio.play(); } catch { /* silent */ }
+          }
+        });
+      } else {
+        fire();
       }
-      const src = _bellAudioCtx.createBufferSource();
-      src.buffer = _bellAudioBuffer;
-      src.connect(_bellAudioGain);
-      src.start(0);
       return;
     }
     if (_bellAudio) {
@@ -528,6 +587,54 @@ function playBell() {
       void _bellAudio.play();
     }
   } catch { /* silent */ }
+}
+
+// ---------- Audio lifecycle ----------
+// iOS suspends every AudioContext when the app is backgrounded (or when
+// the screen locks, or when another app starts playing media). Once the
+// app returns to foreground the contexts stay in 'suspended' / 'interrupted'
+// state until something explicitly resumes them. Because resume() is async,
+// the first tap after foregrounding fires .start(0) BEFORE the context
+// actually wakes up, and that buffer source is silently dropped — which
+// matches the "no sound on reopen until I close & reopen the app" symptom.
+//
+// wakeAllAudio resumes every cached AudioContext we own. Call it on:
+//   - mount (so a fresh load is always playable)
+//   - visibilitychange when document becomes visible
+//   - pageshow (covers Safari/iOS's bfcache restore path which doesn't
+//     always fire visibilitychange)
+//   - first user pointerdown anywhere (safety net — iOS guarantees a user
+//     gesture lets us resume even if the events above didn't fire)
+function wakeAllAudio() {
+  const ctxs: Array<AudioContext | null> = [
+    _audioCtx, _slideAudioCtx, _buttonAudioCtx, _backAudioCtx, _bellAudioCtx,
+  ];
+  for (const ctx of ctxs) {
+    if (!ctx) continue;
+    if (ctx.state === 'suspended' || (ctx.state as string) === 'interrupted') {
+      ctx.resume().catch(() => { /* silent */ });
+    }
+  }
+}
+
+// Install lifecycle handlers exactly once. The module-level guard means
+// HMR / fast-refresh in dev won't double-install.
+let _audioLifecycleInstalled = false;
+function installAudioLifecycle() {
+  if (_audioLifecycleInstalled) return;
+  if (typeof document === 'undefined') return;
+  _audioLifecycleInstalled = true;
+  const onVisible = () => {
+    if (!document.hidden) wakeAllAudio();
+  };
+  document.addEventListener('visibilitychange', onVisible);
+  window.addEventListener('pageshow', wakeAllAudio);
+  // First user gesture safety net — once any tap happens, resume contexts
+  // and remove the listener. Capture phase + once: true so we win against
+  // anything that might stopPropagation.
+  const onFirstGesture = () => { wakeAllAudio(); };
+  window.addEventListener('pointerdown', onFirstGesture, { capture: true, once: true });
+  window.addEventListener('touchstart', onFirstGesture, { capture: true, once: true, passive: true } as any);
 }
 
 // ---------- Categories ----------
@@ -1061,13 +1168,28 @@ type View =
 export default function App() {
   const [view, _setViewRaw] = useState<View>({ name: 'home' });
   // Navigation history stack — every time setView is called, the previous
-  // view gets pushed here so swipe-right can pop back to it.
-  const _navHistory = useRef<View[]>([]);
+  // view gets pushed here so swipe-right can pop back to it. We also stash
+  // the scroll position at navigation time so goBack() can restore it,
+  // letting the user return exactly where they left off on long pages
+  // (List View, Dread Leaders, CategoryView, etc.).
+  type HistoryEntry = { view: View; scrollY: number };
+  const _navHistory = useRef<HistoryEntry[]>([]);
+  // Pending scroll restore — populated by goBack() and consumed by a
+  // post-render effect once the new view has actually painted. We can't
+  // scroll inside goBack itself because the new view's content isn't in
+  // the DOM yet at that moment.
+  const _pendingScrollRestore = useRef<number | null>(null);
   const setView = (next: View) => {
     _setViewRaw((prev) => {
       // Don't push if the new view is the same as current (no-op nav).
       if (JSON.stringify(prev) !== JSON.stringify(next)) {
-        _navHistory.current.push(prev);
+        // Capture scroll BEFORE the new view mounts. document.documentElement
+        // is the actual scroll container on iOS Safari / iOS WebView; on
+        // other browsers window.scrollY agrees with it. Read both for safety.
+        const sy = (typeof window !== 'undefined')
+          ? (window.scrollY || document.documentElement.scrollTop || 0)
+          : 0;
+        _navHistory.current.push({ view: prev, scrollY: sy });
         // Cap history at 50 to avoid unbounded growth.
         if (_navHistory.current.length > 50) _navHistory.current.shift();
       }
@@ -1077,8 +1199,9 @@ export default function App() {
   const goBack = () => {
     const stack = _navHistory.current;
     if (stack.length === 0) return; // already at oldest, no-op
-    const prev = stack.pop()!;
-    _setViewRaw(prev);
+    const entry = stack.pop()!;
+    _pendingScrollRestore.current = entry.scrollY;
+    _setViewRaw(entry.view);
   };
   const [currentLocation, setCurrentLocation] = useState<{ lat: number; lng: number } | null>(null);
   // Tracks whether to show the "Enable Always Location" modal. Shown once
@@ -1139,6 +1262,11 @@ export default function App() {
     try { ensureButtonAudio(); } catch { /* silent */ }
     try { ensureBackAudio(); } catch { /* silent */ }
     try { ensureBellAudio(); } catch { /* silent */ }
+    // Install foreground/visibility listeners so the AudioContexts get
+    // resumed when the user comes back to the app from the home screen,
+    // a phone call, the lock screen, etc. Without this the first sound
+    // tap after returning is silently dropped on iOS.
+    try { installAudioLifecycle(); } catch { /* silent */ }
     let primed = false;
     const primeOnFirstTouch = () => {
       if (primed) return;
@@ -1254,7 +1382,7 @@ export default function App() {
         // wasn't bleeding into normal page interaction beforehand.
         const stack = _navHistory.current;
         if (stack.length > 0) {
-          setPrevView(stack[stack.length - 1]);
+          setPrevView(stack[stack.length - 1].view);
         }
       }
 
@@ -1577,7 +1705,7 @@ export default function App() {
         element: <BadgesView handle={v.handle} isMe={!!handle && handle.toLowerCase() === v.handle.toLowerCase()} onBack={goHome} />,
       };
     } else if (v.name === 'list') {
-      return { key: 'list', element: <ListPlaceholderView onBack={goHome} /> };
+      return { key: 'list', element: <ListView sites={sites} currentLocation={currentLocation} onSelectSite={goDetail} onBack={goHome} /> };
     } else {
       return {
         key: 'home',
@@ -1626,6 +1754,33 @@ export default function App() {
       document.body.style.overflow = '';
       document.documentElement.style.overflow = '';
     };
+  }, [viewKey]);
+
+  // Scroll restore on swipe-back. When goBack() pops a history entry it
+  // stashes the saved scrollY in _pendingScrollRestore. This effect fires
+  // on the next render (after the popped view has mounted and laid out
+  // its content) and scrolls the document to that position. We do it in
+  // a double-rAF to make sure layout/paint has had a tick — restoring
+  // before the new view's content exists in the DOM is a no-op since
+  // there's nothing to scroll.
+  //
+  // On forward navigations there's no pending value, so this scrolls to
+  // 0 — matching the normal "new screen starts at the top" expectation.
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const target = _pendingScrollRestore.current;
+    _pendingScrollRestore.current = null;
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        if (target != null) {
+          // 'instant' avoids a visible scroll animation that would clash
+          // with the swipe-back transform animation.
+          window.scrollTo({ top: target, left: 0, behavior: 'auto' as ScrollBehavior });
+        } else {
+          window.scrollTo({ top: 0, left: 0, behavior: 'auto' as ScrollBehavior });
+        }
+      });
+    });
   }, [viewKey]);
 
   // The key forces React to unmount + remount the wrapper on every view
@@ -1982,15 +2137,19 @@ function BadgesView({ handle, isMe, onBack }: {
   onBack: () => void;
 }) {
   const [badges, setBadges] = useState<BadgeRow[] | null>(null);
+  const [submitCount, setSubmitCount] = useState(0);
+  const [visitCount, setVisitCount] = useState(0);
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const list = await apiGetBadges(handle);
+        const data = await apiGetBadges(handle);
         if (cancelled) return;
-        setBadges(list);
+        setBadges(data.badges);
+        setSubmitCount(data.submitCount);
+        setVisitCount(data.visitCount);
       } catch (e: any) {
         if (cancelled) return;
         setErr(e?.message || 'Could not load badges');
@@ -1999,11 +2158,17 @@ function BadgesView({ handle, isMe, onBack }: {
     return () => { cancelled = true; };
   }, [handle]);
 
-  // Bucket badges by kind so each section gets its own header. Unknown
-  // kinds fall into "Other" so we never silently drop server data.
-  const submitterBadges = (badges || []).filter(b => b.kind === 'submitter');
-  const visitorBadges = (badges || []).filter(b => b.kind === 'visitor');
-  const otherBadges = (badges || []).filter(b => b.kind !== 'submitter' && b.kind !== 'visitor');
+  // Bucket badges by kind so each section gets its own header. Submitter
+  // tier badges have kind "submitter"; per-category "first" badges have
+  // kind "submitter_category"/"visitor_category" — we group those alongside
+  // the tier badges since they're all earned by submitting/visiting.
+  // Anything truly unknown falls into "Other" so we never silently drop
+  // server data.
+  const isSubmitter = (k: string) => k === 'submitter' || k.startsWith('submitter_');
+  const isVisitor = (k: string) => k === 'visitor' || k.startsWith('visitor_');
+  const submitterBadges = (badges || []).filter(b => isSubmitter(b.kind));
+  const visitorBadges = (badges || []).filter(b => isVisitor(b.kind));
+  const otherBadges = (badges || []).filter(b => !isSubmitter(b.kind) && !isVisitor(b.kind));
 
   return (
     <div style={S.appBg}>
@@ -2017,6 +2182,20 @@ function BadgesView({ handle, isMe, onBack }: {
           <p style={{ ...S.aboutPara, fontSize: 13, opacity: 0.7 }}>
             Handle: <b>{handle}</b>
           </p>
+        )}
+        {/* Stats strip — shown once badges load. Gives a snapshot of the
+            user's totals even before scanning the badge cards below. */}
+        {badges !== null && (submitCount > 0 || visitCount > 0) && (
+          <div style={S.badgeStats}>
+            <div style={S.badgeStatCell}>
+              <div style={{ ...S.badgeStatNum, color: SUBMIT_RED, textShadow: `0 0 10px ${SUBMIT_RED}88` }}>{submitCount}</div>
+              <div style={S.badgeStatLabel}>Submitted</div>
+            </div>
+            <div style={S.badgeStatCell}>
+              <div style={{ ...S.badgeStatNum, color: '#6ad06a', textShadow: '0 0 10px #6ad06a88' }}>{visitCount}</div>
+              <div style={S.badgeStatLabel}>Visited</div>
+            </div>
+          </div>
         )}
         {err && <p style={{ ...S.aboutPara, color: '#d97a7a' }}>{err}</p>}
         {!err && badges === null && <p style={S.aboutPara}>Loading…</p>}
@@ -2079,7 +2258,66 @@ function BadgeGroup({ title, badges, accent }: {
 // Scaffolded page. Will become a flat scannable directory: every category
 // expanded, every state inside it expanded, every location inside that.
 // Useful for users who want to browse without the filmstrip-cell flow.
-function ListPlaceholderView({ onBack }: { onBack: () => void }) {
+// ---------- List View ----------
+// Flat directory of every approved site, grouped by category → state →
+// sites. Lets users browse without going through the cascading filmstrip
+// flow on the home page. Each row taps into the same DetailView the rest
+// of the app uses, so I'm Here / directions / etc. all just work.
+//
+// Layout: a search bar sticks at the top filtering by site title, state,
+// or category label. Below it, each category gets a header in its own
+// color, then states under that, then site rows under each state.
+// Categories with no matching sites are hidden entirely so the list
+// doesn't grow noisy as the filter tightens.
+//
+// Performance note: useMemo on the grouped structure keeps re-renders
+// cheap as the user types. We're well under 1000 sites for now so this is
+// already overkill, but it costs nothing and pays off as the catalog grows.
+function ListView({ sites, currentLocation, onSelectSite, onBack }: {
+  sites: SinisterSite[];
+  currentLocation: { lat: number; lng: number } | null;
+  onSelectSite: (site: SinisterSite) => void;
+  onBack: () => void;
+}) {
+  const [query, setQuery] = useState('');
+  const q = query.trim().toLowerCase();
+
+  // Group sites: { [categoryKey]: { [state]: site[] } }
+  // Built once per render with useMemo — recomputes when sites or query
+  // change, which is exactly what we want.
+  const grouped = useMemo(() => {
+    const out: Record<string, Record<string, SinisterSite[]>> = {};
+    for (const site of sites) {
+      // Apply search filter early so groups with zero matches collapse.
+      if (q) {
+        const cat = CATEGORIES.find(c => c.key === site.category);
+        const catLabel = (cat?.label || site.category).toLowerCase();
+        const hay = `${site.title} ${site.state} ${catLabel}`.toLowerCase();
+        if (!hay.includes(q)) continue;
+      }
+      const cat = site.category as string;
+      if (!out[cat]) out[cat] = {};
+      const state = site.state || 'Unknown';
+      if (!out[cat][state]) out[cat][state] = [];
+      out[cat][state].push(site);
+    }
+    // Sort sites alphabetically within each state for predictable ordering.
+    for (const cat of Object.keys(out)) {
+      for (const state of Object.keys(out[cat])) {
+        out[cat][state].sort((a, b) => a.title.localeCompare(b.title));
+      }
+    }
+    return out;
+  }, [sites, q]);
+
+  // Iterate categories in the same order as the home page filmstrip so
+  // the visual hierarchy matches what users already learned. States are
+  // sorted alphabetically within each category — simple and predictable.
+  const orderedCategories = CATEGORIES.filter(c => grouped[c.key] && Object.keys(grouped[c.key]).length > 0);
+  const totalMatches = sites.length === 0 ? 0 :
+    Object.values(grouped).reduce((sum, byState) =>
+      sum + Object.values(byState).reduce((s2, list) => s2 + list.length, 0), 0);
+
   return (
     <div style={S.appBg}>
       <header style={S.header}>
@@ -2087,11 +2325,72 @@ function ListPlaceholderView({ onBack }: { onBack: () => void }) {
           List View
         </div>
       </header>
-      <div style={S.aboutBody}>
-        <p style={S.aboutPara}>
-          Coming soon. A flat list of every category, every state, and every approved
-          location for quick browsing without the filmstrip flow.
-        </p>
+
+      {/* Search bar — title / state / category text match. Same visual
+          language as the search bar on CategoryView. */}
+      <div style={S.listSearchWrap}>
+        <div style={{ position: 'relative', flex: 1 }}>
+          <input
+            type="text"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search by title, state, or category…"
+            style={S.searchInput}
+          />
+          {query && (
+            <button
+              style={S.searchClear}
+              onClick={() => { playButton(); setQuery(''); }}
+              aria-label="Clear search"
+            >
+              ✕
+            </button>
+          )}
+        </div>
+      </div>
+
+      <div style={S.leaderBody}>
+        {sites.length === 0 ? (
+          <p style={S.aboutPara}>Loading sites…</p>
+        ) : totalMatches === 0 ? (
+          <p style={S.aboutPara}>
+            No matches for "{query}". Try a different search.
+          </p>
+        ) : (
+          orderedCategories.map((cat) => {
+            const byState = grouped[cat.key];
+            const states = Object.keys(byState).sort();
+            const color = CATEGORY_COLOR[cat.key];
+            return (
+              <div key={cat.key} style={{ marginBottom: 28 }}>
+                <div style={{ ...S.listCategoryHeader, color, textShadow: `0 0 10px ${color}88`, borderBottom: `1px solid ${color}44` }}>
+                  {cat.label}
+                </div>
+                {states.map((state) => {
+                  const stateSites = byState[state];
+                  return (
+                    <div key={state} style={{ marginTop: 12 }}>
+                      <div style={S.listStateHeader}>{state}</div>
+                      <div style={S.listSitesWrap}>
+                        {stateSites.map((site) => (
+                          <button
+                            key={site.id}
+                            style={S.listRow}
+                            onClick={() => { playForward(); onSelectSite(site); }}
+                          >
+                            <span style={{ ...S.listRowDot, background: color, boxShadow: `0 0 6px ${color}` }} />
+                            <span style={S.listRowTitle}>{site.title}</span>
+                            <span style={S.listRowState}>{site.state}</span>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            );
+          })
+        )}
       </div>
     </div>
   );
@@ -4455,6 +4754,106 @@ const S: Record<string, React.CSSProperties> = {
     color: '#777',
     letterSpacing: '0.08em',
     textTransform: 'uppercase' as const,
+  },
+  badgeStats: {
+    display: 'flex',
+    gap: 12,
+    marginBottom: 24,
+    marginTop: 4,
+  },
+  badgeStatCell: {
+    flex: 1,
+    background: '#0d0d0d',
+    border: '1px solid #1f1f1f',
+    borderRadius: 12,
+    padding: '14px 10px',
+    textAlign: 'center' as const,
+  },
+  badgeStatNum: {
+    fontSize: 28,
+    fontWeight: 900,
+    lineHeight: 1.1,
+    letterSpacing: '0.04em',
+  },
+  badgeStatLabel: {
+    fontSize: 10,
+    color: '#888',
+    letterSpacing: '0.18em',
+    textTransform: 'uppercase' as const,
+    marginTop: 4,
+    fontWeight: 700,
+  },
+
+  // ---- List View styles ----
+  // Search bar wrap matches the same horizontal padding as the body and
+  // the leader/about views so the layout aligns vertically across screens.
+  listSearchWrap: {
+    display: 'flex',
+    padding: '4px 20px 16px',
+    maxWidth: 600,
+    margin: '0 auto',
+    boxSizing: 'border-box' as const,
+    width: '100%',
+  },
+  listCategoryHeader: {
+    fontSize: 16,
+    fontWeight: 900,
+    letterSpacing: '0.22em',
+    textTransform: 'uppercase' as const,
+    paddingBottom: 8,
+    marginBottom: 4,
+  },
+  listStateHeader: {
+    fontSize: 11,
+    fontWeight: 800,
+    letterSpacing: '0.22em',
+    textTransform: 'uppercase' as const,
+    color: '#888',
+    marginBottom: 6,
+    marginTop: 8,
+  },
+  listSitesWrap: {
+    display: 'flex',
+    flexDirection: 'column' as const,
+    gap: 6,
+  },
+  listRow: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 10,
+    width: '100%',
+    boxSizing: 'border-box' as const,
+    padding: '11px 14px',
+    background: '#0d0d0d',
+    border: '1px solid #1f1f1f',
+    borderRadius: 8,
+    color: BONE,
+    fontFamily: 'inherit',
+    cursor: 'pointer',
+    textAlign: 'left' as const,
+  },
+  listRowDot: {
+    width: 8,
+    height: 8,
+    borderRadius: '50%',
+    flexShrink: 0,
+  },
+  listRowTitle: {
+    flex: 1,
+    fontSize: 13,
+    fontWeight: 600,
+    letterSpacing: '0.02em',
+    overflow: 'hidden' as const,
+    textOverflow: 'ellipsis' as const,
+    whiteSpace: 'nowrap' as const,
+  },
+  listRowState: {
+    fontSize: 10,
+    color: '#777',
+    fontWeight: 600,
+    letterSpacing: '0.12em',
+    textTransform: 'uppercase' as const,
+    flexShrink: 0,
   },
   aboutLinkBtn: {
     width: '100%',
