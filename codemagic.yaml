@@ -34,6 +34,8 @@ workflows:
             plutil -replace NSLocationAlwaysUsageDescription -string "The Dread Directory needs background location to ping you when you're near a sinister site." "$PLIST"
           plutil -insert NSCameraUsageDescription -string "The Dread Directory uses your camera so you can take a verification photo when submitting a new sinister site." "$PLIST" || \
             plutil -replace NSCameraUsageDescription -string "The Dread Directory uses your camera so you can take a verification photo when submitting a new sinister site." "$PLIST"
+          plutil -insert NSMotionUsageDescription -string "The Dread Directory uses motion sensors to efficiently detect when you're moving, so it only checks for nearby sinister sites when needed and saves your battery." "$PLIST" || \
+            plutil -replace NSMotionUsageDescription -string "The Dread Directory uses motion sensors to efficiently detect when you're moving, so it only checks for nearby sinister sites when needed and saves your battery." "$PLIST"
           plutil -insert UIBackgroundModes -array "$PLIST" 2>/dev/null || true
           plutil -insert UIBackgroundModes.0 -string location "$PLIST" 2>/dev/null || true
           plutil -insert UIBackgroundModes.1 -string fetch "$PLIST" 2>/dev/null || true
@@ -103,6 +105,8 @@ workflows:
             plutil -replace NSLocationAlwaysUsageDescription -string "The Dread Directory needs background location to ping you when you're near a sinister site." "$PLIST"
           plutil -insert NSCameraUsageDescription -string "The Dread Directory uses your camera so you can take a verification photo when submitting a new sinister site." "$PLIST" || \
             plutil -replace NSCameraUsageDescription -string "The Dread Directory uses your camera so you can take a verification photo when submitting a new sinister site." "$PLIST"
+          plutil -insert NSMotionUsageDescription -string "The Dread Directory uses motion sensors to efficiently detect when you're moving, so it only checks for nearby sinister sites when needed and saves your battery." "$PLIST" || \
+            plutil -replace NSMotionUsageDescription -string "The Dread Directory uses motion sensors to efficiently detect when you're moving, so it only checks for nearby sinister sites when needed and saves your battery." "$PLIST"
           plutil -insert UIBackgroundModes -array "$PLIST" 2>/dev/null || true
           plutil -insert UIBackgroundModes.0 -string location "$PLIST" 2>/dev/null || true
           plutil -insert UIBackgroundModes.1 -string fetch "$PLIST" 2>/dev/null || true
