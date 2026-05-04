@@ -171,6 +171,10 @@ type BadgeRow = {
   kind: 'submitter' | 'visitor' | string;
   threshold?: number;
   category?: string;
+  // Server-provided emoji or short symbol. Falls back to a generic star if
+  // missing so older API responses still render. Using emojis keeps this
+  // theme-able from the server without shipping new app assets.
+  icon?: string;
 };
 
 async function apiLeaderboardSubmitters(limit = 25): Promise<LeaderRow[]> {
@@ -2239,7 +2243,7 @@ function BadgeGroup({ title, badges, accent }: {
       <div style={S.badgeGrid}>
         {badges.map((b) => (
           <div key={b.id} style={{ ...S.badgeCard, borderColor: `${accent}55`, boxShadow: `0 0 10px ${accent}33` }}>
-            <div style={{ ...S.badgeIcon, color: accent, textShadow: `0 0 10px ${accent}` }}>★</div>
+            <div style={{ ...S.badgeIcon, color: accent, textShadow: `0 0 10px ${accent}` }}>{b.icon || '★'}</div>
             <div style={S.badgeLabel}>{b.label}</div>
             {b.threshold != null && (
               <div style={S.badgeMeta}>Tier: {b.threshold}+</div>
