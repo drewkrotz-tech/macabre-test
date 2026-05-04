@@ -108,6 +108,55 @@ async function apiGetMyHandle(deviceId: string): Promise<string | null> {
   } catch { return null; }
 }
 
+// ---------- Visit-claim API ----------
+// POST /visits — server checks (handle, deviceId) ownership, verifies the
+// reported lat/lng is within 100m of the site's coords, dedupes (one visit
+// per handle per site), and records to visits.json. Returns:
+//   { ok: true }                       on a fresh claim
+//   { ok: true, alreadyClaimed: true } if the user previously claimed this site
+//   { ok: false, code, ... }           otherwise (too_far, unknown_site, etc.)
+type VisitClaimResult =
+  | { ok: true; alreadyClaimed?: boolean }
+  | { ok: false; code: string; distance?: number; message?: string };
+
+async function apiClaimVisit(args: {
+  handle: string;
+  deviceId: string;
+  siteId: string;
+  lat: number;
+  lng: number;
+}): Promise<VisitClaimResult> {
+  try {
+    const res = await fetch(`${API_BASE}/visits`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    const data = await res.json().catch(() => ({}));
+    // 409 == already claimed; the server treats this as idempotent and so do we.
+    if (res.status === 409 || data?.code === 'already_claimed') {
+      return { ok: true, alreadyClaimed: true };
+    }
+    if (!res.ok) {
+      return { ok: false, code: data?.code || `http_${res.status}`, distance: data?.distance, message: data?.error };
+    }
+    return { ok: true };
+  } catch (err: any) {
+    return { ok: false, code: 'network', message: err?.message || 'Network error' };
+  }
+}
+
+// Returns the set of siteIds the handle has visited. Used at app startup
+// to mark already-visited sites in DetailView without a per-detail roundtrip.
+async function apiGetMyVisits(handle: string): Promise<Set<string>> {
+  try {
+    const res = await fetch(`${API_BASE}/visits/${encodeURIComponent(handle)}`);
+    const data = await res.json();
+    const ids = (data?.visits || []).map((v: any) => v.siteId).filter(Boolean);
+    return new Set(ids);
+  } catch { return new Set(); }
+}
+
 // ---------- Live site fetch ----------
 // The server's /sites endpoint returns approved locales. Each site has the
 // shape { id, title, shortDescription, fullDescription, category, state,
@@ -1004,6 +1053,19 @@ export default function App() {
   // SubmitView so it can attribute submissions and to future BadgesView.
   const [deviceId, setDeviceId] = useState<string | null>(null);
   const [handle, setHandle] = useState<string | null>(null);
+  // Set of siteIds the current handle has already visited. Used by DetailView
+  // to show the I'm Here button as already-claimed without re-hitting the
+  // server. Loaded once on launch (after handle resolves) and updated locally
+  // whenever the user successfully claims a new visit.
+  const [visitedSiteIds, setVisitedSiteIds] = useState<Set<string>>(new Set());
+  const markSiteVisited = (siteId: string) => {
+    setVisitedSiteIds(prev => {
+      if (prev.has(siteId)) return prev;
+      const next = new Set(prev);
+      next.add(siteId);
+      return next;
+    });
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -1014,7 +1076,14 @@ export default function App() {
         setDeviceId(id);
         const myHandle = await apiGetMyHandle(id);
         if (cancelled) return;
-        if (myHandle) setHandle(myHandle);
+        if (myHandle) {
+          setHandle(myHandle);
+          // Load visit history so DetailView can show the visited state
+          // immediately without a flash of the unclaimed button.
+          const siteIds = await apiGetMyVisits(myHandle);
+          if (cancelled) return;
+          if (siteIds.size) setVisitedSiteIds(siteIds);
+        }
       } catch { /* silent */ }
     })();
     return () => { cancelled = true; };
@@ -1393,6 +1462,10 @@ export default function App() {
           <DetailView
             site={v.site}
             currentLocation={currentLocation}
+            handle={handle}
+            deviceId={deviceId}
+            alreadyVisited={visitedSiteIds.has(v.site.id)}
+            onVisited={markSiteVisited}
             onBack={() => goLocaleListBack(v.site.category as CategoryKey, v.site.state)}
           />
         ),
@@ -2713,14 +2786,80 @@ function CategoryView({ label, color, sites, currentLocation, onSelectSite, onSu
 }
 
 // ---------- DETAIL ----------
-function DetailView({ site, currentLocation, onBack }: {
+function DetailView({ site, currentLocation, handle, deviceId, alreadyVisited, onVisited, onBack }: {
   site: SinisterSite;
   currentLocation: { lat: number; lng: number } | null;
+  handle: string | null;
+  deviceId: string | null;
+  alreadyVisited: boolean;
+  onVisited: (siteId: string) => void;
   onBack: () => void;
 }) {
   const color = CATEGORY_COLOR[site.category as CategoryKey] || WHITE;
   const distM = currentLocation ? distanceMeters(currentLocation.lat, currentLocation.lng, site.coords.lat, site.coords.lng) : null;
   const distMi = distM ? (distM / 1609.34).toFixed(1) : null;
+
+  // ---- I'm Here button state ----
+  // The button has three visual states once a GPS fix is available:
+  //   visited  → "✓ You've Been Here" (green, no action)
+  //   inRange  → "I'm Here — Claim Visit" (red, tappable)
+  //   tooFar   → disabled with "Xm away — get within 100m to claim"
+  // If no GPS fix yet, the whole block is hidden. Distance check uses the
+  // same 100m radius the server enforces; server re-verifies on claim, so
+  // this is just a UX gate, not the security check.
+  const VISIT_RADIUS_M = 100;
+  const inRange = distM != null && distM <= VISIT_RADIUS_M;
+  const [visited, setVisited] = useState<boolean>(alreadyVisited);
+  const [claiming, setClaiming] = useState(false);
+  const [claimError, setClaimError] = useState<string | null>(null);
+
+  // Sync local visited flag if parent's set updates (e.g. new visits loaded
+  // from server while this view is mounted).
+  useEffect(() => {
+    if (alreadyVisited) setVisited(true);
+  }, [alreadyVisited]);
+
+  const handleClaimVisit = async () => {
+    if (!handle) {
+      setClaimError('Claim a handle first (try Submit a Location)');
+      return;
+    }
+    if (!deviceId) {
+      setClaimError('Device not ready, try again in a moment');
+      return;
+    }
+    if (!currentLocation) {
+      setClaimError('No GPS fix yet — try again in a moment');
+      return;
+    }
+    setClaiming(true);
+    setClaimError(null);
+    playBell();
+    const result = await apiClaimVisit({
+      handle,
+      deviceId,
+      siteId: site.id,
+      lat: currentLocation.lat,
+      lng: currentLocation.lng,
+    });
+    setClaiming(false);
+    if (result.ok) {
+      setVisited(true);
+      onVisited(site.id);
+      return;
+    }
+    // Failure path. Pull fields off as the failure variant — narrowing this way
+    // doesn't depend on TS flow analysis across the early return.
+    const fail = result as Extract<VisitClaimResult, { ok: false }>;
+    if (fail.code === 'too_far') {
+      const m = fail.distance != null ? `${Math.round(fail.distance)}m` : '';
+      setClaimError(`Server says you're ${m} away — must be within 100m.`);
+    } else if (fail.code === 'network') {
+      setClaimError('Network error — check your connection and try again.');
+    } else {
+      setClaimError(fail.message || 'Could not claim visit');
+    }
+  };
   const handleDirections = () => {
     playBell();
     // Smart cross-platform directions opener:
@@ -2785,6 +2924,64 @@ function DetailView({ site, currentLocation, onBack }: {
         <div style={S.detailDescription}>
           {site.fullDescription.split('\n\n').map((para, i) => <p key={i} style={S.detailPara}>{para}</p>)}
         </div>
+        {/* I'm Here button — only rendered when we have a GPS fix. Three
+            visual modes: visited (green confirmation), in-range (red, active),
+            out-of-range (disabled with distance hint). */}
+        {currentLocation && (
+          visited ? (
+            <div
+              style={{
+                ...S.directionsButton,
+                border: `2px solid #2a3f2a`,
+                color: '#6ad06a',
+                backgroundColor: '#0f2010',
+                boxShadow: `0 0 18px #2a3f2a88, inset 0 0 12px #2a3f2a55`,
+                textShadow: `0 0 8px #6ad06a`,
+                cursor: 'default',
+                marginBottom: 12,
+              }}
+            >
+              ✓ You've Been Here
+            </div>
+          ) : inRange ? (
+            <button
+              onClick={handleClaimVisit}
+              disabled={claiming}
+              style={{
+                ...S.directionsButton,
+                border: `2px solid ${SUBMIT_RED}`,
+                color: WHITE,
+                backgroundColor: claiming ? '#3a0a0a' : '#5a0000',
+                boxShadow: `0 0 22px ${SUBMIT_RED}aa, 0 0 44px ${SUBMIT_RED}55, inset 0 0 14px ${SUBMIT_RED}33`,
+                textShadow: `0 0 10px ${SUBMIT_RED}`,
+                marginBottom: 12,
+                opacity: claiming ? 0.7 : 1,
+              }}
+            >
+              {claiming ? 'Claiming…' : "I'm Here — Claim Visit"}
+            </button>
+          ) : (
+            <div
+              style={{
+                ...S.directionsButton,
+                border: `2px solid #2a2a2a`,
+                color: '#888',
+                backgroundColor: '#1a1a1a',
+                boxShadow: 'none',
+                cursor: 'not-allowed',
+                marginBottom: 12,
+                fontSize: 14,
+              }}
+            >
+              {distM != null ? `${Math.round(distM)}m away — get within 100m to claim` : 'Locating…'}
+            </div>
+          )
+        )}
+        {claimError && (
+          <div style={{ color: '#d97a7a', fontSize: 13, textAlign: 'center', marginBottom: 12 }}>
+            {claimError}
+          </div>
+        )}
         <button
           onClick={handleDirections}
           style={{
