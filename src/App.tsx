@@ -9,7 +9,6 @@ import {
   requestPermissions,
   distanceMeters,
   setSites,
-  getDebugLog,
 } from './geofencing';
 import LivingHellFontUrl from './assets/Living Hell.ttf';
 import SlideMountUrl from './assets/slide-mount.png';
@@ -25,6 +24,89 @@ import { SINISTER_SITES as FALLBACK_SITES, SinisterSite } from './locations';
 
 // ---------- Production server URL ----------
 const API_BASE = 'https://api.sinistertrivia.com';
+
+// ---------- Device identity (handle system) ----------
+// Auto-generated stable id stored on first launch. Used to prove ownership of
+// a claimed handle. Persists across app restarts; wipes on app reinstall.
+// Storage: Capacitor Preferences on native, localStorage on web.
+const DEVICE_ID_KEY = 'sinister_device_id';
+
+function generateDeviceId(): string {
+  // RFC4122-ish v4. Not cryptographic — server doesn't trust id alone, only
+  // the (handle, deviceId) pair.
+  const bytes = new Uint8Array(16);
+  if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+    crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < 16; i++) bytes[i] = Math.floor(Math.random() * 256);
+  }
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+  return `device_${hex.slice(0, 8)}_${hex.slice(8, 16)}_${hex.slice(16, 24)}_${hex.slice(24, 32)}`;
+}
+
+async function readPersistent(key: string): Promise<string | null> {
+  try {
+    const cap = (window as any).Capacitor;
+    if (cap?.isNativePlatform?.() && cap?.Plugins?.Preferences) {
+      const { value } = await cap.Plugins.Preferences.get({ key });
+      return value || null;
+    }
+  } catch { /* fall through */ }
+  try { return typeof localStorage !== 'undefined' ? localStorage.getItem(key) : null; }
+  catch { return null; }
+}
+
+async function writePersistent(key: string, value: string): Promise<void> {
+  try {
+    const cap = (window as any).Capacitor;
+    if (cap?.isNativePlatform?.() && cap?.Plugins?.Preferences) {
+      await cap.Plugins.Preferences.set({ key, value });
+      return;
+    }
+  } catch { /* fall through */ }
+  try { if (typeof localStorage !== 'undefined') localStorage.setItem(key, value); }
+  catch { /* silent */ }
+}
+
+async function getOrCreateDeviceId(): Promise<string> {
+  const existing = await readPersistent(DEVICE_ID_KEY);
+  if (existing && existing.length >= 8) return existing;
+  const fresh = generateDeviceId();
+  await writePersistent(DEVICE_ID_KEY, fresh);
+  return fresh;
+}
+
+// ---------- Handle API client ----------
+type HandleCheckResult = { available: boolean; reason?: string };
+type HandleClaimResult = { ok: boolean; handle?: string; reason?: string; existingHandle?: string };
+
+async function apiCheckHandle(handle: string): Promise<HandleCheckResult> {
+  try {
+    const res = await fetch(`${API_BASE}/handles/check/${encodeURIComponent(handle)}`);
+    return await res.json();
+  } catch { return { available: false, reason: 'network error' }; }
+}
+
+async function apiClaimHandle(handle: string, deviceId: string): Promise<HandleClaimResult> {
+  try {
+    const res = await fetch(`${API_BASE}/handles/claim`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ handle, deviceId }),
+    });
+    return await res.json();
+  } catch { return { ok: false, reason: 'network error' }; }
+}
+
+async function apiGetMyHandle(deviceId: string): Promise<string | null> {
+  try {
+    const res = await fetch(`${API_BASE}/handles/me?deviceId=${encodeURIComponent(deviceId)}`);
+    const data = await res.json();
+    return data?.handle || null;
+  } catch { return null; }
+}
 
 // ---------- Live site fetch ----------
 // The server's /sites endpoint returns approved locales. Each site has the
@@ -915,6 +997,27 @@ export default function App() {
   const [sites, setSitesState] = useState<SinisterSite[]>(FALLBACK_SITES);
   const [sitesLoaded, setSitesLoaded] = useState(false);
 
+  // Identity: deviceId is auto-generated on first launch; handle is fetched
+  // from the server (or null until the user claims one). Both passed to
+  // SubmitView so it can attribute submissions and to future BadgesView.
+  const [deviceId, setDeviceId] = useState<string | null>(null);
+  const [handle, setHandle] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const id = await getOrCreateDeviceId();
+        if (cancelled) return;
+        setDeviceId(id);
+        const myHandle = await apiGetMyHandle(id);
+        if (cancelled) return;
+        if (myHandle) setHandle(myHandle);
+      } catch { /* silent */ }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
   // Eagerly start decoding all audio buffers + prime gain chains on first touch
   useEffect(() => {
     try { ensureSlideAudio(); } catch { /* silent */ }
@@ -1327,7 +1430,7 @@ export default function App() {
         ),
       };
     } else if (v.name === 'submit') {
-      return { key: 'submit', element: <SubmitView currentLocation={currentLocation} onBack={goHome} /> };
+      return { key: 'submit', element: <SubmitView currentLocation={currentLocation} deviceId={deviceId} handle={handle} onHandleClaimed={setHandle} onBack={goHome} /> };
     } else if (v.name === 'about') {
       return { key: 'about', element: <AboutView onBack={goHome} /> };
     } else {
@@ -2193,15 +2296,6 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
 
 
 function AboutView({ onBack }: { onBack: () => void }) {
-  // Geofencing debug log viewer — accessed via a labeled button below.
-  // We tried hidden 5-tap and long-press patterns; iOS WebView interferes
-  // with both. A plain visible button is unambiguous and reliable.
-  const [showDebug, setShowDebug] = useState(false);
-  const [debugLines, setDebugLines] = useState<string[]>([]);
-  function openDebug() {
-    setDebugLines(getDebugLog());
-    setShowDebug(true);
-  }
   return (
     <div style={S.appBg}>
       <header style={S.header}>
@@ -2239,77 +2333,8 @@ function AboutView({ onBack }: { onBack: () => void }) {
           >
             ▶️ Subscribe on YouTube
           </button>
-          <button
-            style={{ ...S.aboutLinkBtn, border: `2px solid ${BLUE}`, color: BLUE, marginTop: 12 }}
-            onClick={openDebug}
-          >
-            🔍 View Geofencing Log
-          </button>
         </div>
       </div>
-      {showDebug && (
-        <div
-          role="dialog"
-          aria-modal="true"
-          onClick={() => setShowDebug(false)}
-          style={{
-            position: 'fixed', inset: 0, backgroundColor: 'rgba(0, 0, 0, 0.92)',
-            zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center',
-            padding: 16,
-          }}
-        >
-          <div
-            onClick={(e) => e.stopPropagation()}
-            style={{
-              backgroundColor: BLACK, border: `2px solid ${WHITE}`, borderRadius: 14,
-              padding: 16, maxWidth: 480, width: '100%', maxHeight: '80vh',
-              display: 'flex', flexDirection: 'column', gap: 10,
-            }}
-          >
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <div style={{ fontSize: 12, color: WHITE, fontWeight: 700, letterSpacing: '0.15em' }}>GEOFENCING LOG</div>
-              <button
-                type="button"
-                onClick={() => setShowDebug(false)}
-                style={{ background: 'transparent', border: 'none', color: WHITE, fontSize: 18, cursor: 'pointer', padding: 4 }}
-              >×</button>
-            </div>
-            <div style={{
-              fontFamily: 'Menlo, monospace', fontSize: 10, color: BONE,
-              backgroundColor: '#111', padding: 10, borderRadius: 8,
-              overflow: 'auto', flex: 1, whiteSpace: 'pre-wrap', wordBreak: 'break-all',
-              border: '1px solid #2a2a2a',
-            }}>
-              {debugLines.length === 0 ? '(empty — no events logged yet)' : debugLines.join('\n')}
-            </div>
-            <div style={{ display: 'flex', gap: 8 }}>
-              <button
-                type="button"
-                onClick={() => setDebugLines(getDebugLog())}
-                style={{
-                  flex: 1, background: 'transparent', border: `1.5px solid ${WHITE}`,
-                  color: WHITE, padding: '10px', borderRadius: 10, fontSize: 11,
-                  fontWeight: 700, letterSpacing: '0.15em', fontFamily: 'inherit', cursor: 'pointer',
-                }}
-              >REFRESH</button>
-              <button
-                type="button"
-                onClick={() => {
-                  try {
-                    const txt = debugLines.join('\n');
-                    if (navigator.clipboard) navigator.clipboard.writeText(txt);
-                  } catch { /* ignore */ }
-                }}
-                style={{
-                  flex: 1, background: 'transparent', border: `1.5px solid ${WHITE}`,
-                  color: WHITE, padding: '10px', borderRadius: 10, fontSize: 11,
-                  fontWeight: 700, letterSpacing: '0.15em', fontFamily: 'inherit', cursor: 'pointer',
-                }}
-              >COPY</button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
@@ -2686,18 +2711,186 @@ function DetailView({ site, currentLocation, onBack }: {
   );
 }
 
+// ---------- Inline handle claim UI for SubmitView ----------
+// If the user has a server-claimed handle, just shows it read-only. If not,
+// shows a small text input with live availability check + Claim button.
+// Once claimed, the parent's onClaimed() fires, App's `handle` state updates,
+// and on next render the field flips to the read-only display.
+function HandleField({ deviceId, handle, submitter, setSubmitter, onClaimed }: {
+  deviceId: string | null;
+  handle: string | null;
+  submitter: string;
+  setSubmitter: (v: string) => void;
+  onClaimed: (h: string) => void;
+}) {
+  // Read-only display path: user already owns a handle.
+  if (handle) {
+    return (
+      <Field label="Your Handle" valid={true} hint="Verified handle — credited on the entry">
+        <div style={{
+          ...S.input,
+          display: 'flex', alignItems: 'center', gap: 8,
+          color: BONE, opacity: 0.95,
+        }}>
+          <span style={{ color: SUBMIT_RED, fontWeight: 700 }}>@</span>
+          <span style={{ flex: 1 }}>{handle}</span>
+          <span style={{ fontSize: 11, color: '#6f6', letterSpacing: '0.1em' }}>✓ CLAIMED</span>
+        </div>
+      </Field>
+    );
+  }
+
+  // Claim path: user has no handle yet. Show input + live availability + Claim button.
+  // We use submitter state as the typed value so we don't need a second piece
+  // of state and the placeholder behaves naturally.
+  return (
+    <ClaimHandleInline
+      deviceId={deviceId}
+      typed={submitter}
+      onTypedChange={setSubmitter}
+      onClaimed={onClaimed}
+    />
+  );
+}
+
+function ClaimHandleInline({ deviceId, typed, onTypedChange, onClaimed }: {
+  deviceId: string | null;
+  typed: string;
+  onTypedChange: (v: string) => void;
+  onClaimed: (h: string) => void;
+}) {
+  const [status, setStatus] = useState<'idle' | 'checking' | 'available' | 'taken' | 'invalid'>('idle');
+  const [statusMsg, setStatusMsg] = useState<string>('');
+  const [claiming, setClaiming] = useState(false);
+  const [claimErr, setClaimErr] = useState<string | null>(null);
+  const debounceRef = useRef<number | null>(null);
+
+  // Live availability check, debounced 350ms after the last keystroke.
+  useEffect(() => {
+    if (debounceRef.current) {
+      window.clearTimeout(debounceRef.current);
+      debounceRef.current = null;
+    }
+    const trimmed = typed.trim();
+    if (trimmed.length === 0) {
+      setStatus('idle');
+      setStatusMsg('');
+      return;
+    }
+    setStatus('checking');
+    setStatusMsg('checking...');
+    debounceRef.current = window.setTimeout(async () => {
+      const r = await apiCheckHandle(trimmed);
+      if (r.available) {
+        setStatus('available');
+        setStatusMsg('available');
+      } else {
+        // Distinguish "format/reserved/profanity" (invalid) from "already taken".
+        if (r.reason && r.reason.toLowerCase().includes('taken')) {
+          setStatus('taken');
+          setStatusMsg('taken');
+        } else {
+          setStatus('invalid');
+          setStatusMsg(r.reason || 'invalid');
+        }
+      }
+    }, 350);
+    return () => {
+      if (debounceRef.current) window.clearTimeout(debounceRef.current);
+    };
+  }, [typed]);
+
+  async function doClaim() {
+    if (status !== 'available') return;
+    if (!deviceId) {
+      setClaimErr('Device id not ready yet — try again in a moment.');
+      return;
+    }
+    setClaiming(true);
+    setClaimErr(null);
+    try {
+      const r = await apiClaimHandle(typed.trim(), deviceId);
+      if (r.ok && r.handle) {
+        onClaimed(r.handle);
+      } else {
+        setClaimErr(r.reason || 'Claim failed.');
+      }
+    } catch (err: any) {
+      setClaimErr(err?.message || 'Claim failed.');
+    } finally {
+      setClaiming(false);
+    }
+  }
+
+  const statusColor =
+    status === 'available' ? '#6f6' :
+    status === 'taken' ? '#f66' :
+    status === 'invalid' ? '#fc6' :
+    BONE;
+
+  return (
+    <Field label="Pick a Handle" valid={status === 'available'} hint="3-20 chars · letters, numbers, underscores · this is your forever name">
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+        <input
+          type="text"
+          value={typed}
+          onChange={(e) => onTypedChange(e.target.value.replace(/[^A-Za-z0-9_]/g, ''))}
+          placeholder="e.g. drew_horror"
+          maxLength={20}
+          style={S.input}
+          disabled={claiming}
+        />
+        {statusMsg && (
+          <div style={{ fontSize: 12, color: statusColor, letterSpacing: '0.1em' }}>
+            {status === 'available' ? '✓ ' : status === 'taken' ? '✗ ' : status === 'invalid' ? '⚠ ' : ''}{statusMsg}
+          </div>
+        )}
+        {claimErr && (
+          <div style={{ fontSize: 12, color: '#f66', letterSpacing: '0.05em' }}>⚠ {claimErr}</div>
+        )}
+        <button
+          type="button"
+          onClick={doClaim}
+          disabled={status !== 'available' || claiming || !deviceId}
+          style={{
+            padding: '12px 16px',
+            border: `2px solid ${status === 'available' ? SUBMIT_RED : '#444'}`,
+            background: 'transparent',
+            color: status === 'available' ? '#fff' : '#666',
+            fontFamily: 'inherit',
+            fontSize: 13,
+            fontWeight: 700,
+            letterSpacing: '0.18em',
+            borderRadius: 12,
+            cursor: status === 'available' && !claiming ? 'pointer' : 'not-allowed',
+          }}
+        >
+          {claiming ? 'CLAIMING...' : 'CLAIM HANDLE'}
+        </button>
+      </div>
+    </Field>
+  );
+}
+
 // ---------- SUBMIT ----------
 // Short Description field REMOVED. The server's `shortDescription` parameter is
 // derived from the first ~150 chars of the full description so the existing
 // /sites/submit endpoint still gets a value (it requires shortDescription).
-function SubmitView({ currentLocation, onBack }: {
+function SubmitView({ currentLocation, deviceId, handle, onHandleClaimed, onBack }: {
   currentLocation: { lat: number; lng: number } | null;
+  deviceId: string | null;
+  handle: string | null;
+  onHandleClaimed: (h: string) => void;
   onBack: () => void;
 }) {
   const [title, setTitle] = useState('');
   const [fullDesc, setFullDesc] = useState('');
   const [category, setCategory] = useState<CategoryKey>('crime');
-  const [submitter, setSubmitter] = useState('');
+  // Seed from the server-claimed handle (if any) so the form ships with the
+  // user's real identity already filled in instead of an empty box.
+  const [submitter, setSubmitter] = useState(handle || '');
+  // Keep submitter in sync if handle changes mid-form (e.g. user just claimed it).
+  useEffect(() => { if (handle && !submitter) setSubmitter(handle); }, [handle]);
   const [locMode, setLocMode] = useState<'gps' | 'manual'>('gps');
   const [manualLat, setManualLat] = useState('');
   const [manualLng, setManualLng] = useState('');
@@ -2759,7 +2952,10 @@ function SubmitView({ currentLocation, onBack }: {
   const pin = pinLatLng();
   const titleOk     = title.trim().length >= 3 && title.trim().length <= 120;
   const fullOk      = fullDesc.trim().length >= 20 && fullDesc.trim().length <= 500;
-  const submitterOk = submitter.trim().length >= 2 && submitter.trim().length <= 30;
+  // Submission requires a server-claimed handle. Free-text entry was the old
+  // model; new model proves ownership via deviceId so badges can be tied to
+  // a real persistent identity.
+  const submitterOk = !!handle && submitter.trim().length >= 2 && submitter.trim().length <= 30;
   const photoOk     = !!photoFile;
   const locOk       = pin !== null;
   const allValid = titleOk && fullOk && submitterOk && photoOk && locOk;
@@ -2810,6 +3006,12 @@ function SubmitView({ currentLocation, onBack }: {
       fd.append('lat', String(pin.lat));
       fd.append('lng', String(pin.lng));
       fd.append('submitter', submitter.trim());
+      // Identity: handle (the user's claimed @name) and deviceId (proof of
+      // ownership). Server uses the pair to attribute the submission for
+      // future badges; sites.js will validate the pair if it knows about
+      // /handles. If not, these are silently ignored — backward compatible.
+      if (handle) fd.append('handle', handle);
+      if (deviceId) fd.append('deviceId', deviceId);
       if (captureCoords) {
         fd.append('captureLat', String(captureCoords.lat));
         fd.append('captureLng', String(captureCoords.lng));
@@ -2926,10 +3128,17 @@ function SubmitView({ currentLocation, onBack }: {
           {photoPreview && <img src={photoPreview} alt="preview" style={S.photoPreview} />}
         </Field>
 
-        <Field label="Your Handle" valid={submitterOk} hint="2-30 characters — credited on the entry if approved">
-          <input type="text" value={submitter} onChange={(e) => setSubmitter(e.target.value)}
-                 placeholder="e.g. drew" maxLength={30} style={S.input} />
-        </Field>
+        {/* Handle field — driven by the server-claimed handle when one exists.
+            If the user hasn't claimed yet, a small inline form does it now.
+            We reuse the existing submitter state so downstream code (success
+            message, server payload) doesn't care which path produced it. */}
+        <HandleField
+          deviceId={deviceId}
+          handle={handle}
+          submitter={submitter}
+          setSubmitter={setSubmitter}
+          onClaimed={(h) => { setSubmitter(h); onHandleClaimed(h); }}
+        />
 
         {errorMsg && <div style={S.errorBox}>⚠ {errorMsg}</div>}
 
