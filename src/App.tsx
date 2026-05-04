@@ -1184,15 +1184,19 @@ export default function App() {
   // the DOM yet at that moment.
   const _pendingScrollRestore = useRef<number | null>(null);
   const setView = (next: View) => {
+    // Capture scroll position SYNCHRONOUSLY before any state update. Doing
+    // this inside the state updater is unsafe — React may run the updater
+    // multiple times (Strict Mode) or asynchronously, and by then the
+    // scroll position can have changed (e.g. the button tap that triggered
+    // the nav fired focus events that scrolled the page). Reading it here,
+    // before _setViewRaw is even called, guarantees we record the user's
+    // actual position when they initiated the navigation.
+    const sy = (typeof window !== 'undefined')
+      ? (window.scrollY || document.documentElement.scrollTop || 0)
+      : 0;
     _setViewRaw((prev) => {
       // Don't push if the new view is the same as current (no-op nav).
       if (JSON.stringify(prev) !== JSON.stringify(next)) {
-        // Capture scroll BEFORE the new view mounts. document.documentElement
-        // is the actual scroll container on iOS Safari / iOS WebView; on
-        // other browsers window.scrollY agrees with it. Read both for safety.
-        const sy = (typeof window !== 'undefined')
-          ? (window.scrollY || document.documentElement.scrollTop || 0)
-          : 0;
         _navHistory.current.push({ view: prev, scrollY: sy });
         // Cap history at 50 to avoid unbounded growth.
         if (_navHistory.current.length > 50) _navHistory.current.shift();
@@ -1762,11 +1766,17 @@ export default function App() {
 
   // Scroll restore on swipe-back. When goBack() pops a history entry it
   // stashes the saved scrollY in _pendingScrollRestore. This effect fires
-  // on the next render (after the popped view has mounted and laid out
-  // its content) and scrolls the document to that position. We do it in
-  // a double-rAF to make sure layout/paint has had a tick — restoring
-  // before the new view's content exists in the DOM is a no-op since
-  // there's nothing to scroll.
+  // on the next render after the popped view has mounted, but the new
+  // view's content may not be tall enough yet (data loaded async, images
+  // streaming in, lazy effects running). A single double-rAF lands too
+  // early in those cases and the page caps the scroll at whatever the
+  // current content height allows — which is why users were seeing scroll
+  // back to 0 even though the saved value was correct.
+  //
+  // We poll up to ~600ms checking whether the document is tall enough to
+  // accommodate the target scroll, and only then commit. If after the
+  // poll period the page still isn't tall enough, we scroll as far as we
+  // can so the user lands as close to where they were as possible.
   //
   // On forward navigations there's no pending value, so this scrolls to
   // 0 — matching the normal "new screen starts at the top" expectation.
@@ -1774,17 +1784,40 @@ export default function App() {
     if (typeof window === 'undefined') return;
     const target = _pendingScrollRestore.current;
     _pendingScrollRestore.current = null;
-    requestAnimationFrame(() => {
+
+    if (target == null) {
+      // Forward nav — go straight to top after one rAF for layout.
       requestAnimationFrame(() => {
-        if (target != null) {
-          // 'instant' avoids a visible scroll animation that would clash
-          // with the swipe-back transform animation.
-          window.scrollTo({ top: target, left: 0, behavior: 'auto' as ScrollBehavior });
-        } else {
-          window.scrollTo({ top: 0, left: 0, behavior: 'auto' as ScrollBehavior });
-        }
+        window.scrollTo({ top: 0, left: 0, behavior: 'auto' as ScrollBehavior });
       });
-    });
+      return;
+    }
+
+    // Backward nav with a saved scroll position. Poll for the page to grow
+    // tall enough, then commit. We require the document to be tall enough
+    // that scrolling to `target` actually moves the viewport (not capped
+    // at maxScroll < target).
+    let cancelled = false;
+    let attempts = 0;
+    const MAX_ATTEMPTS = 12; // ~12 frames * ~50ms = 600ms ceiling
+    const tryRestore = () => {
+      if (cancelled) return;
+      attempts++;
+      const doc = document.documentElement;
+      const maxScroll = Math.max(0, doc.scrollHeight - window.innerHeight);
+      // If the page is tall enough OR we've burned through our retries,
+      // commit. Math.min ensures we never request a scroll past maxScroll
+      // (which iOS Safari ignores and leaves us at 0).
+      if (maxScroll >= target || attempts >= MAX_ATTEMPTS) {
+        const safeTarget = Math.min(target, maxScroll);
+        window.scrollTo({ top: safeTarget, left: 0, behavior: 'auto' as ScrollBehavior });
+        return;
+      }
+      // Not tall enough yet — wait one more frame plus a tick.
+      window.setTimeout(() => requestAnimationFrame(tryRestore), 50);
+    };
+    requestAnimationFrame(tryRestore);
+    return () => { cancelled = true; };
   }, [viewKey]);
 
   // The key forces React to unmount + remount the wrapper on every view
