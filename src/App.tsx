@@ -2564,7 +2564,7 @@ function CategoryView({ label, color, sites, currentLocation, onSelectSite, onSu
                     <div style={S.filmFrameContent}>
                       <div style={S.filmFrameLabel}>{entry.site.title}</div>
                       <div style={S.filmFrameCount}>
-                        {entry.site.shortDescription}
+                        {entry.site.state}
                       </div>
                     </div>
                   </button>
