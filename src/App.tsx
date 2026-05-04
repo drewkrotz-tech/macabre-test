@@ -961,7 +961,9 @@ type View =
   | { name: 'category'; category: CategoryKey; state?: string }
   | { name: 'detail'; site: SinisterSite }
   | { name: 'submit' }
-  | { name: 'about' };
+  | { name: 'about' }
+  | { name: 'leaders' }
+  | { name: 'list' };
 
 export default function App() {
   const [view, _setViewRaw] = useState<View>({ name: 'home' });
@@ -1351,6 +1353,14 @@ export default function App() {
     playButton();
     setView({ name: 'about' });
   }
+  function goLeaders() {
+    playButton();
+    setView({ name: 'leaders' });
+  }
+  function goList() {
+    playButton();
+    setView({ name: 'list' });
+  }
   function goHome() {
     playBackSound();
     setView({ name: 'home' });
@@ -1433,6 +1443,10 @@ export default function App() {
       return { key: 'submit', element: <SubmitView currentLocation={currentLocation} deviceId={deviceId} handle={handle} onHandleClaimed={setHandle} onBack={goHome} /> };
     } else if (v.name === 'about') {
       return { key: 'about', element: <AboutView onBack={goHome} /> };
+    } else if (v.name === 'leaders') {
+      return { key: 'leaders', element: <LeadersView onBack={goHome} /> };
+    } else if (v.name === 'list') {
+      return { key: 'list', element: <ListPlaceholderView onBack={goHome} /> };
     } else {
       return {
         key: 'home',
@@ -1442,6 +1456,8 @@ export default function App() {
             onSelectCategory={goStateList}
             onSubmit={goSubmit}
             onAbout={goAbout}
+            onLeaders={goLeaders}
+            onList={goList}
           />
         ),
       };
@@ -1670,6 +1686,84 @@ function FireEffect() {
 }
 
 // ---------- Bottom social bar ----------
+// ---------- Home bottom bar ----------
+// Replaces the old SocialBar on the home page. Three slots: Dread Leaders
+// (top submitters/visitors leaderboard, scaffolded but not yet populated),
+// List View (flat directory of all categories/states/locations, also
+// scaffolded), and About. Instagram and YouTube links moved to AboutView
+// where they already live, so users still have one tap to reach them.
+function HomeBottomBar({ onLeaders, onList, onAbout }: {
+  onLeaders: () => void;
+  onList: () => void;
+  onAbout: () => void;
+}) {
+  return (
+    <div style={S.socialBar}>
+      <button style={S.socialBtn} onClick={() => { playButton(); onLeaders(); }}>
+        <span style={S.socialIcon}>👑</span>
+        <span style={S.socialLabel}>Dread Leaders</span>
+      </button>
+      <button style={S.socialBtn} onClick={() => { playButton(); onList(); }}>
+        <span style={S.socialIcon}>📜</span>
+        <span style={S.socialLabel}>List View</span>
+      </button>
+      <button style={S.socialBtn} onClick={() => { playButton(); onAbout(); }}>
+        <span style={S.socialIcon}>ℹ️</span>
+        <span style={S.socialLabel}>About</span>
+      </button>
+    </div>
+  );
+}
+
+// ---------- Leaders (placeholder) ----------
+// Scaffolded page. Once the badges/visits backend exists we will:
+//   - GET /leaderboard/submitters?limit=20 (handles ranked by approved submissions)
+//   - GET /leaderboard/visitors?limit=20 (handles ranked by verified visits)
+// and render twin scrollable rankings here.
+function LeadersView({ onBack }: { onBack: () => void }) {
+  return (
+    <div style={S.appBg}>
+      <header style={S.header}>
+        <div style={{ ...S.categoryViewTitle, color: WHITE, textShadow: `0 0 14px ${WHITE}cc` }}>
+          Dread Leaders
+        </div>
+      </header>
+      <div style={S.aboutBody}>
+        <p style={S.aboutPara}>
+          Coming soon. The leaderboards will rank the most active <b>submitters</b> (users
+          who add the most approved locations) and the most active <b>explorers</b> (users
+          who physically visit and check in at the most sites).
+        </p>
+        <p style={S.aboutPara}>
+          Earn your spot by submitting locations and tagging in when you arrive at one.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+// ---------- List View (placeholder) ----------
+// Scaffolded page. Will become a flat scannable directory: every category
+// expanded, every state inside it expanded, every location inside that.
+// Useful for users who want to browse without the filmstrip-cell flow.
+function ListPlaceholderView({ onBack }: { onBack: () => void }) {
+  return (
+    <div style={S.appBg}>
+      <header style={S.header}>
+        <div style={{ ...S.categoryViewTitle, color: WHITE, textShadow: `0 0 14px ${WHITE}cc` }}>
+          List View
+        </div>
+      </header>
+      <div style={S.aboutBody}>
+        <p style={S.aboutPara}>
+          Coming soon. A flat list of every category, every state, and every approved
+          location for quick browsing without the filmstrip flow.
+        </p>
+      </div>
+    </div>
+  );
+}
+
 function SocialBar({ onAbout, flow }: { onAbout: () => void; flow?: boolean }) {
   function openExternal(url: string) {
     playButton();
@@ -1694,11 +1788,13 @@ function SocialBar({ onAbout, flow }: { onAbout: () => void; flow?: boolean }) {
 }
 
 // ---------- HOME ----------
-function HomeView({ sites, onSelectCategory, onSubmit, onAbout }: {
+function HomeView({ sites, onSelectCategory, onSubmit, onAbout, onLeaders, onList }: {
   sites: SinisterSite[];
   onSelectCategory: (key: CategoryKey) => void;
   onSubmit: () => void;
   onAbout: () => void;
+  onLeaders: () => void;
+  onList: () => void;
 }) {
   const counts: Record<string, number> = {};
   for (const s of sites) counts[s.category] = (counts[s.category] || 0) + 1;
@@ -1941,7 +2037,7 @@ function HomeView({ sites, onSelectCategory, onSubmit, onAbout }: {
         <span style={S.submitFixedButtonText}>Submit a Location</span>
       </button>
 
-      <SocialBar onAbout={onAbout} />
+      <HomeBottomBar onLeaders={onLeaders} onList={onList} onAbout={onAbout} />
     </div>
   );
 }
@@ -2526,7 +2622,6 @@ function CategoryView({ label, color, sites, currentLocation, onSelectSite, onSu
             >
               {label}
             </div>
-            <div style={S.bySinister}><BySinister /></div>
           </div>
 
           {/* Search bar sits between header and filmstrip. Hidden on empty
@@ -2670,9 +2765,6 @@ function DetailView({ site, currentLocation, onBack }: {
         boxShadow: `0 0 28px ${SUBMIT_RED}aa, 0 0 56px ${SUBMIT_RED}55, inset 0 -50px 80px ${BLACK}`,
       }} />
       <div style={S.detailBody}>
-        <div style={{ ...S.detailCategory, color: color, textShadow: `0 0 12px ${color}` }}>
-          {titleCase(site.category)}
-        </div>
         {/* Title styled to match the home / category page titles: LivingHell
             font with the chromatic-aberration glitch effect. data-text mirrors
             content for the ::before/::after pseudo-elements that drive the
