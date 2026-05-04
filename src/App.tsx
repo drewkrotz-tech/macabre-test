@@ -157,6 +157,49 @@ async function apiGetMyVisits(handle: string): Promise<Set<string>> {
   } catch { return new Set(); }
 }
 
+// ---------- Leaderboard + Badges API ----------
+// The server exposes two leaderboard endpoints (top submitters and top
+// visitors) plus a per-handle badges endpoint. All public, no auth.
+//
+// Leaderboards return a ranked list of { handle, count }. Badges returns
+// a flat list of { id, label, kind, threshold? } for whatever the handle
+// has earned.
+type LeaderRow = { handle: string; count: number };
+type BadgeRow = {
+  id: string;
+  label: string;
+  kind: 'submitter' | 'visitor' | string;
+  threshold?: number;
+  category?: string;
+};
+
+async function apiLeaderboardSubmitters(limit = 25): Promise<LeaderRow[]> {
+  try {
+    const res = await fetch(`${API_BASE}/leaderboard/submitters?limit=${limit}`);
+    const data = await res.json();
+    const rows = data?.leaderboard || data?.rows || data?.results || [];
+    return Array.isArray(rows) ? rows : [];
+  } catch { return []; }
+}
+
+async function apiLeaderboardVisitors(limit = 25): Promise<LeaderRow[]> {
+  try {
+    const res = await fetch(`${API_BASE}/leaderboard/visitors?limit=${limit}`);
+    const data = await res.json();
+    const rows = data?.leaderboard || data?.rows || data?.results || [];
+    return Array.isArray(rows) ? rows : [];
+  } catch { return []; }
+}
+
+async function apiGetBadges(handle: string): Promise<BadgeRow[]> {
+  try {
+    const res = await fetch(`${API_BASE}/badges/${encodeURIComponent(handle)}`);
+    const data = await res.json();
+    const list = data?.badges || [];
+    return Array.isArray(list) ? list : [];
+  } catch { return []; }
+}
+
 // ---------- Live site fetch ----------
 // The server's /sites endpoint returns approved locales. Each site has the
 // shape { id, title, shortDescription, fullDescription, category, state,
@@ -1012,6 +1055,7 @@ type View =
   | { name: 'submit' }
   | { name: 'about' }
   | { name: 'leaders' }
+  | { name: 'badges'; handle: string }
   | { name: 'list' };
 
 export default function App() {
@@ -1517,7 +1561,21 @@ export default function App() {
     } else if (v.name === 'about') {
       return { key: 'about', element: <AboutView onBack={goHome} /> };
     } else if (v.name === 'leaders') {
-      return { key: 'leaders', element: <LeadersView onBack={goHome} /> };
+      return {
+        key: 'leaders',
+        element: (
+          <LeadersView
+            currentHandle={handle}
+            onSelectHandle={(h) => setView({ name: 'badges', handle: h })}
+            onBack={goHome}
+          />
+        ),
+      };
+    } else if (v.name === 'badges') {
+      return {
+        key: `badges:${v.handle}`,
+        element: <BadgesView handle={v.handle} isMe={!!handle && handle.toLowerCase() === v.handle.toLowerCase()} onBack={goHome} />,
+      };
     } else if (v.name === 'list') {
       return { key: 'list', element: <ListPlaceholderView onBack={goHome} /> };
     } else {
@@ -1788,12 +1846,53 @@ function HomeBottomBar({ onLeaders, onList, onAbout }: {
   );
 }
 
-// ---------- Leaders (placeholder) ----------
-// Scaffolded page. Once the badges/visits backend exists we will:
-//   - GET /leaderboard/submitters?limit=20 (handles ranked by approved submissions)
-//   - GET /leaderboard/visitors?limit=20 (handles ranked by verified visits)
-// and render twin scrollable rankings here.
-function LeadersView({ onBack }: { onBack: () => void }) {
+// ---------- Leaders (Dread Leaders leaderboard) ----------
+// Two-tab leaderboard: Submitters (handles ranked by approved site count)
+// and Visitors (handles ranked by verified visit count). Tapping any row
+// drills into that handle's badge collection.
+//
+// Design choices:
+//   - Submitters tab is the default since it represents earned content; the
+//     visitor count lags until users start tagging in at sites.
+//   - Tabs are local state (no routing) — switching is cheap and doesn't
+//     warrant a new view in the back stack.
+//   - We fetch both lists once on mount in parallel rather than lazy-load
+//     per tab. The payload is tiny and switching tabs feels instant this way.
+//   - The "View My Badges" pill at the top is shown only if a handle is
+//     claimed; it's the most discoverable entry point to the badges screen
+//     for users who don't appear on the leaderboard yet.
+function LeadersView({ currentHandle, onSelectHandle, onBack }: {
+  currentHandle: string | null;
+  onSelectHandle: (handle: string) => void;
+  onBack: () => void;
+}) {
+  const [tab, setTab] = useState<'submitters' | 'visitors'>('submitters');
+  const [submitters, setSubmitters] = useState<LeaderRow[] | null>(null);
+  const [visitors, setVisitors] = useState<LeaderRow[] | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const [s, v] = await Promise.all([
+          apiLeaderboardSubmitters(50),
+          apiLeaderboardVisitors(50),
+        ]);
+        if (cancelled) return;
+        setSubmitters(s);
+        setVisitors(v);
+      } catch (err: any) {
+        if (cancelled) return;
+        setLoadError(err?.message || 'Could not load leaderboards');
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const rows = tab === 'submitters' ? submitters : visitors;
+  const unitLabel = tab === 'submitters' ? 'submissions' : 'visits';
+
   return (
     <div style={S.appBg}>
       <header style={S.header}>
@@ -1801,15 +1900,176 @@ function LeadersView({ onBack }: { onBack: () => void }) {
           Dread Leaders
         </div>
       </header>
-      <div style={S.aboutBody}>
-        <p style={S.aboutPara}>
-          Coming soon. The leaderboards will rank the most active <b>submitters</b> (users
-          who add the most approved locations) and the most active <b>explorers</b> (users
-          who physically visit and check in at the most sites).
-        </p>
-        <p style={S.aboutPara}>
-          Earn your spot by submitting locations and tagging in when you arrive at one.
-        </p>
+
+      {/* Tab switcher — pill row, currentTab gets the white glow that the
+          rest of the app uses to indicate active state. */}
+      <div style={S.leaderTabs}>
+        <button
+          style={{ ...S.leaderTab, ...(tab === 'submitters' ? S.leaderTabActive : {}) }}
+          onClick={() => { playButton(); setTab('submitters'); }}
+        >
+          Submitters
+        </button>
+        <button
+          style={{ ...S.leaderTab, ...(tab === 'visitors' ? S.leaderTabActive : {}) }}
+          onClick={() => { playButton(); setTab('visitors'); }}
+        >
+          Visitors
+        </button>
+      </div>
+
+      {/* "View My Badges" entry point — only when the user has a claimed handle. */}
+      {currentHandle && (
+        <div style={{ padding: '0 20px', marginBottom: 8 }}>
+          <button
+            style={{ ...S.leaderMineBtn, border: `2px solid ${WHITE}`, color: WHITE }}
+            onClick={() => { playForward(); onSelectHandle(currentHandle); }}
+          >
+            🏅 View My Badges ({currentHandle})
+          </button>
+        </div>
+      )}
+
+      <div style={S.leaderBody}>
+        {loadError && (
+          <p style={{ ...S.aboutPara, color: '#d97a7a' }}>{loadError}</p>
+        )}
+        {!loadError && rows === null && (
+          <p style={S.aboutPara}>Loading…</p>
+        )}
+        {!loadError && rows !== null && rows.length === 0 && (
+          <p style={S.aboutPara}>
+            No {tab} yet. Be the first — {tab === 'submitters' ? 'submit a location' : 'tag in at a site'} to claim the top spot.
+          </p>
+        )}
+        {!loadError && rows !== null && rows.length > 0 && (
+          <div style={S.leaderList}>
+            {rows.map((row, i) => {
+              const isMe = !!currentHandle && currentHandle.toLowerCase() === row.handle.toLowerCase();
+              return (
+                <button
+                  key={`${row.handle}:${i}`}
+                  style={{ ...S.leaderRow, ...(isMe ? S.leaderRowMe : {}) }}
+                  onClick={() => { playForward(); onSelectHandle(row.handle); }}
+                >
+                  <span style={S.leaderRank}>{i + 1}</span>
+                  <span style={S.leaderHandle}>{row.handle}{isMe ? ' (you)' : ''}</span>
+                  <span style={S.leaderCount}>{row.count} {unitLabel}</span>
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---------- Badges (per-handle collection) ----------
+// Shows every badge a given handle has earned. Reachable from a row tap on
+// LeadersView, or via the "View My Badges" pill on the same screen.
+//
+// Server response format (computed on each request, not stored):
+//   { handle, badges: [{ id, label, kind, threshold?, category? }] }
+//
+// We bucket the badges into Submitter / Visitor / Other and render each
+// group with a header. Empty handles get an encouraging empty state rather
+// than a blank screen, since some users may visit this view with a handle
+// that hasn't earned anything yet.
+function BadgesView({ handle, isMe, onBack }: {
+  handle: string;
+  isMe: boolean;
+  onBack: () => void;
+}) {
+  const [badges, setBadges] = useState<BadgeRow[] | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const list = await apiGetBadges(handle);
+        if (cancelled) return;
+        setBadges(list);
+      } catch (e: any) {
+        if (cancelled) return;
+        setErr(e?.message || 'Could not load badges');
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [handle]);
+
+  // Bucket badges by kind so each section gets its own header. Unknown
+  // kinds fall into "Other" so we never silently drop server data.
+  const submitterBadges = (badges || []).filter(b => b.kind === 'submitter');
+  const visitorBadges = (badges || []).filter(b => b.kind === 'visitor');
+  const otherBadges = (badges || []).filter(b => b.kind !== 'submitter' && b.kind !== 'visitor');
+
+  return (
+    <div style={S.appBg}>
+      <header style={S.header}>
+        <div style={{ ...S.categoryViewTitle, color: WHITE, textShadow: `0 0 14px ${WHITE}cc` }}>
+          {isMe ? 'My Badges' : `${handle}'s Badges`}
+        </div>
+      </header>
+      <div style={S.leaderBody}>
+        {!isMe && (
+          <p style={{ ...S.aboutPara, fontSize: 13, opacity: 0.7 }}>
+            Handle: <b>{handle}</b>
+          </p>
+        )}
+        {err && <p style={{ ...S.aboutPara, color: '#d97a7a' }}>{err}</p>}
+        {!err && badges === null && <p style={S.aboutPara}>Loading…</p>}
+        {!err && badges !== null && badges.length === 0 && (
+          <p style={S.aboutPara}>
+            {isMe
+              ? "You haven't earned any badges yet. Submit a location or tag in at a site to start your collection."
+              : `${handle} hasn't earned any badges yet.`}
+          </p>
+        )}
+        {!err && badges !== null && badges.length > 0 && (
+          <>
+            {submitterBadges.length > 0 && (
+              <BadgeGroup title="Submitter" badges={submitterBadges} accent={SUBMIT_RED} />
+            )}
+            {visitorBadges.length > 0 && (
+              <BadgeGroup title="Visitor" badges={visitorBadges} accent="#5a8f5a" />
+            )}
+            {otherBadges.length > 0 && (
+              <BadgeGroup title="Special" badges={otherBadges} accent={WHITE} />
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Reusable badge group renderer. Keeps BadgesView's JSX readable when we
+// add new categories of badges later (e.g. event-based or seasonal).
+function BadgeGroup({ title, badges, accent }: {
+  title: string;
+  badges: BadgeRow[];
+  accent: string;
+}) {
+  return (
+    <div style={{ marginBottom: 24 }}>
+      <div style={{ ...S.badgeGroupTitle, color: accent, textShadow: `0 0 8px ${accent}88` }}>
+        {title}
+      </div>
+      <div style={S.badgeGrid}>
+        {badges.map((b) => (
+          <div key={b.id} style={{ ...S.badgeCard, borderColor: `${accent}55`, boxShadow: `0 0 10px ${accent}33` }}>
+            <div style={{ ...S.badgeIcon, color: accent, textShadow: `0 0 10px ${accent}` }}>★</div>
+            <div style={S.badgeLabel}>{b.label}</div>
+            {b.threshold != null && (
+              <div style={S.badgeMeta}>Tier: {b.threshold}+</div>
+            )}
+            {b.category && (
+              <div style={S.badgeMeta}>{titleCase(b.category)}</div>
+            )}
+          </div>
+        ))}
       </div>
     </div>
   );
@@ -2922,7 +3182,7 @@ function DetailView({ site, currentLocation, handle, deviceId, alreadyVisited, o
         {distMi && <div style={{ ...S.detailDistance, color: color }}>📍 {distMi} mi from you</div>}
         <div style={{ ...S.detailDivider, backgroundColor: SUBMIT_RED, boxShadow: `0 0 12px ${SUBMIT_RED}` }} />
         <div style={S.detailDescription}>
-          {site.fullDescription.split('\n\n').map((para, i) => <p key={i} style={S.detailPara}>{para}</p>)}
+          {(site.fullDescription || site.shortDescription || '').split('\n\n').map((para, i) => <p key={i} style={S.detailPara}>{para}</p>)}
         </div>
         {/* I'm Here button — only rendered when we have a GPS fix. Three
             visual modes: visited (green confirmation), in-range (red, active),
@@ -4049,6 +4309,153 @@ const S: Record<string, React.CSSProperties> = {
     margin: '0 auto',
   },
   aboutPara: { fontSize: 14, lineHeight: 1.6, marginBottom: 14 },
+
+  // ---- Dread Leaders / Badges styles ----
+  // Body uses the same width constraint as aboutBody so the leaderboard
+  // doesn't sprawl on tablets, but uses tighter vertical padding because
+  // the row list provides its own rhythm.
+  leaderBody: {
+    padding: '8px 20px 80px',
+    position: 'relative',
+    zIndex: 1,
+    color: BONE,
+    maxWidth: 600,
+    margin: '0 auto',
+    boxSizing: 'border-box',
+  },
+  leaderTabs: {
+    display: 'flex',
+    gap: 8,
+    padding: '4px 20px 16px',
+    maxWidth: 600,
+    margin: '0 auto',
+    boxSizing: 'border-box',
+  },
+  leaderTab: {
+    flex: 1,
+    backgroundColor: 'transparent',
+    border: '2px solid #2a2a2a',
+    color: '#888',
+    padding: '10px',
+    fontSize: 12,
+    fontWeight: 800,
+    letterSpacing: '0.18em',
+    borderRadius: 12,
+    cursor: 'pointer',
+    fontFamily: 'inherit',
+    textTransform: 'uppercase' as const,
+  },
+  leaderTabActive: {
+    border: `2px solid ${WHITE}`,
+    color: WHITE,
+    textShadow: `0 0 8px ${WHITE}aa`,
+    boxShadow: `0 0 14px ${WHITE}44, inset 0 0 10px ${WHITE}22`,
+  },
+  leaderMineBtn: {
+    width: '100%',
+    boxSizing: 'border-box' as const,
+    backgroundColor: 'transparent',
+    padding: '12px',
+    fontSize: 12,
+    fontWeight: 800,
+    letterSpacing: '0.15em',
+    cursor: 'pointer',
+    borderRadius: 12,
+    fontFamily: 'inherit',
+    textShadow: `0 0 8px ${WHITE}88`,
+    boxShadow: `0 0 12px ${WHITE}33, inset 0 0 8px ${WHITE}22`,
+  },
+  leaderList: {
+    display: 'flex',
+    flexDirection: 'column' as const,
+    gap: 8,
+    marginTop: 8,
+  },
+  leaderRow: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 12,
+    width: '100%',
+    boxSizing: 'border-box' as const,
+    padding: '12px 14px',
+    background: '#0d0d0d',
+    border: '1px solid #1f1f1f',
+    borderRadius: 10,
+    color: BONE,
+    fontFamily: 'inherit',
+    cursor: 'pointer',
+    textAlign: 'left' as const,
+  },
+  leaderRowMe: {
+    border: `1px solid ${SUBMIT_RED}66`,
+    boxShadow: `0 0 12px ${SUBMIT_RED}44, inset 0 0 8px ${SUBMIT_RED}22`,
+    background: '#150808',
+  },
+  leaderRank: {
+    fontSize: 14,
+    fontWeight: 900,
+    color: '#666',
+    minWidth: 24,
+    letterSpacing: '0.1em',
+  },
+  leaderHandle: {
+    flex: 1,
+    fontSize: 14,
+    fontWeight: 700,
+    letterSpacing: '0.05em',
+    overflow: 'hidden' as const,
+    textOverflow: 'ellipsis' as const,
+    whiteSpace: 'nowrap' as const,
+  },
+  leaderCount: {
+    fontSize: 11,
+    color: '#888',
+    fontWeight: 600,
+    letterSpacing: '0.08em',
+  },
+
+  // Badges grid — auto-fitting cards so it works on phone & tablet alike.
+  badgeGroupTitle: {
+    fontSize: 13,
+    fontWeight: 900,
+    letterSpacing: '0.22em',
+    textTransform: 'uppercase' as const,
+    marginBottom: 12,
+    paddingBottom: 6,
+    borderBottom: '1px solid #1f1f1f',
+  },
+  badgeGrid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))',
+    gap: 10,
+  },
+  badgeCard: {
+    background: '#0d0d0d',
+    border: '1px solid #1f1f1f',
+    borderRadius: 12,
+    padding: '14px 10px',
+    textAlign: 'center' as const,
+    display: 'flex',
+    flexDirection: 'column' as const,
+    alignItems: 'center',
+    gap: 6,
+  },
+  badgeIcon: {
+    fontSize: 32,
+    lineHeight: 1,
+  },
+  badgeLabel: {
+    fontSize: 12,
+    fontWeight: 700,
+    letterSpacing: '0.05em',
+    color: BONE,
+  },
+  badgeMeta: {
+    fontSize: 10,
+    color: '#777',
+    letterSpacing: '0.08em',
+    textTransform: 'uppercase' as const,
+  },
   aboutLinkBtn: {
     width: '100%',
     backgroundColor: 'transparent',
