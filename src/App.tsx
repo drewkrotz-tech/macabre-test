@@ -1965,9 +1965,15 @@ export default function App() {
   // because the wrapper's CSS transform creates a containing block and
   // would break position:fixed for the fire layers, making them scroll
   // with the page instead of staying anchored to the viewport.
+  //
+  // FireEffect render currently disabled — the embers + glow weren't
+  // visible behind the opaque content on any screen, so we're skipping
+  // the per-frame animation cost. Component, EMBERS array, keyframes,
+  // and styles are all left in place; just re-add `<FireEffect />` here
+  // to bring it back.
   return (
     <>
-      <FireEffect />
+      {/* <FireEffect /> */}
       {/* Peek-from-left layer rendered as a SIBLING of the drag wrapper, NOT
           inside it. If it lived inside the wrapper, the wrapper's translateX
           during a swipe would drag the peek layer along with the current
@@ -4557,7 +4563,7 @@ function DetailView({ site, currentLocation, handle, deviceId, alreadyVisited, o
                 fontSize: 14,
               }}
             >
-              {distM != null ? `${Math.round(distM)}m away — get within 100m to claim` : 'Locating…'}
+              {distM != null ? 'Get within 100m to claim location' : 'Locating…'}
             </div>
           )
         )}
