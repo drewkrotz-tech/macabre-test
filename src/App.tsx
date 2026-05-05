@@ -277,6 +277,7 @@ function getAudioCtx(): AudioContext | null {
 }
 
 function playForward() {
+  haptic('light');
   const ctx = getAudioCtx();
   if (!ctx) return;
   try {
@@ -426,6 +427,7 @@ function ensureButtonAudio() {
   } catch { /* silent */ }
 }
 function playButton() {
+  haptic('light');
   try {
     ensureButtonAudio();
     if (_buttonAudioCtx && _buttonAudioBuffer && _buttonAudioGain) {
@@ -497,6 +499,7 @@ function ensureBackAudio() {
   } catch { /* silent */ }
 }
 function playBackSound() {
+  haptic('light');
   try {
     ensureBackAudio();
     if (_backAudioCtx && _backAudioBuffer && _backAudioGain) {
@@ -561,6 +564,7 @@ function ensureBellAudio() {
   } catch { /* silent */ }
 }
 function playBell() {
+  haptic('strong');
   try {
     ensureBellAudio();
     if (_bellAudioCtx && _bellAudioBuffer && _bellAudioGain) {
@@ -590,6 +594,48 @@ function playBell() {
       _bellAudio.currentTime = 0;
       void _bellAudio.play();
     }
+  } catch { /* silent */ }
+}
+
+// ---------- Haptics ----------
+// Lightweight haptic feedback via the Web Vibration API. Works in iOS
+// WebView (Capacitor) without needing the @capacitor/haptics plugin or any
+// package.json changes. Three intensities tuned for the app's interactions:
+//
+//   light   — generic button/cell tap. Tiny, snappy.
+//   medium  — confirmations, transitions. Slightly heavier.
+//   strong  — claim success, milestone events. Double-pulse.
+//
+// All haptic calls are wrapped in try/catch + feature checks so they
+// silently no-op on devices/browsers that don't support vibration.
+type HapticIntensity = 'light' | 'medium' | 'strong';
+function haptic(kind: HapticIntensity = 'light') {
+  try {
+    if (typeof navigator === 'undefined' || !navigator.vibrate) return;
+    if (kind === 'light')   navigator.vibrate(8);
+    else if (kind === 'medium') navigator.vibrate(18);
+    else if (kind === 'strong') navigator.vibrate([20, 40, 20]);
+  } catch { /* silent */ }
+}
+
+// ---------- Toasts ----------
+// Lightweight global toast system. Any component can call showToast(msg)
+// and a small notification slides up from above the bottom bar for ~2.5
+// seconds, then auto-dismisses. Used today for visit-claim success but
+// any future "soft confirmation" can use it too.
+//
+// Why a custom event instead of context/props: keeps deeply-nested
+// components (like DetailView's I'm Here button) decoupled from the App
+// root. They just shout into the void; the App's Toast renderer listens.
+type ToastTone = 'default' | 'success' | 'error';
+type ToastDetail = { message: string; tone: ToastTone; durationMs: number };
+const TOAST_EVENT = 'sinister:toast';
+function showToast(message: string, tone: ToastTone = 'default', durationMs = 2500) {
+  if (typeof window === 'undefined') return;
+  try {
+    window.dispatchEvent(new CustomEvent<ToastDetail>(TOAST_EVENT, {
+      detail: { message, tone, durationMs },
+    }));
   } catch { /* silent */ }
 }
 
@@ -682,7 +728,7 @@ const CATEGORIES: { key: CategoryKey; label: string; gridIndex: number; cascadeO
   { key: 'haunting',   label: 'Hauntings',      gridIndex: 2, cascadeOrder: 1, borderColor: WHITE,    image: cellHaunting   },
   { key: 'cult',       label: 'Cults',          gridIndex: 3, cascadeOrder: 4, borderColor: WHITE,    image: cellCult       },
   { key: 'killer',     label: 'Serial Killers', gridIndex: 4, cascadeOrder: 2, borderColor: TILE_RED, image: cellKiller     },
-  { key: 'historical', label: 'Historical',     gridIndex: 5, cascadeOrder: 3, borderColor: TILE_RED, image: cellHistorical },
+  { key: 'historical', label: 'Grave Sites',    gridIndex: 5, cascadeOrder: 3, borderColor: TILE_RED, image: cellHistorical },
 ];
 
 const CATEGORY_COLOR: Record<CategoryKey, string> = {
@@ -770,6 +816,23 @@ function buildStyleCss() {
   10%  { opacity: 1; }
   60%  { transform: translate(calc(var(--sway) * 0.6), -55vh) scale(1); opacity: 0.85; }
   100% { transform: translate(var(--sway), -100vh) scale(0.4); opacity: 0; }
+}
+
+/* Skeleton loader pulse — shifts a lighter band across the placeholder
+   rectangle, conveying "this is loading" without a spinner. */
+@keyframes sinister-skeleton-pulse {
+  0%   { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* Toast slide-in — small upward fade for the visit-success notification
+   and any other showToast() calls. Fast, unobtrusive. */
+@keyframes sinister-toast-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.sinister-toast {
+  animation: sinister-toast-in 200ms ease-out;
 }
 
 /* Tile / button press feedback — applied via .sinister-pressable class.
@@ -1883,6 +1946,7 @@ export default function App() {
       <div ref={_dragWrapperRef} style={{ willChange: 'transform', position: 'relative', zIndex: 2, backgroundColor: '#0A0A0A' }}><div key={viewKey} className="sinister-view-enter">
         {viewElement}
       </div></div>
+      <ToastHost />
       {showAlwaysModal && (
         <AlwaysLocationModal
           onEnable={async () => {
@@ -2029,6 +2093,84 @@ function FireEffect() {
         />
       ))}
     </div>
+  );
+}
+
+// ---------- Toast Host ----------
+// Listens for showToast() events and renders a small dismissible
+// notification above the bottom social bar. Auto-clears on a timer.
+// Supports stacking (most recent on top) but caps the queue at 3 to
+// avoid the screen filling up if something goes wild.
+function ToastHost() {
+  const [toasts, setToasts] = useState<Array<ToastDetail & { id: number }>>([]);
+
+  useEffect(() => {
+    let counter = 0;
+    const onToast = (e: Event) => {
+      const detail = (e as CustomEvent<ToastDetail>).detail;
+      if (!detail) return;
+      const id = ++counter;
+      const entry = { ...detail, id };
+      setToasts((prev) => {
+        const next = [...prev, entry];
+        // Keep only the latest 3. If a 4th arrives, drop the oldest so
+        // the user still sees the freshest update.
+        return next.length > 3 ? next.slice(next.length - 3) : next;
+      });
+      window.setTimeout(() => {
+        setToasts((prev) => prev.filter((t) => t.id !== id));
+      }, detail.durationMs || 2500);
+    };
+    window.addEventListener(TOAST_EVENT, onToast as EventListener);
+    return () => window.removeEventListener(TOAST_EVENT, onToast as EventListener);
+  }, []);
+
+  if (toasts.length === 0) return null;
+  return (
+    <div style={S.toastWrap} className="sinister-toast-host">
+      {toasts.map((t) => {
+        const toneStyle =
+          t.tone === 'success' ? S.toastSuccess :
+          t.tone === 'error' ? S.toastError :
+          S.toastDefault;
+        return (
+          <div
+            key={t.id}
+            style={{ ...S.toast, ...toneStyle }}
+            className="sinister-toast"
+          >
+            {t.message}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ---------- Skeleton Loaders ----------
+// Animated placeholder rectangles shown while content is loading. Looks
+// significantly more polished than a "Loading…" text label and increases
+// perceived speed because users see the shape of the eventual content
+// before it arrives.
+//
+// SkeletonRow renders a single horizontal pulsing block — used for list
+// views (Dread Leaders, List View, Badges page).
+// SkeletonCard is a slightly bigger variant used for card-shaped content.
+function SkeletonRow({ height = 48, delay = 0 }: { height?: number; delay?: number }) {
+  return (
+    <div
+      style={{
+        height,
+        width: '100%',
+        background: 'linear-gradient(90deg, #1a1a1a 0%, #252525 50%, #1a1a1a 100%)',
+        backgroundSize: '200% 100%',
+        borderRadius: 10,
+        marginBottom: 8,
+        animation: `sinister-skeleton-pulse 1.4s ease-in-out infinite`,
+        animationDelay: `${delay}ms`,
+      }}
+      aria-hidden="true"
+    />
   );
 }
 
@@ -2215,7 +2357,13 @@ function LeadersView({ currentHandle, onSelectHandle, onBack }: {
           <p style={{ ...S.aboutPara, color: '#d97a7a' }}>{loadError}</p>
         )}
         {!loadError && rows === null && (
-          <p style={S.aboutPara}>Loading…</p>
+          <div style={S.leaderList}>
+            <SkeletonRow height={48} delay={0} />
+            <SkeletonRow height={48} delay={120} />
+            <SkeletonRow height={48} delay={240} />
+            <SkeletonRow height={48} delay={360} />
+            <SkeletonRow height={48} delay={480} />
+          </div>
         )}
         {!loadError && rows !== null && rows.length === 0 && (
           <p style={S.aboutPara}>
@@ -2323,7 +2471,15 @@ function BadgesView({ handle, isMe, onBack }: {
           </div>
         )}
         {err && <p style={{ ...S.aboutPara, color: '#d97a7a' }}>{err}</p>}
-        {!err && badges === null && <p style={S.aboutPara}>Loading…</p>}
+        {!err && badges === null && (
+          <div style={{ marginTop: 12 }}>
+            <SkeletonRow height={28} delay={0} />
+            <div style={{ marginTop: 18 }}>
+              <SkeletonRow height={92} delay={120} />
+              <SkeletonRow height={92} delay={240} />
+            </div>
+          </div>
+        )}
         {!err && badges !== null && badges.length === 0 && (
           <p style={S.aboutPara}>
             {isMe
@@ -2551,7 +2707,12 @@ function ListView({ sites, currentLocation, onSelectSite, onBack }: {
 
       <div style={S.leaderBody}>
         {sites.length === 0 ? (
-          <p style={S.aboutPara}>Loading sites…</p>
+          <div style={S.listSitesWrap}>
+            <SkeletonRow height={56} delay={0} />
+            <SkeletonRow height={56} delay={120} />
+            <SkeletonRow height={56} delay={240} />
+            <SkeletonRow height={56} delay={360} />
+          </div>
         ) : level.kind === 'categories' ? (
           // ---- Level 1: Categories ----
           categoryRows.length === 0 ? (
@@ -3358,6 +3519,22 @@ const MAPKIT_JS_TOKEN = 'eyJraWQiOiJQNTgzOEJGMlNHIiwidHlwIjoiSldUIiwiYWxnIjoiRVM
 const NEARBY_RADIUS_MILES = 20;
 const METERS_PER_MILE = 1609.34;
 
+// Per-category map pin glyphs. MapKit MarkerAnnotation renders the glyph
+// inside the colored teardrop, so this gives each category an instantly-
+// recognizable sinister icon while preserving the color coding.
+//
+// Single-character emoji is what MapKit JS reliably renders; multi-codepoint
+// sequences (skin tone, ZWJ joins) sometimes get clipped or default-styled.
+// Keeping these to plain single emoji avoids that.
+const CATEGORY_PIN_GLYPH: Record<CategoryKey, string> = {
+  haunting:   '👻',
+  killer:     '💀',
+  crime:      '🔪',
+  cult:       '🕯',
+  film:       '🎬',
+  historical: '🪦',
+};
+
 // Lazily load MapKit JS once across the whole app. Returns a promise that
 // resolves to the global `mapkit` object, or rejects if loading fails.
 let _mapkitLoadPromise: Promise<any> | null = null;
@@ -3551,14 +3728,24 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack }: {
     for (const entry of nearbySites) {
       const { site, distMi } = entry;
       const color = CATEGORY_COLOR[site.category as CategoryKey] || '#888888';
+      const glyph = CATEGORY_PIN_GLYPH[site.category as CategoryKey] || '✦';
       const ann = new mk.MarkerAnnotation(
         new mk.Coordinate(site.coords.lat, site.coords.lng),
         {
           color,
-          glyphColor: '#000000',
+          // glyphText shows our category emoji inside the teardrop. The
+          // emoji brings its own colors, so glyphColor is ignored once
+          // glyphText is set — we keep the teardrop colored via `color`
+          // so the category color still reads from far away.
+          glyphText: glyph,
           title: site.title,
           subtitle: `${distMi.toFixed(1)} mi`,
           selected: false,
+          // animates: false stops MapKit's default bounce/pulse on the
+          // pin. The bounce was barely noticeable with no glyph, but with
+          // emoji glyphs it reads as flickering/blinking — turning it off
+          // keeps the pins still and readable.
+          animates: false,
           // We render our own slide-up card instead of MapKit's bubble.
           calloutEnabled: false,
         },
@@ -4083,6 +4270,14 @@ function DetailView({ site, currentLocation, handle, deviceId, alreadyVisited, o
     if (result.ok) {
       setVisited(true);
       onVisited(site.id);
+      // Soft confirmation toast — reinforces the badge system by hinting
+      // at progression. Idempotent claims (already visited) get a gentler
+      // message that doesn't pretend they earned anything new.
+      if (result.alreadyClaimed) {
+        showToast(`Already visited ${site.title}`, 'default');
+      } else {
+        showToast(`✓ Visited ${site.title} — +1 toward your next badge`, 'success');
+      }
       return;
     }
     // Failure path. Pull fields off as the failure variant — narrowing this way
@@ -5245,6 +5440,54 @@ const S: Record<string, React.CSSProperties> = {
     display: 'inline-block',
     animation: 'sinister-cell-title-pulse 3.5s ease-in-out infinite',
     transformOrigin: 'center center',
+  },
+
+  // ---- Toast styles ----
+  // Stack of small notifications above the bottom social bar. Each toast
+  // is its own pill with a soft glow tinted by tone. Centered horizontally
+  // with a max-width so they never feel crammed on small screens or stretch
+  // weirdly on iPad.
+  toastWrap: {
+    position: 'fixed',
+    left: 0,
+    right: 0,
+    bottom: 80, // just above the bottom social bar (which sits at 14px)
+    zIndex: 50,
+    display: 'flex',
+    flexDirection: 'column' as const,
+    alignItems: 'center',
+    gap: 8,
+    padding: '0 16px',
+    pointerEvents: 'none' as const,
+  },
+  toast: {
+    maxWidth: 380,
+    padding: '12px 16px',
+    borderRadius: 12,
+    fontSize: 13,
+    fontWeight: 600,
+    letterSpacing: '0.02em',
+    textAlign: 'center' as const,
+    boxShadow: '0 4px 24px rgba(0,0,0,0.5)',
+    backdropFilter: 'blur(8px)',
+    pointerEvents: 'auto' as const,
+    color: BONE,
+  },
+  toastDefault: {
+    backgroundColor: 'rgba(20,20,20,0.92)',
+    border: `1px solid ${WHITE}33`,
+  },
+  toastSuccess: {
+    backgroundColor: 'rgba(15, 32, 16, 0.95)',
+    border: '1px solid #2a3f2a',
+    color: '#a3e6a3',
+    boxShadow: '0 4px 24px rgba(0,0,0,0.5), 0 0 16px rgba(106,208,106,0.3)',
+  },
+  toastError: {
+    backgroundColor: 'rgba(31, 16, 16, 0.95)',
+    border: '1px solid #3a2020',
+    color: '#e6a3a3',
+    boxShadow: '0 4px 24px rgba(0,0,0,0.5), 0 0 16px rgba(217,122,122,0.3)',
   },
 
   socialBar: {
