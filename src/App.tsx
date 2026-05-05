@@ -3614,23 +3614,26 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack }: {
   // ---- Render ----
   return (
     <div style={S.appBg}>
-      {/* Floating back button — replaces the swipe-back gesture which is
-          disabled on this view (the map has its own pan gestures that would
-          fight a swipe handler). Sits at the top-left, above the map. */}
-      <button
-        style={S.mapBackBtn}
-        onClick={() => { playBackSound(); onBack(); }}
-        aria-label="Back to home"
-      >
-        ← Back
-      </button>
-
       <header style={S.header}>
-        <div style={{ ...S.categoryViewTitle, color: WHITE, textShadow: `0 0 14px ${WHITE}cc` }}>
-          Locations Near Me
-        </div>
-        <div style={S.listSubtitle}>
-          {nearbySites.length} {nearbySites.length === 1 ? 'site' : 'sites'} within {NEARBY_RADIUS_MILES} mi
+        {/* Inline back button — sits next to the title, anchored within the
+            header so it can't get clipped by the iOS status bar / Dynamic
+            Island. Circular with a left chevron. */}
+        <div style={S.mapHeaderRow}>
+          <button
+            style={S.mapBackBtn}
+            onClick={() => { playBackSound(); onBack(); }}
+            aria-label="Back to home"
+          >
+            ‹
+          </button>
+          <div style={S.mapHeaderTitle}>
+            <div style={{ ...S.categoryViewTitle, color: WHITE, textShadow: `0 0 14px ${WHITE}cc` }}>
+              Locations Near Me
+            </div>
+            <div style={S.listSubtitle}>
+              {nearbySites.length} {nearbySites.length === 1 ? 'site' : 'sites'} within {NEARBY_RADIUS_MILES} mi
+            </div>
+          </div>
         </div>
       </header>
 
@@ -5330,27 +5333,48 @@ const S: Record<string, React.CSSProperties> = {
   },
 
   // ---- Map View styles ----
-  // Floating Back button — top-left of the map. zIndex above the map (which
-  // is zIndex 1) and the header (which is positioned by appBg). The button
-  // is small and unobtrusive but glows enough to be findable on a busy map.
+  // Header row that places the back button inline with the title block.
+  // Both items live inside the existing header so they sit safely below
+  // the iOS status bar / Dynamic Island.
+  mapHeaderRow: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 12,
+    padding: '0 14px',
+    width: '100%',
+    boxSizing: 'border-box' as const,
+  },
+  mapHeaderTitle: {
+    flex: 1,
+    minWidth: 0,
+    textAlign: 'center' as const,
+    // 36px right padding mirrors the back button width on the left so the
+    // title stays visually centered within the header row.
+    paddingRight: 36,
+  },
+  // Circular back button — small, glowing left chevron. Lives inline with
+  // the title rather than floating, so it can never collide with the
+  // status bar / Dynamic Island.
   mapBackBtn: {
-    position: 'fixed',
-    top: 14,
-    left: 14,
-    zIndex: 12,
-    backgroundColor: 'rgba(0,0,0,0.7)',
+    flexShrink: 0,
+    width: 36,
+    height: 36,
+    backgroundColor: 'rgba(0,0,0,0.6)',
     border: `1.5px solid ${WHITE}`,
     color: WHITE,
     fontFamily: 'inherit',
-    fontSize: 12,
+    fontSize: 22,
     fontWeight: 700,
-    letterSpacing: '0.08em',
-    textTransform: 'uppercase' as const,
-    padding: '8px 14px',
-    borderRadius: 12,
+    lineHeight: 1,
+    padding: 0,
+    paddingBottom: 3,
+    borderRadius: '50%',
     cursor: 'pointer',
-    boxShadow: `0 0 12px ${WHITE}55`,
+    boxShadow: `0 0 10px ${WHITE}55`,
     backdropFilter: 'blur(4px)',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
 
   // Slide-up site preview card. Sits at the bottom of the map, overlaying
