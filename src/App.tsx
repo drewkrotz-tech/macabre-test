@@ -1316,6 +1316,10 @@ export default function App() {
   useEffect(() => {
     if (typeof window === 'undefined') return;
     if (view.name === 'home') return;
+    // Disable swipe-back on the map view — the map's own pan/zoom gestures
+    // would constantly fight the swipe handler. The map page provides an
+    // explicit Back button instead.
+    if (view.name === 'nearby') return;
 
     let startX = 0, startY = 0, startT = 0;
     let tracking = false;
@@ -3408,6 +3412,10 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack }: {
   const siteAnnotationsRef = useRef<any[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [livePos, setLivePos] = useState<{ lat: number; lng: number } | null>(currentLocation);
+  // Currently-tapped pin's site + distance. When non-null, a slide-up
+  // preview card renders over the bottom of the map. Tapping the map
+  // background, the card's × button, or another pin updates this.
+  const [selectedSite, setSelectedSite] = useState<{ site: SinisterSite; distMi: number } | null>(null);
 
   // Compute nearby sites once we have a location. We sort + cap at 50 so
   // huge metros don't paint hundreds of pins.
@@ -3521,6 +3529,9 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack }: {
   }, [livePos]);
 
   // Render site pins whenever the nearby set changes.
+  // Tapping a pin sets selectedSite (state below), which renders the
+  // slide-up card. We disable MapKit's built-in callout entirely by
+  // setting calloutEnabled: false, since the card replaces it.
   useEffect(() => {
     const map = mapRef.current;
     const mk = (window as any).mapkit;
@@ -3533,8 +3544,12 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack }: {
     }
     if (!nearbySites.length) return;
 
+    // Annotation -> site lookup so the click handler can resolve which
+    // site was tapped without fragile coordinate matching.
+    const annToSite = new WeakMap<any, { site: SinisterSite; distMi: number }>();
     const created: any[] = [];
-    for (const { site, distMi } of nearbySites) {
+    for (const entry of nearbySites) {
+      const { site, distMi } = entry;
       const color = CATEGORY_COLOR[site.category as CategoryKey] || '#888888';
       const ann = new mk.MarkerAnnotation(
         new mk.Coordinate(site.coords.lat, site.coords.lng),
@@ -3544,59 +3559,72 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack }: {
           title: site.title,
           subtitle: `${distMi.toFixed(1)} mi`,
           selected: false,
+          // We render our own slide-up card instead of MapKit's bubble.
+          calloutEnabled: false,
         },
       );
-      // Tap pin → fly to it. Tap callout → open DetailView. MapKit JS
-      // exposes selection events on annotations; we listen for 'select'.
-      ann.addEventListener('select', () => {
-        // Just selecting reveals the title/subtitle bubble.
-      });
-      // The callout itself isn't directly tappable in MapKit JS, but we
-      // can use the calloutAccessoryRight option to inject a button that
-      // routes to DetailView. For now, double-select navigates.
-      ann.addEventListener('deselect', () => { /* noop */ });
-      // Workaround: we add a click on the pin's element after MapKit attaches
-      // it. This is the most reliable way today.
+      annToSite.set(ann, entry);
       created.push(ann);
     }
     map.addAnnotations(created);
     siteAnnotationsRef.current = created;
 
-    // Wire up annotation clicks via the map's 'select-annotation' event
-    // (newer MapKit JS) or fallback to listening for selection changes.
-    const handler = (e: any) => {
+    // Pin tap: open / swap the card. Tapping the same pin a second time
+    // keeps the card open (no toggle on pin tap — we toggle only on
+    // close-X or map-background tap, which is more predictable).
+    const onSelect = (e: any) => {
       const ann = e?.annotation;
       if (!ann) return;
-      const matched = nearbySites.find(
-        (x) =>
-          Math.abs(x.site.coords.lat - ann.coordinate.latitude) < 1e-6 &&
-          Math.abs(x.site.coords.lng - ann.coordinate.longitude) < 1e-6,
-      );
-      if (matched && matched.site !== userAnnotationRef.current) {
-        // Single tap shows callout; if the user taps again or taps the
-        // callout, route to DetailView. We do that via a short delay
-        // double-tap detection.
-        const now = Date.now();
-        const last = (ann as any)._lastTap || 0;
-        (ann as any)._lastTap = now;
-        if (now - last < 800) {
-          playForward();
-          onSelectSite(matched.site);
-        }
-      }
+      const matched = annToSite.get(ann);
+      if (!matched) return;
+      setSelectedSite(matched);
     };
-    try {
-      map.addEventListener('select', handler);
-    } catch { /* silent */ }
+    // Map-background tap: close the card. MapKit fires this whenever the
+    // user taps anywhere that isn't a pin or annotation.
+    const onMapTap = () => {
+      setSelectedSite(null);
+    };
+    try { map.addEventListener('select', onSelect); } catch { /* silent */ }
+    try { map.addEventListener('single-tap', onMapTap); } catch { /* silent */ }
 
     return () => {
-      try { map.removeEventListener('select', handler); } catch { /* silent */ }
+      try { map.removeEventListener('select', onSelect); } catch { /* silent */ }
+      try { map.removeEventListener('single-tap', onMapTap); } catch { /* silent */ }
     };
-  }, [nearbySites, onSelectSite]);
+  }, [nearbySites]);
+
+  // Directions helper — same geo: scheme + Google Maps web fallback that
+  // DetailView's Get Directions button uses. Lets the slide-up card route
+  // straight to maps without a stop in DetailView.
+  const openDirections = (site: SinisterSite) => {
+    playBell();
+    const lat = site.coords.lat;
+    const lng = site.coords.lng;
+    const label = encodeURIComponent(site.title);
+    const geoUrl = `geo:${lat},${lng}?q=${lat},${lng}(${label})`;
+    const webUrl = `https://www.google.com/maps/dir/?api=1&destination=${lat},${lng}`;
+    try { window.location.href = geoUrl; } catch { /* fall through */ }
+    setTimeout(() => {
+      if (document.hasFocus && document.hasFocus()) {
+        window.open(webUrl, '_blank', 'noopener,noreferrer');
+      }
+    }, 600);
+  };
 
   // ---- Render ----
   return (
     <div style={S.appBg}>
+      {/* Floating back button — replaces the swipe-back gesture which is
+          disabled on this view (the map has its own pan gestures that would
+          fight a swipe handler). Sits at the top-left, above the map. */}
+      <button
+        style={S.mapBackBtn}
+        onClick={() => { playBackSound(); onBack(); }}
+        aria-label="Back to home"
+      >
+        ← Back
+      </button>
+
       <header style={S.header}>
         <div style={{ ...S.categoryViewTitle, color: WHITE, textShadow: `0 0 14px ${WHITE}cc` }}>
           Locations Near Me
@@ -3639,6 +3667,77 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack }: {
               No sites within {NEARBY_RADIUS_MILES} miles. Submit one to be the first.
             </div>
           )}
+
+          {/* Slide-up site card. Renders when a pin is tapped. Sits at the
+              bottom of the map, overlaying the lower portion. The card
+              itself stops click-through so taps inside don't dismiss it. */}
+          {selectedSite && (() => {
+            const { site, distMi } = selectedSite;
+            const cat = CATEGORIES.find(c => c.key === site.category);
+            const catLabel = cat?.label || site.category;
+            const color = CATEGORY_COLOR[site.category as CategoryKey] || '#888';
+            return (
+              <div
+                style={S.mapCard}
+                onClick={(e) => e.stopPropagation()}
+                className="sinister-map-card"
+              >
+                {/* Close X — explicit dismiss control. */}
+                <button
+                  style={S.mapCardClose}
+                  onClick={() => { playBackSound(); setSelectedSite(null); }}
+                  aria-label="Close"
+                >
+                  ×
+                </button>
+
+                <div style={S.mapCardTop}>
+                  {/* Thumbnail. Falls back to a colored block if the image
+                      fails or is missing — better than a broken image icon. */}
+                  {site.imageUrl ? (
+                    <div
+                      style={{
+                        ...S.mapCardThumb,
+                        backgroundImage: `url(${site.imageUrl})`,
+                        borderColor: `${color}88`,
+                      }}
+                    />
+                  ) : (
+                    <div style={{ ...S.mapCardThumb, backgroundColor: color, opacity: 0.4 }} />
+                  )}
+
+                  <div style={S.mapCardText}>
+                    <div style={S.mapCardTitle}>{site.title}</div>
+                    <div style={S.mapCardMeta}>
+                      <span style={{ color, textShadow: `0 0 6px ${color}88` }}>{catLabel}</span>
+                      <span style={S.mapCardMetaSep}>·</span>
+                      <span>{site.state}</span>
+                      <span style={S.mapCardMetaSep}>·</span>
+                      <span>{distMi.toFixed(1)} mi</span>
+                    </div>
+                    <div style={S.mapCardDesc}>
+                      {site.shortDescription || ''}
+                    </div>
+                  </div>
+                </div>
+
+                <div style={S.mapCardActions}>
+                  <button
+                    style={{ ...S.mapCardBtn, ...S.mapCardBtnSecondary }}
+                    onClick={() => { setSelectedSite(null); playForward(); onSelectSite(site); }}
+                  >
+                    View Details
+                  </button>
+                  <button
+                    style={{ ...S.mapCardBtn, ...S.mapCardBtnPrimary }}
+                    onClick={() => openDirections(site)}
+                  >
+                    Get Directions
+                  </button>
+                </div>
+              </div>
+            );
+          })()}
         </>
       )}
     </div>
@@ -5228,6 +5327,142 @@ const S: Record<string, React.CSSProperties> = {
   moreMenuDivider: {
     height: 0,
     borderTop: '0.5px solid rgba(255,255,255,0.1)',
+  },
+
+  // ---- Map View styles ----
+  // Floating Back button — top-left of the map. zIndex above the map (which
+  // is zIndex 1) and the header (which is positioned by appBg). The button
+  // is small and unobtrusive but glows enough to be findable on a busy map.
+  mapBackBtn: {
+    position: 'fixed',
+    top: 14,
+    left: 14,
+    zIndex: 12,
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    border: `1.5px solid ${WHITE}`,
+    color: WHITE,
+    fontFamily: 'inherit',
+    fontSize: 12,
+    fontWeight: 700,
+    letterSpacing: '0.08em',
+    textTransform: 'uppercase' as const,
+    padding: '8px 14px',
+    borderRadius: 12,
+    cursor: 'pointer',
+    boxShadow: `0 0 12px ${WHITE}55`,
+    backdropFilter: 'blur(4px)',
+  },
+
+  // Slide-up site preview card. Sits at the bottom of the map, overlaying
+  // the lower ~30% of the viewport. Tap on the card stops propagation so
+  // the map's "tap background to dismiss" handler doesn't fire.
+  mapCard: {
+    position: 'fixed',
+    left: 12,
+    right: 12,
+    bottom: 12,
+    zIndex: 11,
+    backgroundColor: 'rgba(13,13,13,0.97)',
+    border: `1px solid ${SUBMIT_RED}77`,
+    borderRadius: 16,
+    padding: '14px 14px 12px',
+    boxShadow: `0 0 30px rgba(0,0,0,0.85), 0 0 22px ${SUBMIT_RED}33`,
+    backdropFilter: 'blur(8px)',
+    color: BONE,
+  },
+  mapCardClose: {
+    position: 'absolute',
+    top: 6,
+    right: 8,
+    width: 28,
+    height: 28,
+    background: 'transparent',
+    border: 'none',
+    color: '#aaa',
+    fontSize: 22,
+    lineHeight: 1,
+    cursor: 'pointer',
+    fontFamily: 'inherit',
+  },
+  mapCardTop: {
+    display: 'flex',
+    gap: 12,
+    alignItems: 'flex-start',
+    paddingRight: 24,
+    marginBottom: 12,
+  },
+  mapCardThumb: {
+    width: 72,
+    height: 72,
+    borderRadius: 8,
+    backgroundSize: 'cover',
+    backgroundPosition: 'center',
+    backgroundRepeat: 'no-repeat',
+    border: '1px solid #2a2a2a',
+    flexShrink: 0,
+  },
+  mapCardText: {
+    flex: 1,
+    minWidth: 0,
+  },
+  mapCardTitle: {
+    fontSize: 15,
+    fontWeight: 800,
+    letterSpacing: '0.02em',
+    color: WHITE,
+    marginBottom: 4,
+    lineHeight: 1.25,
+  },
+  mapCardMeta: {
+    fontSize: 11,
+    color: '#aaa',
+    fontWeight: 600,
+    letterSpacing: '0.06em',
+    textTransform: 'uppercase' as const,
+    marginBottom: 8,
+    display: 'flex',
+    flexWrap: 'wrap' as const,
+    gap: 4,
+    alignItems: 'baseline',
+  },
+  mapCardMetaSep: { opacity: 0.5 },
+  mapCardDesc: {
+    fontSize: 12,
+    color: '#bbb',
+    lineHeight: 1.4,
+    // Truncate to 2 lines so the card stays compact regardless of how
+    // long the site's shortDescription is.
+    display: '-webkit-box' as const,
+    WebkitLineClamp: 2,
+    WebkitBoxOrient: 'vertical' as const,
+    overflow: 'hidden' as const,
+  },
+  mapCardActions: {
+    display: 'flex',
+    gap: 8,
+  },
+  mapCardBtn: {
+    flex: 1,
+    padding: '10px 12px',
+    fontFamily: 'inherit',
+    fontSize: 12,
+    fontWeight: 800,
+    letterSpacing: '0.08em',
+    textTransform: 'uppercase' as const,
+    borderRadius: 10,
+    cursor: 'pointer',
+  },
+  mapCardBtnSecondary: {
+    backgroundColor: 'transparent',
+    border: `1px solid ${WHITE}66`,
+    color: WHITE,
+  },
+  mapCardBtnPrimary: {
+    backgroundColor: '#5a0000',
+    border: `1px solid ${SUBMIT_RED}`,
+    color: WHITE,
+    boxShadow: `0 0 12px ${SUBMIT_RED}77`,
+    textShadow: `0 0 6px ${SUBMIT_RED}`,
   },
 
   aboutBody: {
