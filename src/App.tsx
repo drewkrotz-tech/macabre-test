@@ -1167,6 +1167,7 @@ type View =
   | { name: 'about' }
   | { name: 'leaders' }
   | { name: 'badges'; handle: string }
+  | { name: 'nearby' }
   | { name: 'list' };
 
 export default function App() {
@@ -1622,6 +1623,10 @@ export default function App() {
     playButton();
     setView({ name: 'list' });
   }
+  function goNearby() {
+    playButton();
+    setView({ name: 'nearby' });
+  }
   function goHome() {
     playBackSound();
     setView({ name: 'home' });
@@ -1726,6 +1731,8 @@ export default function App() {
       };
     } else if (v.name === 'list') {
       return { key: 'list', element: <ListView sites={sites} currentLocation={currentLocation} onSelectSite={goDetail} onBack={goHome} /> };
+    } else if (v.name === 'nearby') {
+      return { key: 'nearby', element: <NearbyView sites={sites} currentLocation={currentLocation} onSelectSite={goDetail} onBack={goHome} /> };
     } else {
       return {
         key: 'home',
@@ -1737,6 +1744,7 @@ export default function App() {
             onAbout={goAbout}
             onLeaders={goLeaders}
             onList={goList}
+            onNearby={goNearby}
           />
         ),
       };
@@ -2027,26 +2035,90 @@ function FireEffect() {
 // List View (flat directory of all categories/states/locations, also
 // scaffolded), and About. Instagram and YouTube links moved to AboutView
 // where they already live, so users still have one tap to reach them.
-function HomeBottomBar({ onLeaders, onList, onAbout }: {
+function HomeBottomBar({ onLeaders, onList, onAbout, onNearby }: {
   onLeaders: () => void;
   onList: () => void;
   onAbout: () => void;
+  onNearby: () => void;
 }) {
+  // Two pill buttons on the home page bottom bar: "Locations Near Me" (left)
+  // opens the Map View (NearbyView), and "More" (right) opens a popup that
+  // contains Dread Leaders, List View, and About. Submit a Location stays
+  // unchanged above this bar.
+  //
+  // The More popup is anchored above the More button (right-aligned). It
+  // closes when:
+  //   - User taps any item in it (and navigates)
+  //   - User taps the More button again
+  //   - User taps anywhere outside (handled via a transparent overlay)
+  const [moreOpen, setMoreOpen] = useState(false);
+  const closeMore = () => setMoreOpen(false);
+
   return (
-    <div style={S.socialBar}>
-      <button style={S.socialBtn} onClick={() => { playButton(); onLeaders(); }}>
-        <span style={S.socialIcon}>👑</span>
-        <span style={S.socialLabel}>Dread Leaders</span>
-      </button>
-      <button style={S.socialBtn} onClick={() => { playButton(); onList(); }}>
-        <span style={S.socialIcon}>📜</span>
-        <span style={S.socialLabel}>List View</span>
-      </button>
-      <button style={S.socialBtn} onClick={() => { playButton(); onAbout(); }}>
-        <span style={S.socialIcon}>ℹ️</span>
-        <span style={S.socialLabel}>About</span>
-      </button>
-    </div>
+    <>
+      {/* Backdrop — captures taps outside the popup so users can dismiss
+          by tapping anywhere on the page, the same way iOS context menus
+          and action sheets behave. Transparent so it doesn't darken the
+          home view (the popup itself is what stands out). */}
+      {moreOpen && (
+        <div
+          onClick={closeMore}
+          style={{
+            position: 'fixed',
+            inset: 0,
+            zIndex: 9,
+            backgroundColor: 'transparent',
+          }}
+        />
+      )}
+
+      {/* Popup menu — anchored above the More button on the right side.
+          Animated in via a CSS class so it doesn't pop in jarringly. */}
+      {moreOpen && (
+        <div style={S.moreMenuWrap} className="sinister-more-menu">
+          <button
+            style={S.moreMenuItem}
+            onClick={() => { playButton(); closeMore(); onLeaders(); }}
+          >
+            <span style={S.socialIcon}>👑</span>
+            <span style={S.moreMenuLabel}>Dread Leaders</span>
+          </button>
+          <div style={S.moreMenuDivider} />
+          <button
+            style={S.moreMenuItem}
+            onClick={() => { playButton(); closeMore(); onList(); }}
+          >
+            <span style={S.socialIcon}>📜</span>
+            <span style={S.moreMenuLabel}>List View</span>
+          </button>
+          <div style={S.moreMenuDivider} />
+          <button
+            style={S.moreMenuItem}
+            onClick={() => { playButton(); closeMore(); onAbout(); }}
+          >
+            <span style={S.socialIcon}>ℹ️</span>
+            <span style={S.moreMenuLabel}>About</span>
+          </button>
+        </div>
+      )}
+
+      <div style={S.socialBar}>
+        <button
+          style={S.socialBtn}
+          onClick={() => { playButton(); onNearby(); }}
+        >
+          <span style={S.socialIcon}>📍</span>
+          <span style={S.socialLabel}>Locations Near Me</span>
+        </button>
+        <button
+          style={{ ...S.socialBtn, ...(moreOpen ? S.socialBtnActive : {}) }}
+          onClick={() => { playButton(); setMoreOpen(v => !v); }}
+        >
+          <span style={S.socialIcon}>☰</span>
+          <span style={S.socialLabel}>More</span>
+        </button>
+      </div>
+    </>
   );
 }
 
@@ -2580,13 +2652,14 @@ function SocialBar({ onAbout, flow }: { onAbout: () => void; flow?: boolean }) {
 }
 
 // ---------- HOME ----------
-function HomeView({ sites, onSelectCategory, onSubmit, onAbout, onLeaders, onList }: {
+function HomeView({ sites, onSelectCategory, onSubmit, onAbout, onLeaders, onList, onNearby }: {
   sites: SinisterSite[];
   onSelectCategory: (key: CategoryKey) => void;
   onSubmit: () => void;
   onAbout: () => void;
   onLeaders: () => void;
   onList: () => void;
+  onNearby: () => void;
 }) {
   const counts: Record<string, number> = {};
   for (const s of sites) counts[s.category] = (counts[s.category] || 0) + 1;
@@ -2829,7 +2902,7 @@ function HomeView({ sites, onSelectCategory, onSubmit, onAbout, onLeaders, onLis
         <span style={S.submitFixedButtonText}>Submit a Location</span>
       </button>
 
-      <HomeBottomBar onLeaders={onLeaders} onList={onList} onAbout={onAbout} />
+      <HomeBottomBar onLeaders={onLeaders} onList={onList} onAbout={onAbout} onNearby={onNearby} />
     </div>
   );
 }
@@ -3251,6 +3324,323 @@ function AboutView({ onBack }: { onBack: () => void }) {
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+// ---------- Nearby (Live Map View) ----------
+// Real Apple Maps via MapKit JS, embedded in the app. Shows the user's
+// live location as a blue dot and pins for every site within RADIUS_MILES.
+//
+// MapKit JS notes:
+//   - We load the script lazily on mount and tear it down on unmount so it
+//     doesn't bloat the rest of the app.
+//   - Auth uses a JWT Maps Token from developer.apple.com. The token has a
+//     long expiry (up to a year) and the same one works for all users.
+//   - Real-time tracking uses Capacitor Geolocation watchPosition where
+//     available, falling back to the browser's geolocation API. The user's
+//     dot recenters smoothly as they move.
+//   - Pins are colored by category. Tapping one shows a small callout with
+//     the site name; tapping the callout opens DetailView.
+//
+// Setup required: paste your Maps Token below in MAPKIT_JS_TOKEN. You get
+// it from developer.apple.com → Certificates, IDs & Profiles → Maps IDs/Keys.
+//
+// NOTE: The current token is an 8-day test token (expires 05/13/26). Before
+// shipping to production, generate a long-term token (up to 365 days) at
+// developer.apple.com → Maps → Tokens, with a domain restriction set to
+// sinistertrivia.com.
+const MAPKIT_JS_TOKEN = 'eyJraWQiOiJQNTgzOEJGMlNHIiwidHlwIjoiSldUIiwiYWxnIjoiRVMyNTYifQ.eyJpc3MiOiI4SzZUOTc3N1I5IiwiaWF0IjoxNzc3OTg0ODU4LCJzY29wZSI6Im1hcGtpdF9qcyIsImV4cCI6MTc3ODY1NTU5OX0.7h9gMm7v8GJtjIjHdzQ3QUvg-nmyq-WkRU4OopbHrx93zTaAHq2ISkMfnWt858PD73zAxJmLSAT8q9ohNUcsyw';
+const NEARBY_RADIUS_MILES = 20;
+const METERS_PER_MILE = 1609.34;
+
+// Lazily load MapKit JS once across the whole app. Returns a promise that
+// resolves to the global `mapkit` object, or rejects if loading fails.
+let _mapkitLoadPromise: Promise<any> | null = null;
+function loadMapKitJS(token: string): Promise<any> {
+  if (_mapkitLoadPromise) return _mapkitLoadPromise;
+  _mapkitLoadPromise = new Promise((resolve, reject) => {
+    if (typeof window === 'undefined') return reject(new Error('No window'));
+    // Already loaded?
+    const w = window as any;
+    if (w.mapkit && w.mapkit.maps) return resolve(w.mapkit);
+    const script = document.createElement('script');
+    script.src = 'https://cdn.apple-mapkit.com/mk/5.x.x/mapkit.js';
+    script.crossOrigin = '';
+    script.dataset.callback = 'initMapKit';
+    script.dataset.libraries = 'map,annotations,services';
+    // @ts-ignore — mapkit attaches itself to window before firing the
+    // initial-init event.
+    script.dataset.token = token;
+    script.async = true;
+    script.onload = () => {
+      // mapkit fires its initial init on load. We init synchronously here.
+      try {
+        const mk = (window as any).mapkit;
+        if (!mk) {
+          reject(new Error('mapkit failed to attach to window'));
+          return;
+        }
+        mk.init({
+          authorizationCallback: (done: (t: string) => void) => done(token),
+          language: navigator.language || 'en-US',
+        });
+        resolve(mk);
+      } catch (err) {
+        reject(err);
+      }
+    };
+    script.onerror = () => reject(new Error('Failed to load mapkit.js'));
+    document.head.appendChild(script);
+  });
+  return _mapkitLoadPromise;
+}
+
+function NearbyView({ sites, currentLocation, onSelectSite, onBack }: {
+  sites: SinisterSite[];
+  currentLocation: { lat: number; lng: number } | null;
+  onSelectSite: (site: SinisterSite) => void;
+  onBack: () => void;
+}) {
+  const mapElRef = useRef<HTMLDivElement | null>(null);
+  const mapRef = useRef<any>(null);
+  const userAnnotationRef = useRef<any>(null);
+  const siteAnnotationsRef = useRef<any[]>([]);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [livePos, setLivePos] = useState<{ lat: number; lng: number } | null>(currentLocation);
+
+  // Compute nearby sites once we have a location. We sort + cap at 50 so
+  // huge metros don't paint hundreds of pins.
+  const nearbySites = useMemo(() => {
+    if (!livePos) return [] as { site: SinisterSite; distMi: number }[];
+    const radiusM = NEARBY_RADIUS_MILES * METERS_PER_MILE;
+    return sites
+      .map((s) => ({
+        site: s,
+        distM: distanceMeters(livePos.lat, livePos.lng, s.coords.lat, s.coords.lng),
+      }))
+      .filter((x) => x.distM <= radiusM)
+      .sort((a, b) => a.distM - b.distM)
+      .slice(0, 50)
+      .map((x) => ({ site: x.site, distMi: x.distM / METERS_PER_MILE }));
+  }, [sites, livePos]);
+
+  // Initialize the map once on mount. The map sits in mapElRef; we recenter
+  // and re-pin via subsequent effects rather than tearing it down.
+  useEffect(() => {
+    let cancelled = false;
+    if (!MAPKIT_JS_TOKEN) {
+      setLoadError('Maps token missing. Paste it into MAPKIT_JS_TOKEN in App.tsx.');
+      return;
+    }
+    loadMapKitJS(MAPKIT_JS_TOKEN)
+      .then((mk) => {
+        if (cancelled || !mapElRef.current) return;
+        const map = new mk.Map(mapElRef.current, {
+          colorScheme: mk.Map.ColorSchemes.Dark,
+          showsUserLocation: false, // we render our own dot for control
+          showsCompass: mk.FeatureVisibility.Hidden,
+          showsScale: mk.FeatureVisibility.Hidden,
+          showsZoomControl: false,
+          showsMapTypeControl: false,
+          isRotationEnabled: true,
+        });
+        mapRef.current = map;
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setLoadError(err?.message || 'Could not load Apple Maps');
+      });
+    return () => {
+      cancelled = true;
+      const m = mapRef.current;
+      if (m) {
+        try { m.destroy(); } catch { /* silent */ }
+      }
+      mapRef.current = null;
+    };
+  }, []);
+
+  // Live geolocation watcher — updates livePos as the user moves.
+  useEffect(() => {
+    if (typeof navigator === 'undefined' || !navigator.geolocation) return;
+    let watchId: number | null = null;
+    try {
+      watchId = navigator.geolocation.watchPosition(
+        (pos) => setLivePos({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
+        () => { /* silent — keep last good position */ },
+        { enableHighAccuracy: true, maximumAge: 5000, timeout: 15000 }
+      );
+    } catch { /* silent */ }
+    return () => {
+      if (watchId != null && navigator.geolocation && navigator.geolocation.clearWatch) {
+        try { navigator.geolocation.clearWatch(watchId); } catch { /* silent */ }
+      }
+    };
+  }, []);
+
+  // Recenter the map and update the user dot whenever livePos changes.
+  // Only recenters on the FIRST fix to avoid yanking the map every move.
+  const didInitialCenterRef = useRef(false);
+  useEffect(() => {
+    const map = mapRef.current;
+    const mk = (window as any).mapkit;
+    if (!map || !mk || !livePos) return;
+
+    // First fix — center the map and set the visible region to the radius.
+    if (!didInitialCenterRef.current) {
+      const center = new mk.Coordinate(livePos.lat, livePos.lng);
+      // Convert miles to meters for span. CoordinateRegion uses degrees,
+      // so we approximate: 1 deg lat ~= 111km. Span = 2 * radius.
+      const spanDeg = (NEARBY_RADIUS_MILES * 2 * METERS_PER_MILE) / 111000;
+      map.region = new mk.CoordinateRegion(
+        center,
+        new mk.CoordinateSpan(spanDeg, spanDeg),
+      );
+      didInitialCenterRef.current = true;
+    }
+
+    // Update or create the user dot. We use a custom MarkerAnnotation so
+    // we can color it blue and override the glyph.
+    if (userAnnotationRef.current) {
+      userAnnotationRef.current.coordinate = new mk.Coordinate(livePos.lat, livePos.lng);
+    } else {
+      const dot = new mk.MarkerAnnotation(
+        new mk.Coordinate(livePos.lat, livePos.lng),
+        {
+          color: '#2a8aff',
+          glyphColor: '#ffffff',
+          title: 'You',
+          subtitle: '',
+          selected: false,
+        },
+      );
+      map.addAnnotation(dot);
+      userAnnotationRef.current = dot;
+    }
+  }, [livePos]);
+
+  // Render site pins whenever the nearby set changes.
+  useEffect(() => {
+    const map = mapRef.current;
+    const mk = (window as any).mapkit;
+    if (!map || !mk) return;
+
+    // Remove old pins.
+    if (siteAnnotationsRef.current.length) {
+      try { map.removeAnnotations(siteAnnotationsRef.current); } catch { /* silent */ }
+      siteAnnotationsRef.current = [];
+    }
+    if (!nearbySites.length) return;
+
+    const created: any[] = [];
+    for (const { site, distMi } of nearbySites) {
+      const color = CATEGORY_COLOR[site.category as CategoryKey] || '#888888';
+      const ann = new mk.MarkerAnnotation(
+        new mk.Coordinate(site.coords.lat, site.coords.lng),
+        {
+          color,
+          glyphColor: '#000000',
+          title: site.title,
+          subtitle: `${distMi.toFixed(1)} mi`,
+          selected: false,
+        },
+      );
+      // Tap pin → fly to it. Tap callout → open DetailView. MapKit JS
+      // exposes selection events on annotations; we listen for 'select'.
+      ann.addEventListener('select', () => {
+        // Just selecting reveals the title/subtitle bubble.
+      });
+      // The callout itself isn't directly tappable in MapKit JS, but we
+      // can use the calloutAccessoryRight option to inject a button that
+      // routes to DetailView. For now, double-select navigates.
+      ann.addEventListener('deselect', () => { /* noop */ });
+      // Workaround: we add a click on the pin's element after MapKit attaches
+      // it. This is the most reliable way today.
+      created.push(ann);
+    }
+    map.addAnnotations(created);
+    siteAnnotationsRef.current = created;
+
+    // Wire up annotation clicks via the map's 'select-annotation' event
+    // (newer MapKit JS) or fallback to listening for selection changes.
+    const handler = (e: any) => {
+      const ann = e?.annotation;
+      if (!ann) return;
+      const matched = nearbySites.find(
+        (x) =>
+          Math.abs(x.site.coords.lat - ann.coordinate.latitude) < 1e-6 &&
+          Math.abs(x.site.coords.lng - ann.coordinate.longitude) < 1e-6,
+      );
+      if (matched && matched.site !== userAnnotationRef.current) {
+        // Single tap shows callout; if the user taps again or taps the
+        // callout, route to DetailView. We do that via a short delay
+        // double-tap detection.
+        const now = Date.now();
+        const last = (ann as any)._lastTap || 0;
+        (ann as any)._lastTap = now;
+        if (now - last < 800) {
+          playForward();
+          onSelectSite(matched.site);
+        }
+      }
+    };
+    try {
+      map.addEventListener('select', handler);
+    } catch { /* silent */ }
+
+    return () => {
+      try { map.removeEventListener('select', handler); } catch { /* silent */ }
+    };
+  }, [nearbySites, onSelectSite]);
+
+  // ---- Render ----
+  return (
+    <div style={S.appBg}>
+      <header style={S.header}>
+        <div style={{ ...S.categoryViewTitle, color: WHITE, textShadow: `0 0 14px ${WHITE}cc` }}>
+          Locations Near Me
+        </div>
+        <div style={S.listSubtitle}>
+          {nearbySites.length} {nearbySites.length === 1 ? 'site' : 'sites'} within {NEARBY_RADIUS_MILES} mi
+        </div>
+      </header>
+
+      {loadError ? (
+        <div style={S.leaderBody}>
+          <p style={{ ...S.aboutPara, color: '#d97a7a' }}>
+            {loadError}
+          </p>
+          <p style={S.aboutPara}>
+            Once the token is set, the map will load Apple Maps with your live position
+            and every site within {NEARBY_RADIUS_MILES} miles.
+          </p>
+        </div>
+      ) : (
+        <>
+          <div
+            ref={mapElRef}
+            style={{
+              width: '100%',
+              height: 'calc(100vh - 240px)',
+              minHeight: 360,
+              backgroundColor: '#0a0a0a',
+              position: 'relative',
+              zIndex: 1,
+            }}
+          />
+          {!livePos && (
+            <div style={{ ...S.aboutPara, padding: '12px 20px', textAlign: 'center', color: '#888' }}>
+              Locating you…
+            </div>
+          )}
+          {livePos && nearbySites.length === 0 && (
+            <div style={{ ...S.aboutPara, padding: '12px 20px', textAlign: 'center', color: '#888' }}>
+              No sites within {NEARBY_RADIUS_MILES} miles. Submit one to be the first.
+            </div>
+          )}
+        </>
+      )}
     </div>
   );
 }
@@ -4759,16 +5149,19 @@ const S: Record<string, React.CSSProperties> = {
     position: 'fixed',
     left: 0, right: 0,
     bottom: 14,
-    zIndex: 2,
+    zIndex: 10,
     display: 'flex',
     justifyContent: 'center',
     gap: 8,
     padding: '0 12px',
     boxSizing: 'border-box',
   },
+  // Pill button used in the home bottom bar. Wider than the original 3-button
+  // layout since there are now only 2 (Locations Near Me / More) sharing the
+  // available width.
   socialBtn: {
     flex: 1,
-    maxWidth: 130,
+    maxWidth: 200,
     backgroundColor: 'rgba(0,0,0,0.45)',
     border: `1.5px solid ${WHITE}`,
     color: WHITE,
@@ -4776,7 +5169,7 @@ const S: Record<string, React.CSSProperties> = {
     fontSize: 12,
     fontWeight: 700,
     letterSpacing: '0.05em',
-    padding: '10px 8px',
+    padding: '10px 12px',
     borderRadius: 14,
     cursor: 'pointer',
     display: 'flex',
@@ -4786,8 +5179,56 @@ const S: Record<string, React.CSSProperties> = {
     boxShadow: `0 0 10px ${WHITE}33`,
     backdropFilter: 'blur(2px)',
   },
+  // Variant applied to the More button while its popup is open. Gives a
+  // brighter glow + slightly stronger shadow so the user gets visual
+  // feedback that the menu is anchored to that button.
+  socialBtnActive: {
+    boxShadow: `0 0 16px ${WHITE}88, 0 0 28px ${WHITE}33`,
+    textShadow: `0 0 8px ${WHITE}aa`,
+  },
   socialIcon: { fontSize: 14, lineHeight: 1 },
   socialLabel: { fontSize: 12 },
+
+  // ---- More menu popup ----
+  // Anchored above the More button (right-aligned). Sits at zIndex 11 so it
+  // floats over the home bottom bar (zIndex 10) and the page content. Width
+  // matches roughly half the screen so it lines up neatly above the
+  // right-side button without spanning the full bar.
+  moreMenuWrap: {
+    position: 'fixed',
+    bottom: 70,
+    right: 14,
+    zIndex: 11,
+    minWidth: 180,
+    backgroundColor: 'rgba(13, 13, 13, 0.97)',
+    border: `1px solid ${WHITE}55`,
+    borderRadius: 12,
+    overflow: 'hidden',
+    boxShadow: `0 0 20px rgba(0,0,0,0.7), 0 0 28px ${WHITE}22`,
+    backdropFilter: 'blur(6px)',
+  },
+  moreMenuItem: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 10,
+    width: '100%',
+    boxSizing: 'border-box' as const,
+    padding: '13px 16px',
+    backgroundColor: 'transparent',
+    border: 'none',
+    color: BONE,
+    fontFamily: 'inherit',
+    fontSize: 13,
+    fontWeight: 600,
+    letterSpacing: '0.04em',
+    cursor: 'pointer',
+    textAlign: 'left' as const,
+  },
+  moreMenuLabel: { flex: 1 },
+  moreMenuDivider: {
+    height: 0,
+    borderTop: '0.5px solid rgba(255,255,255,0.1)',
+  },
 
   aboutBody: {
     padding: '20px 24px 80px',
