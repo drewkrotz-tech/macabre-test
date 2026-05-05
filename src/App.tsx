@@ -1335,21 +1335,27 @@ export default function App() {
     return () => { cancelled = true; };
   }, []);
 
-  // Eagerly start decoding all audio buffers + prime gain chains on first touch
+  // Audio priming. iOS WKWebView is finicky: AudioContexts created without
+  // a user gesture will silently fail to play their first buffer, which is
+  // the recurring "open the app, no sounds, close & reopen fixes it" bug.
+  //
+  // Strategy:
+  //   1. Don't create the contexts on mount. Wait for a user gesture.
+  //   2. On EVERY gesture (not just the first), call ensureXxxAudio() —
+  //      idempotent if already created, and it gives us a fresh chance
+  //      to recover if iOS broke the context after a background cycle.
+  //   3. Always fire a tiny silent buffer through each gain chain after
+  //      ensure. This "kicks" the chain and reliably unblocks playback.
+  //   4. installAudioLifecycle() sets up visibility/focus/pageshow handlers
+  //      to call wakeAllAudio when the app returns to foreground.
   useEffect(() => {
-    try { ensureSlideAudio(); } catch { /* silent */ }
-    try { ensureButtonAudio(); } catch { /* silent */ }
-    try { ensureBackAudio(); } catch { /* silent */ }
-    try { ensureBellAudio(); } catch { /* silent */ }
-    // Install foreground/visibility listeners so the AudioContexts get
-    // resumed when the user comes back to the app from the home screen,
-    // a phone call, the lock screen, etc. Without this the first sound
-    // tap after returning is silently dropped on iOS.
     try { installAudioLifecycle(); } catch { /* silent */ }
-    let primed = false;
-    const primeOnFirstTouch = () => {
-      if (primed) return;
-      primed = true;
+
+    const primeAndKick = () => {
+      try { ensureSlideAudio(); } catch { /* silent */ }
+      try { ensureButtonAudio(); } catch { /* silent */ }
+      try { ensureBackAudio(); } catch { /* silent */ }
+      try { ensureBellAudio(); } catch { /* silent */ }
       const ctxs: Array<{ ctx: AudioContext | null; gain: GainNode | null }> = [
         { ctx: _slideAudioCtx, gain: _slideAudioGain },
         { ctx: _buttonAudioCtx, gain: _buttonAudioGain },
@@ -1359,7 +1365,11 @@ export default function App() {
       for (const { ctx, gain } of ctxs) {
         if (!ctx || !gain) continue;
         try {
-          if (ctx.state === 'suspended') ctx.resume().catch(() => { /* silent */ });
+          // Resume unconditionally — cheap on running contexts.
+          ctx.resume().catch(() => { /* silent */ });
+          // Kick the chain with a 50ms silent buffer. Without this the
+          // chain can be in a broken-but-running state after backgrounding
+          // and play attempts produce no audio.
           const sr = ctx.sampleRate;
           const silent = ctx.createBuffer(1, Math.floor(sr * 0.05), sr);
           const primer = ctx.createBufferSource();
@@ -1369,14 +1379,18 @@ export default function App() {
         } catch { /* silent */ }
       }
       try { _slidePrimed = true; } catch { /* silent */ }
-      window.removeEventListener('pointerdown', primeOnFirstTouch);
-      window.removeEventListener('touchstart', primeOnFirstTouch);
     };
-    window.addEventListener('pointerdown', primeOnFirstTouch, { passive: true });
-    window.addEventListener('touchstart', primeOnFirstTouch, { passive: true });
+
+    // Run on EVERY gesture, not just the first. The previous version used
+    // once: true and removed the listener after first fire — meaning after
+    // a background cycle there was nothing to re-prime audio. This rearm-
+    // forever pattern is cheap (ensure is idempotent, resume is no-op on
+    // running contexts) and reliably fixes the silent-audio bug.
+    window.addEventListener('pointerdown', primeAndKick, { capture: true, passive: true });
+    window.addEventListener('touchstart', primeAndKick, { capture: true, passive: true } as any);
     return () => {
-      window.removeEventListener('pointerdown', primeOnFirstTouch);
-      window.removeEventListener('touchstart', primeOnFirstTouch);
+      window.removeEventListener('pointerdown', primeAndKick, { capture: true } as any);
+      window.removeEventListener('touchstart', primeAndKick, { capture: true } as any);
     };
   }, []);
 
@@ -1392,11 +1406,15 @@ export default function App() {
   // The previous view, exposed to JSX so we can render it as a peek layer
   // during a swipe-back gesture. Set on drag start, cleared on drag end.
   const [prevView, setPrevView] = useState<View | null>(null);
-  // Saved scroll position of the previous view — used to translate the
-  // peek layer's content up by that amount during a swipe, so the user
-  // visually sees the previous page at the right scroll offset (not
-  // scroll 0) the entire animation.
-  const [prevScrollY, setPrevScrollY] = useState<number>(0);
+  // Saved scroll position of the previous view — stored as a ref (not
+  // state) so it updates SYNCHRONOUSLY alongside setPrevView. If we used
+  // useState here, React would batch the two state updates and the peek
+  // layer's first paint could happen with prevScrollY still at 0 before
+  // the second update lands. On a 220ms swipe animation, that one paint
+  // at 0 is what the user actually sees, defeating the whole fix. Refs
+  // update immediately, so reading _prevScrollRef.current during render
+  // gives us the right value on the very first paint of the peek layer.
+  const _prevScrollRef = useRef<number>(0);
   useEffect(() => {
     if (typeof window === 'undefined') return;
     if (view.name === 'home') return;
@@ -1482,8 +1500,11 @@ export default function App() {
         const stack = _navHistory.current;
         if (stack.length > 0) {
           const top = stack[stack.length - 1];
+          // Set the ref FIRST so any render triggered by setPrevView below
+          // already sees the right scroll offset. Refs are synchronous;
+          // state setters are not.
+          _prevScrollRef.current = top.scrollY;
           setPrevView(top.view);
-          setPrevScrollY(top.scrollY);
           // Stash the value so the restore effect can re-confirm it
           // after the new view mounts (handles the edge case where the
           // page hasn't laid out tall enough yet at this exact moment).
@@ -1968,10 +1989,14 @@ export default function App() {
           {/* Inner div that's shifted up by the saved scroll position. The
               peek layer mounts the previous view fresh (always rendered
               from the top), but visually we want the user to see the page
-              where they LEFT it. Translating the content by -prevScrollY
+              where they LEFT it. Translating the content by -savedScroll
               makes the visible portion of the peek layer match where the
-              user was scrolled when they navigated forward. */}
-          <div style={{ transform: `translateY(-${prevScrollY}px)` }}>
+              user was scrolled when they navigated forward. We read the
+              offset from a ref rather than state so the very first paint
+              of the peek layer already has it applied — state setters
+              would race against React's batch and let the layer paint
+              once at scroll 0 before the correct value lands. */}
+          <div style={{ transform: `translateY(-${_prevScrollRef.current}px)` }}>
             {prevLayer.element}
           </div>
         </div>
@@ -1979,6 +2004,19 @@ export default function App() {
       <div ref={_dragWrapperRef} style={{ willChange: 'transform', position: 'relative', zIndex: 2, backgroundColor: '#0A0A0A' }}><div key={viewKey} className="sinister-view-enter">
         {viewElement}
       </div></div>
+      {/* Global bottom bar — visible on every screen except the Map view.
+          The map page has its own back button + map controls so this bar
+          would visually clutter and overlap interactive elements. Lifting
+          this out of HomeView means it persists during navigation, no
+          longer disappearing on inner pages like Hauntings or DetailView. */}
+      {view.name !== 'nearby' && (
+        <HomeBottomBar
+          onLeaders={goLeaders}
+          onList={goList}
+          onAbout={goAbout}
+          onNearby={goNearby}
+        />
+      )}
       <ToastHost />
       {showAlwaysModal && (
         <AlwaysLocationModal
@@ -3099,8 +3137,6 @@ function HomeView({ sites, onSelectCategory, onSubmit, onAbout, onLeaders, onLis
       >
         <span style={S.submitFixedButtonText}>Submit a Location</span>
       </button>
-
-      <HomeBottomBar onLeaders={onLeaders} onList={onList} onAbout={onAbout} onNearby={onNearby} />
     </div>
   );
 }
