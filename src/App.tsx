@@ -319,6 +319,32 @@ function playBack() {
   } catch { /* silent */ }
 }
 
+// Small rising pop — used when the map preview card slides up after a pin
+// tap. Pitch sweeps up from 400 to 700 Hz over ~70ms with a quick attack
+// and ~110ms exponential decay. Quieter than playBack so it sits as a
+// subtle confirmation rather than a navigation cue. Mirroring the upward
+// motion of the card with an upward pitch gesture makes the moment feel
+// connected rather than arbitrary.
+function playPop() {
+  const ctx = getAudioCtx();
+  if (!ctx) return;
+  try {
+    const now = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(400, now);
+    osc.frequency.exponentialRampToValueAtTime(700, now + 0.07);
+    gain.gain.setValueAtTime(0, now);
+    gain.gain.linearRampToValueAtTime(0.16, now + 0.005);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.11);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(now);
+    osc.stop(now + 0.13);
+  } catch { /* silent */ }
+}
+
 // Single slide audio instance — Web Audio API implementation.
 // HTMLAudioElement.volume is IGNORED on iOS WebView, which is why the
 // slide sound was deafening on iPhone despite volume=0.105. Web Audio's
@@ -620,15 +646,35 @@ function showToast(message: string, tone: ToastTone = 'default', durationMs = 25
 //     used to be here meant we never rearmed after a second background
 //     cycle)
 function wakeAllAudio() {
-  const ctxs: Array<AudioContext | null> = [
-    _audioCtx, _slideAudioCtx, _buttonAudioCtx, _backAudioCtx, _bellAudioCtx,
+  const entries: Array<{ ctx: AudioContext | null; gain: GainNode | null }> = [
+    { ctx: _audioCtx, gain: null },
+    { ctx: _slideAudioCtx, gain: _slideAudioGain },
+    { ctx: _buttonAudioCtx, gain: _buttonAudioGain },
+    { ctx: _backAudioCtx, gain: _backAudioGain },
+    { ctx: _bellAudioCtx, gain: _bellAudioGain },
   ];
-  for (const ctx of ctxs) {
+  for (const { ctx, gain } of entries) {
     if (!ctx) continue;
     // resume() is a no-op on already-running contexts, so we don't bother
     // checking state — the dual nature of iOS's lying state field means
     // the check itself is unreliable.
     try { ctx.resume().catch(() => { /* silent */ }); } catch { /* silent */ }
+    // Kick the gain chain by playing a tiny silent buffer. This is the
+    // key part: after a background/foreground cycle, the AudioContext
+    // can claim it's running but the gain chain is actually broken until
+    // something flows through it. A 50ms silent buffer "warms" the chain
+    // without making any audible noise. Without this, sound silently
+    // never plays even though the contexts report 'running'.
+    if (gain) {
+      try {
+        const sr = ctx.sampleRate;
+        const silent = ctx.createBuffer(1, Math.floor(sr * 0.05), sr);
+        const primer = ctx.createBufferSource();
+        primer.buffer = silent;
+        primer.connect(gain);
+        primer.start(0);
+      } catch { /* silent */ }
+    }
   }
 }
 
@@ -3728,12 +3774,14 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack }: {
 
     // Pin tap: open / swap the card. Tapping the same pin a second time
     // keeps the card open (no toggle on pin tap — we toggle only on
-    // close-X or map-background tap, which is more predictable).
+    // close-X or map-background tap, which is more predictable). Plays
+    // a small upward pop to match the upward slide-in motion of the card.
     const onSelect = (e: any) => {
       const ann = e?.annotation;
       if (!ann) return;
       const matched = annToSite.get(ann);
       if (!matched) return;
+      playPop();
       setSelectedSite(matched);
     };
     // Map-background tap: close the card. MapKit fires this whenever the
@@ -5560,7 +5608,7 @@ const S: Record<string, React.CSSProperties> = {
   // the iOS status bar / Dynamic Island.
   mapHeaderRow: {
     display: 'flex',
-    alignItems: 'center',
+    alignItems: 'flex-start',
     gap: 12,
     padding: '0 14px',
     width: '100%',
@@ -5581,6 +5629,10 @@ const S: Record<string, React.CSSProperties> = {
     flexShrink: 0,
     width: 36,
     height: 36,
+    // Pushed down so it sits closer to the map area, away from the title's
+    // top. The title block is taller than the button, so without this the
+    // button visually floats above where users expect it.
+    marginTop: 28,
     backgroundColor: 'rgba(0,0,0,0.6)',
     border: `1.5px solid ${WHITE}`,
     color: WHITE,
