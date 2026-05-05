@@ -2,7 +2,7 @@
 declare module '*.ttf' { const url: string; export default url; }
 declare module '*.png' { const url: string; export default url; }
 
-import { forwardRef, useEffect, useMemo, useRef, useState } from 'react';
+import { forwardRef, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   startGeofencing,
   stopGeofencing,
@@ -626,10 +626,25 @@ function playBell() {
 // overflowY-auto wrapper around the looping cells), which means
 // window.scrollY ignores it. To preserve the user's position when they
 // open a site → swipe back, we save scrollTop on tap-out and restore
-// it on next CategoryView mount. Module-level var because the saving
-// component (CategoryView going away) is a different React tree node
-// than the receiving component (CategoryView coming back).
-let _categoryScrollSave: number | null = null;
+// it on next CategoryView mount.
+//
+// Why a Map keyed by category+state instead of a single slot: during a
+// swipe-back gesture CategoryView mounts TWICE in quick succession (once
+// in the peek layer, once in the real wrapper). A single-slot value with
+// timer-based clearing creates a race where the second mount can read
+// either the saved value or null depending on subtle timing. With a Map
+// keyed by category, the entry stays put across both mounts and is only
+// overwritten the next time the user taps into a site from that same
+// category. No timers, no races. Module-level so the saving component
+// instance and the receiving component instance share the same storage.
+const _categoryScrollMap: Map<string, number> = new Map();
+// Flip to true and rebuild to get a torrent of diagnostic logs in
+// Safari Web Inspector. Tags every save/restore/clear with the category
+// key and scrollTop so you can see exactly which path fires when.
+const _CAT_SCROLL_DEBUG = false;
+function _catScrollLog(...args: unknown[]) {
+  if (_CAT_SCROLL_DEBUG) console.log('[catScroll]', ...args);
+}
 
 // ---------- Toasts ----------
 // Lightweight global toast system. Any component can call showToast(msg)
@@ -1777,8 +1792,14 @@ export default function App() {
       const label = v.state
         ? `${v.state} · ${cat?.label || titleCase(v.category)}`
         : (cat?.label || titleCase(v.category));
+      // scrollKey: stable identifier for THIS specific category+state.
+      // Both the peek-layer mount and the real-wrapper mount of CategoryView
+      // get the same key, so they read/write the same slot in the scroll-
+      // memory Map. That's what makes scroll restoration deterministic
+      // across the swipe-back gesture's double mount.
+      const scrollKey = `category:${v.category}:${v.state || 'ALL'}`;
       return {
-        key: `category:${v.category}:${v.state || 'ALL'}`,
+        key: scrollKey,
         element: (
           <CategoryView
             label={label}
@@ -1788,6 +1809,7 @@ export default function App() {
             onSelectSite={goDetail}
             onSubmit={goSubmit}
             onBack={goHome}
+            scrollKey={scrollKey}
           />
         ),
       };
@@ -3998,7 +4020,7 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack }: {
 }
 
 // ---------- CATEGORY ----------
-function CategoryView({ label, color, sites, currentLocation, onSelectSite, onSubmit, onBack }: {
+function CategoryView({ label, color, sites, currentLocation, onSelectSite, onSubmit, onBack, scrollKey }: {
   label: string;
   color: string;
   sites: SinisterSite[];
@@ -4006,6 +4028,7 @@ function CategoryView({ label, color, sites, currentLocation, onSelectSite, onSu
   onSelectSite: (s: SinisterSite) => void;
   onSubmit: () => void;
   onBack: () => void;
+  scrollKey: string;
 }) {
   // Search box: case-insensitive substring match against title, short
   // description, full description, and state name. Empty query = show all.
@@ -4041,34 +4064,69 @@ function CategoryView({ label, color, sites, currentLocation, onSelectSite, onSu
   const sprocketLeftRef = useRef<HTMLDivElement | null>(null);
   const sprocketRightRef = useRef<HTMLDivElement | null>(null);
 
-  // On mount: if we have a saved scroll position from a previous visit
-  // (user tapped a site, opened DetailView, swiped back), restore that
-  // position. Otherwise reset to middle copy of the looping filmstrip
-  // so they can scroll either direction.
+  // On mount: restore the scroll position the user was at when they last
+  // tapped into a site from this category. If there's no saved position
+  // (first visit to this category, or never tapped a site), default to the
+  // middle copy of the looping filmstrip so they have equal looping room
+  // in both directions.
   //
-  // The save is cleared on a short timer rather than synchronously,
-  // because during a swipe-back gesture this CategoryView mounts TWICE
-  // in quick succession: once as the peek layer (visible during the
-  // swipe) and once as the destination view (after goBack fires). If
-  // we cleared the save on the first mount, the second mount would
-  // fall through to oneCopyHeight and snap the user back to the top.
-  // The delay lets both mounts pick up the same save.
-  useEffect(() => {
+  // Why useLayoutEffect, not useEffect:
+  //   useEffect fires AFTER paint. That gives the user a one-frame flash
+  //   of the unrestored (default) position before we correct it, which
+  //   matched the bug Drew was seeing exactly. useLayoutEffect fires
+  //   synchronously after DOM mutations but BEFORE paint, so the very
+  //   first frame the user sees already has the right scrollTop.
+  //
+  // Why a Map keyed by scrollKey, not a single module-level slot:
+  //   During a swipe-back gesture, CategoryView mounts twice — once in
+  //   the peek layer, once in the real wrapper after goBack(). With a
+  //   single slot, the second mount races against whatever timer was
+  //   clearing the slot. With a keyed Map, the entry stays put until
+  //   the user next taps a site from this same category — no timers,
+  //   no races, deterministic.
+  //
+  // Why the rAF retry loop:
+  //   Setting scrollTop only takes effect if the scroll container's
+  //   content is already tall enough. On a fresh mount the cells may
+  //   not have laid out yet, and the browser silently caps scrollTop
+  //   at maxScroll (which can be 0). We re-apply for a few frames to
+  //   cover that case. We stop as soon as the value sticks OR the user
+  //   touches the screen (handled by the gesture effect below clearing
+  //   the save when it sees user input).
+  useLayoutEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
-    if (_categoryScrollSave != null) {
-      el.scrollTop = _categoryScrollSave;
-      // Clear after a short delay — long enough for the peek-layer mount
-      // and the real-wrapper mount to both consume it, short enough that
-      // a future forward-then-back nav captures a fresh save first.
-      const savedValue = _categoryScrollSave;
-      window.setTimeout(() => {
-        if (_categoryScrollSave === savedValue) _categoryScrollSave = null;
-      }, 500);
-    } else {
-      el.scrollTop = oneCopyHeight;
-    }
-  }, [oneCopyHeight]);
+    const saved = _categoryScrollMap.get(scrollKey);
+    const target = saved != null ? saved : oneCopyHeight;
+    _catScrollLog('mount restore', { scrollKey, saved, oneCopyHeight, target });
+    el.scrollTop = target;
+
+    // Retry for up to ~600ms in case content height wasn't ready yet.
+    // We stop early once scrollTop actually equals target (or is as
+    // close as the current maxScroll permits).
+    let raf = 0;
+    let attempts = 0;
+    const MAX_ATTEMPTS = 36; // ~600ms at 60fps
+    const tryApply = () => {
+      if (!scrollRef.current) return;
+      const node = scrollRef.current;
+      const maxScroll = Math.max(0, node.scrollHeight - node.clientHeight);
+      const safeTarget = Math.min(target, maxScroll);
+      if (Math.abs(node.scrollTop - safeTarget) > 1) {
+        node.scrollTop = safeTarget;
+      }
+      attempts++;
+      // Stop once we've reached target (within 1px) or the page is tall
+      // enough that we can't blame layout, or we've burned through retries.
+      if (attempts >= MAX_ATTEMPTS || (maxScroll >= target && Math.abs(node.scrollTop - target) <= 1)) {
+        _catScrollLog('mount restore done', { attempts, finalScrollTop: node.scrollTop, target });
+        return;
+      }
+      raf = requestAnimationFrame(tryApply);
+    };
+    raf = requestAnimationFrame(tryApply);
+    return () => { if (raf) cancelAnimationFrame(raf); };
+  }, [scrollKey, oneCopyHeight]);
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -4183,10 +4241,14 @@ function CategoryView({ label, color, sites, currentLocation, onSelectSite, onSu
   const handleClick = (e: Entry) => {
     // Save the filmstrip's scroll position so that when the user swipes
     // back from DetailView to this CategoryView, we can restore them to
-    // the exact site cell they tapped from. The mount effect below reads
+    // the exact site cell they tapped from. The mount effect above reads
     // this on remount and applies it once the cells layout is ready.
+    // Keyed by scrollKey so each category has its own slot — no shared
+    // state across categories, no clearing timers needed.
     const sc = scrollRef.current;
-    if (sc) _categoryScrollSave = sc.scrollTop || 0;
+    const top = sc ? (sc.scrollTop || 0) : 0;
+    _categoryScrollMap.set(scrollKey, top);
+    _catScrollLog('save on tap', { scrollKey, top });
     onSelectSite(e.site);
   };
 
