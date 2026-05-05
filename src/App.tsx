@@ -1392,6 +1392,11 @@ export default function App() {
   // The previous view, exposed to JSX so we can render it as a peek layer
   // during a swipe-back gesture. Set on drag start, cleared on drag end.
   const [prevView, setPrevView] = useState<View | null>(null);
+  // Saved scroll position of the previous view — used to translate the
+  // peek layer's content up by that amount during a swipe, so the user
+  // visually sees the previous page at the right scroll offset (not
+  // scroll 0) the entire animation.
+  const [prevScrollY, setPrevScrollY] = useState<number>(0);
   useEffect(() => {
     if (typeof window === 'undefined') return;
     if (view.name === 'home') return;
@@ -1478,6 +1483,7 @@ export default function App() {
         if (stack.length > 0) {
           const top = stack[stack.length - 1];
           setPrevView(top.view);
+          setPrevScrollY(top.scrollY);
           // Stash the value so the restore effect can re-confirm it
           // after the new view mounts (handles the edge case where the
           // page hasn't laid out tall enough yet at this exact moment).
@@ -1954,9 +1960,20 @@ export default function App() {
             willChange: 'transform',
             pointerEvents: 'none',
             backgroundColor: '#0A0A0A',
+            // Hide overflow on the wrapper itself so the inner shifted
+            // content doesn't bleed into the wrapper's edges.
+            overflow: 'hidden',
           }}
         >
-          {prevLayer.element}
+          {/* Inner div that's shifted up by the saved scroll position. The
+              peek layer mounts the previous view fresh (always rendered
+              from the top), but visually we want the user to see the page
+              where they LEFT it. Translating the content by -prevScrollY
+              makes the visible portion of the peek layer match where the
+              user was scrolled when they navigated forward. */}
+          <div style={{ transform: `translateY(-${prevScrollY}px)` }}>
+            {prevLayer.element}
+          </div>
         </div>
       )}
       <div ref={_dragWrapperRef} style={{ willChange: 'transform', position: 'relative', zIndex: 2, backgroundColor: '#0A0A0A' }}><div key={viewKey} className="sinister-view-enter">
@@ -3820,34 +3837,30 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack }: {
   return (
     <div style={S.appBg}>
       <header style={S.header}>
-        {/* Inline back button — sits next to the title, anchored within the
-            header so it can't get clipped by the iOS status bar / Dynamic
-            Island. Circular with a left chevron. */}
-        <div style={S.mapHeaderRow}>
-          <button
-            style={S.mapBackBtn}
-            onClick={() => { playBackSound(); onBack(); }}
-            aria-label="Back to home"
-          >
-            ‹
-          </button>
-          <div style={S.mapHeaderTitle}>
-            <div
-              style={{
-                ...S.categoryViewTitle,
-                fontFamily: '"LivingHell", "Jolly Lodger", system-ui, serif',
-                color: WHITE,
-                textShadow: `0 0 14px ${WHITE}cc, 0 0 28px ${WHITE}66`,
-              }}
-              className="sinister-glitch"
-              data-text="Locations Near Me"
-            >
-              Locations Near Me
-            </div>
-            <div style={S.listSubtitle}>
-              {nearbySites.length} {nearbySites.length === 1 ? 'site' : 'sites'} within {NEARBY_RADIUS_MILES} mi
-            </div>
-          </div>
+        {/* Back button — positioned absolutely at the bottom-left of the
+            header so it sits down near the map edge, leaving the full
+            header width for the title to render on a single line. */}
+        <button
+          style={S.mapBackBtn}
+          onClick={() => { playBackSound(); onBack(); }}
+          aria-label="Back to home"
+        >
+          ‹
+        </button>
+        <div
+          style={{
+            ...S.categoryViewTitle,
+            fontFamily: '"LivingHell", "Jolly Lodger", system-ui, serif',
+            color: WHITE,
+            textShadow: `0 0 14px ${WHITE}cc, 0 0 28px ${WHITE}66`,
+          }}
+          className="sinister-glitch"
+          data-text="Locations Near Me"
+        >
+          Locations Near Me
+        </div>
+        <div style={S.listSubtitle}>
+          {nearbySites.length} {nearbySites.length === 1 ? 'site' : 'sites'} within {NEARBY_RADIUS_MILES} mi
         </div>
       </header>
 
@@ -5603,36 +5616,19 @@ const S: Record<string, React.CSSProperties> = {
   },
 
   // ---- Map View styles ----
-  // Header row that places the back button inline with the title block.
-  // Both items live inside the existing header so they sit safely below
-  // the iOS status bar / Dynamic Island.
-  mapHeaderRow: {
-    display: 'flex',
-    alignItems: 'flex-start',
-    gap: 12,
-    padding: '0 14px',
-    width: '100%',
-    boxSizing: 'border-box' as const,
-  },
-  mapHeaderTitle: {
-    flex: 1,
-    minWidth: 0,
-    textAlign: 'center' as const,
-    // 36px right padding mirrors the back button width on the left so the
-    // title stays visually centered within the header row.
-    paddingRight: 36,
-  },
-  // Circular back button — small, glowing left chevron. Lives inline with
-  // the title rather than floating, so it can never collide with the
-  // status bar / Dynamic Island.
+  // Circular back button — small, glowing left chevron. Positioned
+  // absolutely against the bottom-left of the header so it sits right
+  // above the map edge, leaving the full header width for the title to
+  // render on a single line. The position values match the header's
+  // own paddingLeft / paddingBottom so it lines up cleanly inside the
+  // header's gutters.
   mapBackBtn: {
-    flexShrink: 0,
+    position: 'absolute' as const,
+    left: 12,
+    bottom: 12,
+    zIndex: 2,
     width: 36,
     height: 36,
-    // Pushed down so it sits closer to the map area, away from the title's
-    // top. The title block is taller than the button, so without this the
-    // button visually floats above where users expect it.
-    marginTop: 28,
     backgroundColor: 'rgba(0,0,0,0.6)',
     border: `1.5px solid ${WHITE}`,
     color: WHITE,
