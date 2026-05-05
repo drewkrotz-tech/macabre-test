@@ -1263,10 +1263,15 @@ export default function App() {
   // scroll inside goBack itself because the new view's content isn't in
   // the DOM yet at that moment.
   const _pendingScrollRestore = useRef<number | null>(null);
+  // Diagnostic state — small pill at the bottom of the screen that shows
+  // captured / restored scroll values so we can see exactly what's happening
+  // on real device. Remove this once the bug is confirmed fixed.
+  const [scrollDebug, setScrollDebug] = useState<string>('');
   const setView = (next: View) => {
     const sy = (typeof window !== 'undefined')
       ? (window.scrollY || document.documentElement.scrollTop || 0)
       : 0;
+    setScrollDebug(`captured ${sy}px going to ${next.name}`);
     _setViewRaw((prev) => {
       if (JSON.stringify(prev) !== JSON.stringify(next)) {
         _navHistory.current.push({ view: prev, scrollY: sy });
@@ -1280,6 +1285,7 @@ export default function App() {
     if (stack.length === 0) return;
     const entry = stack.pop()!;
     _pendingScrollRestore.current = entry.scrollY;
+    setScrollDebug(`goBack: restoring to ${entry.scrollY}px`);
     _setViewRaw(entry.view);
   };
   const [currentLocation, setCurrentLocation] = useState<{ lat: number; lng: number } | null>(null);
@@ -1509,6 +1515,7 @@ export default function App() {
           // after the new view mounts (handles the edge case where the
           // page hasn't laid out tall enough yet at this exact moment).
           _pendingScrollRestore.current = top.scrollY;
+          setScrollDebug(`stage prevView=${top.view.name} savedY=${top.scrollY}px ref=${_prevScrollRef.current}`);
           if (typeof window !== 'undefined') {
             try {
               window.scrollTo({ top: top.scrollY, left: 0, behavior: 'auto' as ScrollBehavior });
@@ -1941,6 +1948,7 @@ export default function App() {
       if (maxScroll >= target || attempts >= MAX_ATTEMPTS) {
         const safeTarget = Math.min(target, maxScroll);
         window.scrollTo({ top: safeTarget, left: 0, behavior: 'auto' as ScrollBehavior });
+        setScrollDebug(`scrolled to ${safeTarget}px (target ${target}, max ${maxScroll}, ${attempts} tries)`);
         return;
       }
       // Not tall enough yet — wait one more frame plus a tick.
@@ -2018,6 +2026,33 @@ export default function App() {
         />
       )}
       <ToastHost />
+      {/* TEMPORARY scroll diagnostic — shows captured/restored scroll values
+          during navigation. Remove this block after the swipe-back scroll
+          bug is fixed. Anchored above the bottom bar so it doesn't get
+          covered. Tap dismisses by clearing the message. */}
+      {scrollDebug && (
+        <div
+          onClick={() => setScrollDebug('')}
+          style={{
+            position: 'fixed',
+            left: 8,
+            right: 8,
+            bottom: 70,
+            zIndex: 9999,
+            backgroundColor: 'rgba(0,40,0,0.95)',
+            color: '#6ad06a',
+            border: '1px solid #2a3f2a',
+            borderRadius: 8,
+            padding: '6px 10px',
+            fontSize: 11,
+            fontFamily: 'monospace',
+            textAlign: 'center',
+            pointerEvents: 'auto',
+          }}
+        >
+          {scrollDebug}
+        </div>
+      )}
       {showAlwaysModal && (
         <AlwaysLocationModal
           onEnable={async () => {
