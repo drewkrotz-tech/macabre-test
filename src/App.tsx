@@ -411,8 +411,15 @@ function playSlide() {
         src.start(0);
       } catch { /* silent */ }
     };
-    // Always resume; cheap on already-running. Avoids state-field traps.
-    ctx.resume().then(fire).catch(() => { /* silent */ });
+    // If already running, fire SYNCHRONOUSLY in the same tap event.
+    // iOS drops samples that fire outside the user-gesture event handler,
+    // and ctx.resume() always defers via Promise even when the context is
+    // already running — that's what was eating the first sound.
+    if (ctx.state !== 'running') {
+      ctx.resume().then(fire).catch(() => { /* silent */ });
+    } else {
+      fire();
+    }
   } catch { /* silent */ }
 }
 
@@ -455,11 +462,9 @@ function playButton() {
       const ctx = _buttonAudioCtx;
       const buf = _buttonAudioBuffer;
       const gain = _buttonAudioGain;
-      // Always resume the context, regardless of what state it claims to
-      // be in. iOS sometimes reports 'running' while the clock is frozen,
-      // and resume() on a running context is a free no-op anyway. Then
-      // chain the actual playback off the resume() promise so we never
-      // schedule into a frozen clock.
+      // If already running, fire SYNCHRONOUSLY in the same tap event so
+      // iOS doesn't drop the sample for being outside the user gesture.
+      // Only defer via resume() if the context is actually suspended.
       const fire = () => {
         try {
           const src = ctx.createBufferSource();
@@ -468,13 +473,17 @@ function playButton() {
           src.start(0);
         } catch { /* silent */ }
       };
-      ctx.resume().then(fire).catch(() => {
-        // Resume failed (e.g. no user gesture yet) — fall through to
-        // HTMLAudioElement which is more permissive.
-        if (_buttonAudio) {
-          try { _buttonAudio.currentTime = 0; void _buttonAudio.play(); } catch { /* silent */ }
-        }
-      });
+      if (ctx.state !== 'running') {
+        ctx.resume().then(fire).catch(() => {
+          // Resume failed (e.g. no user gesture yet) — fall through to
+          // HTMLAudioElement which is more permissive.
+          if (_buttonAudio) {
+            try { _buttonAudio.currentTime = 0; void _buttonAudio.play(); } catch { /* silent */ }
+          }
+        });
+      } else {
+        fire();
+      }
       return;
     }
     if (_buttonAudio) {
@@ -530,11 +539,15 @@ function playBackSound() {
           src.start(0);
         } catch { /* silent */ }
       };
-      ctx.resume().then(fire).catch(() => {
-        if (_backAudio) {
-          try { _backAudio.currentTime = 0; void _backAudio.play(); } catch { /* silent */ }
-        }
-      });
+      if (ctx.state !== 'running') {
+        ctx.resume().then(fire).catch(() => {
+          if (_backAudio) {
+            try { _backAudio.currentTime = 0; void _backAudio.play(); } catch { /* silent */ }
+          }
+        });
+      } else {
+        fire();
+      }
       return;
     }
     if (_backAudio) {
@@ -590,11 +603,15 @@ function playBell() {
           src.start(0);
         } catch { /* silent */ }
       };
-      ctx.resume().then(fire).catch(() => {
-        if (_bellAudio) {
-          try { _bellAudio.currentTime = 0; void _bellAudio.play(); } catch { /* silent */ }
-        }
-      });
+      if (ctx.state !== 'running') {
+        ctx.resume().then(fire).catch(() => {
+          if (_bellAudio) {
+            try { _bellAudio.currentTime = 0; void _bellAudio.play(); } catch { /* silent */ }
+          }
+        });
+      } else {
+        fire();
+      }
       return;
     }
     if (_bellAudio) {
@@ -656,34 +673,13 @@ function showToast(message: string, tone: ToastTone = 'default', durationMs = 25
 //     used to be here meant we never rearmed after a second background
 //     cycle)
 function wakeAllAudio() {
-  const entries: Array<{ ctx: AudioContext | null; gain: GainNode | null }> = [
-    { ctx: _audioCtx, gain: null },
-    { ctx: _slideAudioCtx, gain: _slideAudioGain },
-    { ctx: _buttonAudioCtx, gain: _buttonAudioGain },
-    { ctx: _backAudioCtx, gain: _backAudioGain },
-    { ctx: _bellAudioCtx, gain: _bellAudioGain },
+  const ctxs: Array<AudioContext | null> = [
+    _audioCtx, _slideAudioCtx, _buttonAudioCtx, _backAudioCtx, _bellAudioCtx,
   ];
-  for (const { ctx, gain } of entries) {
+  for (const ctx of ctxs) {
     if (!ctx) continue;
-    // resume() is a no-op on already-running contexts, so we don't bother
-    // checking state — the dual nature of iOS's lying state field means
-    // the check itself is unreliable.
-    try { ctx.resume().catch(() => { /* silent */ }); } catch { /* silent */ }
-    // Kick the gain chain by playing a tiny silent buffer. This is the
-    // key part: after a background/foreground cycle, the AudioContext
-    // can claim it's running but the gain chain is actually broken until
-    // something flows through it. A 50ms silent buffer "warms" the chain
-    // without making any audible noise. Without this, sound silently
-    // never plays even though the contexts report 'running'.
-    if (gain) {
-      try {
-        const sr = ctx.sampleRate;
-        const silent = ctx.createBuffer(1, Math.floor(sr * 0.05), sr);
-        const primer = ctx.createBufferSource();
-        primer.buffer = silent;
-        primer.connect(gain);
-        primer.start(0);
-      } catch { /* silent */ }
+    if (ctx.state === 'suspended' || (ctx.state as string) === 'interrupted') {
+      ctx.resume().catch(() => { /* silent */ });
     }
   }
 }
@@ -700,17 +696,12 @@ function installAudioLifecycle() {
   };
   document.addEventListener('visibilitychange', onVisible);
   window.addEventListener('pageshow', wakeAllAudio);
-  // Every user gesture wakes audio. We deliberately do NOT use `once: true`
-  // because the user backgrounds and re-foregrounds the app multiple times
-  // per session. After any background cycle the next gesture should rearm
-  // audio, not silently fail because the listener already fired earlier.
-  // resume() is cheap on running contexts, so this is effectively free.
-  const onGesture = () => { wakeAllAudio(); };
-  window.addEventListener('pointerdown', onGesture, { capture: true });
-  window.addEventListener('touchstart', onGesture, { capture: true, passive: true } as any);
-  // Also wake on focus — covers the case where the user returns to the app
-  // via the app switcher (some iOS versions don't fire visibilitychange).
-  window.addEventListener('focus', wakeAllAudio);
+  // First user gesture safety net — once any tap happens, resume contexts
+  // and remove the listener. Capture phase + once: true so we win against
+  // anything that might stopPropagation.
+  const onFirstGesture = () => { wakeAllAudio(); };
+  window.addEventListener('pointerdown', onFirstGesture, { capture: true, once: true });
+  window.addEventListener('touchstart', onFirstGesture, { capture: true, once: true, passive: true } as any);
 }
 
 // ---------- Categories ----------
@@ -1345,27 +1336,21 @@ export default function App() {
     return () => { cancelled = true; };
   }, []);
 
-  // Audio priming. iOS WKWebView is finicky: AudioContexts created without
-  // a user gesture will silently fail to play their first buffer, which is
-  // the recurring "open the app, no sounds, close & reopen fixes it" bug.
-  //
-  // Strategy:
-  //   1. Don't create the contexts on mount. Wait for a user gesture.
-  //   2. On EVERY gesture (not just the first), call ensureXxxAudio() —
-  //      idempotent if already created, and it gives us a fresh chance
-  //      to recover if iOS broke the context after a background cycle.
-  //   3. Always fire a tiny silent buffer through each gain chain after
-  //      ensure. This "kicks" the chain and reliably unblocks playback.
-  //   4. installAudioLifecycle() sets up visibility/focus/pageshow handlers
-  //      to call wakeAllAudio when the app returns to foreground.
+  // Eagerly start decoding all audio buffers + prime gain chains on first touch
   useEffect(() => {
+    try { ensureSlideAudio(); } catch { /* silent */ }
+    try { ensureButtonAudio(); } catch { /* silent */ }
+    try { ensureBackAudio(); } catch { /* silent */ }
+    try { ensureBellAudio(); } catch { /* silent */ }
+    // Install foreground/visibility listeners so the AudioContexts get
+    // resumed when the user comes back to the app from the home screen,
+    // a phone call, the lock screen, etc. Without this the first sound
+    // tap after returning is silently dropped on iOS.
     try { installAudioLifecycle(); } catch { /* silent */ }
-
-    const primeAndKick = () => {
-      try { ensureSlideAudio(); } catch { /* silent */ }
-      try { ensureButtonAudio(); } catch { /* silent */ }
-      try { ensureBackAudio(); } catch { /* silent */ }
-      try { ensureBellAudio(); } catch { /* silent */ }
+    let primed = false;
+    const primeOnFirstTouch = () => {
+      if (primed) return;
+      primed = true;
       const ctxs: Array<{ ctx: AudioContext | null; gain: GainNode | null }> = [
         { ctx: _slideAudioCtx, gain: _slideAudioGain },
         { ctx: _buttonAudioCtx, gain: _buttonAudioGain },
@@ -1375,11 +1360,7 @@ export default function App() {
       for (const { ctx, gain } of ctxs) {
         if (!ctx || !gain) continue;
         try {
-          // Resume unconditionally — cheap on running contexts.
-          ctx.resume().catch(() => { /* silent */ });
-          // Kick the chain with a 50ms silent buffer. Without this the
-          // chain can be in a broken-but-running state after backgrounding
-          // and play attempts produce no audio.
+          if (ctx.state === 'suspended') ctx.resume().catch(() => { /* silent */ });
           const sr = ctx.sampleRate;
           const silent = ctx.createBuffer(1, Math.floor(sr * 0.05), sr);
           const primer = ctx.createBufferSource();
@@ -1389,18 +1370,14 @@ export default function App() {
         } catch { /* silent */ }
       }
       try { _slidePrimed = true; } catch { /* silent */ }
+      window.removeEventListener('pointerdown', primeOnFirstTouch);
+      window.removeEventListener('touchstart', primeOnFirstTouch);
     };
-
-    // Run on EVERY gesture, not just the first. The previous version used
-    // once: true and removed the listener after first fire — meaning after
-    // a background cycle there was nothing to re-prime audio. This rearm-
-    // forever pattern is cheap (ensure is idempotent, resume is no-op on
-    // running contexts) and reliably fixes the silent-audio bug.
-    window.addEventListener('pointerdown', primeAndKick, { capture: true, passive: true });
-    window.addEventListener('touchstart', primeAndKick, { capture: true, passive: true } as any);
+    window.addEventListener('pointerdown', primeOnFirstTouch, { passive: true });
+    window.addEventListener('touchstart', primeOnFirstTouch, { passive: true });
     return () => {
-      window.removeEventListener('pointerdown', primeAndKick, { capture: true } as any);
-      window.removeEventListener('touchstart', primeAndKick, { capture: true } as any);
+      window.removeEventListener('pointerdown', primeOnFirstTouch);
+      window.removeEventListener('touchstart', primeOnFirstTouch);
     };
   }, []);
 
@@ -4067,14 +4044,27 @@ function CategoryView({ label, color, sites, currentLocation, onSelectSite, onSu
   // On mount: if we have a saved scroll position from a previous visit
   // (user tapped a site, opened DetailView, swiped back), restore that
   // position. Otherwise reset to middle copy of the looping filmstrip
-  // so they can scroll either direction. The save is consumed (cleared)
-  // after restore so it won't accidentally apply on later mounts.
+  // so they can scroll either direction.
+  //
+  // The save is cleared on a short timer rather than synchronously,
+  // because during a swipe-back gesture this CategoryView mounts TWICE
+  // in quick succession: once as the peek layer (visible during the
+  // swipe) and once as the destination view (after goBack fires). If
+  // we cleared the save on the first mount, the second mount would
+  // fall through to oneCopyHeight and snap the user back to the top.
+  // The delay lets both mounts pick up the same save.
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
     if (_categoryScrollSave != null) {
       el.scrollTop = _categoryScrollSave;
-      _categoryScrollSave = null;
+      // Clear after a short delay — long enough for the peek-layer mount
+      // and the real-wrapper mount to both consume it, short enough that
+      // a future forward-then-back nav captures a fresh save first.
+      const savedValue = _categoryScrollSave;
+      window.setTimeout(() => {
+        if (_categoryScrollSave === savedValue) _categoryScrollSave = null;
+      }, 500);
     } else {
       el.scrollTop = oneCopyHeight;
     }
