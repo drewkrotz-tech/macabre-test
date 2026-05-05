@@ -277,7 +277,6 @@ function getAudioCtx(): AudioContext | null {
 }
 
 function playForward() {
-  haptic('light');
   const ctx = getAudioCtx();
   if (!ctx) return;
   try {
@@ -386,11 +385,8 @@ function playSlide() {
         src.start(0);
       } catch { /* silent */ }
     };
-    if (ctx.state !== 'running') {
-      ctx.resume().then(fire).catch(() => { /* silent */ });
-    } else {
-      fire();
-    }
+    // Always resume; cheap on already-running. Avoids state-field traps.
+    ctx.resume().then(fire).catch(() => { /* silent */ });
   } catch { /* silent */ }
 }
 
@@ -427,18 +423,17 @@ function ensureButtonAudio() {
   } catch { /* silent */ }
 }
 function playButton() {
-  haptic('light');
   try {
     ensureButtonAudio();
     if (_buttonAudioCtx && _buttonAudioBuffer && _buttonAudioGain) {
       const ctx = _buttonAudioCtx;
       const buf = _buttonAudioBuffer;
       const gain = _buttonAudioGain;
-      // If suspended/interrupted, resume() is async. Without awaiting, the
-      // first start(0) after foregrounding fires while the clock is still
-      // frozen and the sample is silently dropped. Defer the start until
-      // resume completes; on the happy path (already running) this is just
-      // an immediate fire-and-forget.
+      // Always resume the context, regardless of what state it claims to
+      // be in. iOS sometimes reports 'running' while the clock is frozen,
+      // and resume() on a running context is a free no-op anyway. Then
+      // chain the actual playback off the resume() promise so we never
+      // schedule into a frozen clock.
       const fire = () => {
         try {
           const src = ctx.createBufferSource();
@@ -447,17 +442,13 @@ function playButton() {
           src.start(0);
         } catch { /* silent */ }
       };
-      if (ctx.state !== 'running') {
-        ctx.resume().then(fire).catch(() => {
-          // Resume failed (e.g. no user gesture yet) — fall through to
-          // HTMLAudioElement which is more permissive.
-          if (_buttonAudio) {
-            try { _buttonAudio.currentTime = 0; void _buttonAudio.play(); } catch { /* silent */ }
-          }
-        });
-      } else {
-        fire();
-      }
+      ctx.resume().then(fire).catch(() => {
+        // Resume failed (e.g. no user gesture yet) — fall through to
+        // HTMLAudioElement which is more permissive.
+        if (_buttonAudio) {
+          try { _buttonAudio.currentTime = 0; void _buttonAudio.play(); } catch { /* silent */ }
+        }
+      });
       return;
     }
     if (_buttonAudio) {
@@ -499,7 +490,6 @@ function ensureBackAudio() {
   } catch { /* silent */ }
 }
 function playBackSound() {
-  haptic('light');
   try {
     ensureBackAudio();
     if (_backAudioCtx && _backAudioBuffer && _backAudioGain) {
@@ -514,15 +504,11 @@ function playBackSound() {
           src.start(0);
         } catch { /* silent */ }
       };
-      if (ctx.state !== 'running') {
-        ctx.resume().then(fire).catch(() => {
-          if (_backAudio) {
-            try { _backAudio.currentTime = 0; void _backAudio.play(); } catch { /* silent */ }
-          }
-        });
-      } else {
-        fire();
-      }
+      ctx.resume().then(fire).catch(() => {
+        if (_backAudio) {
+          try { _backAudio.currentTime = 0; void _backAudio.play(); } catch { /* silent */ }
+        }
+      });
       return;
     }
     if (_backAudio) {
@@ -564,7 +550,6 @@ function ensureBellAudio() {
   } catch { /* silent */ }
 }
 function playBell() {
-  haptic('strong');
   try {
     ensureBellAudio();
     if (_bellAudioCtx && _bellAudioBuffer && _bellAudioGain) {
@@ -579,42 +564,17 @@ function playBell() {
           src.start(0);
         } catch { /* silent */ }
       };
-      if (ctx.state !== 'running') {
-        ctx.resume().then(fire).catch(() => {
-          if (_bellAudio) {
-            try { _bellAudio.currentTime = 0; void _bellAudio.play(); } catch { /* silent */ }
-          }
-        });
-      } else {
-        fire();
-      }
+      ctx.resume().then(fire).catch(() => {
+        if (_bellAudio) {
+          try { _bellAudio.currentTime = 0; void _bellAudio.play(); } catch { /* silent */ }
+        }
+      });
       return;
     }
     if (_bellAudio) {
       _bellAudio.currentTime = 0;
       void _bellAudio.play();
     }
-  } catch { /* silent */ }
-}
-
-// ---------- Haptics ----------
-// Lightweight haptic feedback via the Web Vibration API. Works in iOS
-// WebView (Capacitor) without needing the @capacitor/haptics plugin or any
-// package.json changes. Three intensities tuned for the app's interactions:
-//
-//   light   — generic button/cell tap. Tiny, snappy.
-//   medium  — confirmations, transitions. Slightly heavier.
-//   strong  — claim success, milestone events. Double-pulse.
-//
-// All haptic calls are wrapped in try/catch + feature checks so they
-// silently no-op on devices/browsers that don't support vibration.
-type HapticIntensity = 'light' | 'medium' | 'strong';
-function haptic(kind: HapticIntensity = 'light') {
-  try {
-    if (typeof navigator === 'undefined' || !navigator.vibrate) return;
-    if (kind === 'light')   navigator.vibrate(8);
-    else if (kind === 'medium') navigator.vibrate(18);
-    else if (kind === 'strong') navigator.vibrate([20, 40, 20]);
   } catch { /* silent */ }
 }
 
@@ -640,30 +600,35 @@ function showToast(message: string, tone: ToastTone = 'default', durationMs = 25
 }
 
 // ---------- Audio lifecycle ----------
-// iOS suspends every AudioContext when the app is backgrounded (or when
-// the screen locks, or when another app starts playing media). Once the
-// app returns to foreground the contexts stay in 'suspended' / 'interrupted'
-// state until something explicitly resumes them. Because resume() is async,
-// the first tap after foregrounding fires .start(0) BEFORE the context
-// actually wakes up, and that buffer source is silently dropped — which
-// matches the "no sound on reopen until I close & reopen the app" symptom.
+// iOS does two annoying things to AudioContexts in a Capacitor WebView:
+//   1. Suspends them when the app is backgrounded, the screen locks, or
+//      another app plays audio. resume() is async, so the first start(0)
+//      after foregrounding fires while the context is still frozen and
+//      the sample is silently dropped — that's the "no sound on reopen
+//      until I close & reopen the app" symptom.
+//   2. Sometimes leaves `state` as 'running' even though the audio clock
+//      is actually frozen (this is the rarer mystery case). Calling
+//      resume() on an already-running context is a no-op, so it's safe
+//      and free to call resume unconditionally on every play. Doing that
+//      bypasses the state-check trap entirely.
 //
-// wakeAllAudio resumes every cached AudioContext we own. Call it on:
-//   - mount (so a fresh load is always playable)
+// wakeAllAudio resumes every cached AudioContext we own. We call it on:
+//   - mount
 //   - visibilitychange when document becomes visible
-//   - pageshow (covers Safari/iOS's bfcache restore path which doesn't
-//     always fire visibilitychange)
-//   - first user pointerdown anywhere (safety net — iOS guarantees a user
-//     gesture lets us resume even if the events above didn't fire)
+//   - pageshow (covers iOS bfcache restore that doesn't fire visibility)
+//   - EVERY user gesture (not just the first one — the once: true that
+//     used to be here meant we never rearmed after a second background
+//     cycle)
 function wakeAllAudio() {
   const ctxs: Array<AudioContext | null> = [
     _audioCtx, _slideAudioCtx, _buttonAudioCtx, _backAudioCtx, _bellAudioCtx,
   ];
   for (const ctx of ctxs) {
     if (!ctx) continue;
-    if (ctx.state === 'suspended' || (ctx.state as string) === 'interrupted') {
-      ctx.resume().catch(() => { /* silent */ });
-    }
+    // resume() is a no-op on already-running contexts, so we don't bother
+    // checking state — the dual nature of iOS's lying state field means
+    // the check itself is unreliable.
+    try { ctx.resume().catch(() => { /* silent */ }); } catch { /* silent */ }
   }
 }
 
@@ -679,12 +644,17 @@ function installAudioLifecycle() {
   };
   document.addEventListener('visibilitychange', onVisible);
   window.addEventListener('pageshow', wakeAllAudio);
-  // First user gesture safety net — once any tap happens, resume contexts
-  // and remove the listener. Capture phase + once: true so we win against
-  // anything that might stopPropagation.
-  const onFirstGesture = () => { wakeAllAudio(); };
-  window.addEventListener('pointerdown', onFirstGesture, { capture: true, once: true });
-  window.addEventListener('touchstart', onFirstGesture, { capture: true, once: true, passive: true } as any);
+  // Every user gesture wakes audio. We deliberately do NOT use `once: true`
+  // because the user backgrounds and re-foregrounds the app multiple times
+  // per session. After any background cycle the next gesture should rearm
+  // audio, not silently fail because the listener already fired earlier.
+  // resume() is cheap on running contexts, so this is effectively free.
+  const onGesture = () => { wakeAllAudio(); };
+  window.addEventListener('pointerdown', onGesture, { capture: true });
+  window.addEventListener('touchstart', onGesture, { capture: true, passive: true } as any);
+  // Also wake on focus — covers the case where the user returns to the app
+  // via the app switcher (some iOS versions don't fire visibilitychange).
+  window.addEventListener('focus', wakeAllAudio);
 }
 
 // ---------- Categories ----------
@@ -3814,7 +3784,16 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack }: {
             ‹
           </button>
           <div style={S.mapHeaderTitle}>
-            <div style={{ ...S.categoryViewTitle, color: WHITE, textShadow: `0 0 14px ${WHITE}cc` }}>
+            <div
+              style={{
+                ...S.categoryViewTitle,
+                fontFamily: '"LivingHell", "Jolly Lodger", system-ui, serif',
+                color: WHITE,
+                textShadow: `0 0 14px ${WHITE}cc, 0 0 28px ${WHITE}66`,
+              }}
+              className="sinister-glitch"
+              data-text="Locations Near Me"
+            >
               Locations Near Me
             </div>
             <div style={S.listSubtitle}>
