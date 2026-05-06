@@ -554,6 +554,11 @@ async function fireNotification(site: SinisterSite): Promise<void> {
           id: hashString(site.id) % 2000000000,
           title: 'The Dread Directory',
           body: `You're near ${site.title}. Tap to see the story.`,
+          // iOS plays notifications silently if `sound` is missing. 'default'
+          // tells iOS to use the system notification sound. Without this,
+          // the banner appears but no audio plays — which is why Drew
+          // never heard one despite notification permission being granted.
+          sound: 'default',
           extra: { siteId: site.id },
           channelId: ANDROID_CHANNEL_ID,
         },

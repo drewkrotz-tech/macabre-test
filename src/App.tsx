@@ -2657,12 +2657,12 @@ function ListView({ sites, currentLocation, onSelectSite, onBack }: {
     _listSwipeBackHook = () => {
       const cur = levelRef.current;
       if (cur.kind === 'sites') {
-        playSubDrop();
+        playBackSound();
         setLevel({ kind: 'states', category: cur.category });
         return true;
       }
       if (cur.kind === 'states') {
-        playSubDrop();
+        playBackSound();
         setLevel({ kind: 'categories' });
         return true;
       }
@@ -2735,7 +2735,7 @@ function ListView({ sites, currentLocation, onSelectSite, onBack }: {
   // In-component back: at level 3 -> level 2, at level 2 -> level 1, at
   // level 1 -> close the whole ListView (delegate to onBack from parent).
   const goBackInternal = () => {
-    playSubDrop();
+    playBackSound();
     if (level.kind === 'sites') {
       setLevel({ kind: 'states', category: level.category });
     } else if (level.kind === 'states') {
