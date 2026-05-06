@@ -432,7 +432,11 @@ function playSubDrop() {
     osc.frequency.setValueAtTime(140, now);
     osc.frequency.exponentialRampToValueAtTime(45, now + 0.18);
     gain.gain.setValueAtTime(0, now);
-    gain.gain.linearRampToValueAtTime(0.22, now + 0.01);
+    // Bumped from 0.22 to 0.55 at Drew's request — Sub Drop was too quiet
+    // against ambient room/phone-speaker noise. 0.55 sits comfortably below
+    // 1.0 to leave headroom against any concurrent UI sounds (back/bell)
+    // without clipping the iOS speaker.
+    gain.gain.linearRampToValueAtTime(0.55, now + 0.01);
     gain.gain.exponentialRampToValueAtTime(0.001, now + 0.22);
     osc.connect(gain);
     gain.connect(ctx.destination);
@@ -2277,11 +2281,12 @@ function HomeBottomBar({ onLeaders, onList, onAbout, onNearby }: {
         <button
           style={{ ...S.socialBtn, ...(moreOpen ? S.socialBtnActive : {}) }}
           onClick={() => {
-            // Ghost Wisp on OPEN (menu appearing), Sub Drop on CLOSE
-            // (menu dismissed) — gives the user a distinct audible cue
-            // for "something appeared" vs. "I'm tucking it away."
+            // OPEN plays the run-home/back sound; CLOSE plays Sub Drop
+            // (matches the rest of the bottom bar). The asymmetry gives
+            // the user an audible cue that "the menu just appeared" vs
+            // "I'm dismissing the menu."
             if (moreOpen) playSubDrop();
-            else playGhostWisp();
+            else playBackSound();
             setMoreOpen(v => !v);
           }}
         >
@@ -2652,12 +2657,12 @@ function ListView({ sites, currentLocation, onSelectSite, onBack }: {
     _listSwipeBackHook = () => {
       const cur = levelRef.current;
       if (cur.kind === 'sites') {
-        playBackSound();
+        playSubDrop();
         setLevel({ kind: 'states', category: cur.category });
         return true;
       }
       if (cur.kind === 'states') {
-        playBackSound();
+        playSubDrop();
         setLevel({ kind: 'categories' });
         return true;
       }
@@ -2730,7 +2735,7 @@ function ListView({ sites, currentLocation, onSelectSite, onBack }: {
   // In-component back: at level 3 -> level 2, at level 2 -> level 1, at
   // level 1 -> close the whole ListView (delegate to onBack from parent).
   const goBackInternal = () => {
-    playBackSound();
+    playSubDrop();
     if (level.kind === 'sites') {
       setLevel({ kind: 'states', category: level.category });
     } else if (level.kind === 'states') {
@@ -2773,7 +2778,7 @@ function ListView({ sites, currentLocation, onSelectSite, onBack }: {
           {query && (
             <button
               style={S.searchClear}
-              onClick={() => { playButton(); setQuery(''); }}
+              onClick={() => { playSubDrop(); setQuery(''); }}
               aria-label="Clear search"
             >
               ✕
@@ -2804,7 +2809,7 @@ function ListView({ sites, currentLocation, onSelectSite, onBack }: {
                   <button
                     key={cat.key}
                     style={{ ...S.listCategoryRow, borderColor: `${color}55`, boxShadow: `0 0 10px ${color}22, inset 0 0 6px ${color}11` }}
-                    onClick={() => { playForward(); setLevel({ kind: 'states', category: cat.key }); }}
+                    onClick={() => { playSubDrop(); setLevel({ kind: 'states', category: cat.key }); }}
                   >
                     <span style={{ ...S.listRowDot, background: color, boxShadow: `0 0 6px ${color}` }} />
                     <span style={{ ...S.listRowTitle, color, textShadow: `0 0 8px ${color}88` }}>{cat.label}</span>
@@ -2829,7 +2834,7 @@ function ListView({ sites, currentLocation, onSelectSite, onBack }: {
                   <button
                     key={state}
                     style={S.listRow}
-                    onClick={() => { playForward(); setLevel({ kind: 'sites', category: level.category, state }); }}
+                    onClick={() => { playSubDrop(); setLevel({ kind: 'sites', category: level.category, state }); }}
                   >
                     <span style={{ ...S.listRowDot, background: color, boxShadow: `0 0 6px ${color}` }} />
                     <span style={S.listRowTitle}>{state}</span>
@@ -2854,7 +2859,7 @@ function ListView({ sites, currentLocation, onSelectSite, onBack }: {
                   <button
                     key={site.id}
                     style={S.listRow}
-                    onClick={() => { playForward(); onSelectSite(site); }}
+                    onClick={() => { playSubDrop(); onSelectSite(site); }}
                   >
                     <span style={{ ...S.listRowDot, background: color, boxShadow: `0 0 6px ${color}` }} />
                     <span style={S.listRowTitle}>{site.title}</span>
