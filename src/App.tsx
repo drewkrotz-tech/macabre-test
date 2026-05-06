@@ -5435,7 +5435,7 @@ const S: Record<string, React.CSSProperties> = {
     // controls the gap below BY SINISTER. The filmstrip below is itself
     // position: fixed so it doesn't care how tall this banner is.
     position: 'relative',
-    marginTop: 18,
+    marginTop: 0,
     backgroundColor: 'rgba(10,10,10,0.55)',
     border: `1px solid ${SINISTER_RED}55`,
     borderRadius: 10,
