@@ -907,11 +907,11 @@ function buildStyleCss() {
 @keyframes sinister-spotlight-pulse {
   0%, 100% {
     box-shadow: 0 0 14px rgba(193, 43, 43, 0.2), 0 0 4px rgba(10, 10, 10, 0.6);
-    transform: translateX(-50%) scale(1);
+    transform: scale(1);
   }
   50% {
     box-shadow: 0 0 26px rgba(193, 43, 43, 0.4), 0 0 8px rgba(10, 10, 10, 0.6);
-    transform: translateX(-50%) scale(1.015);
+    transform: scale(1.015);
   }
 }
 
@@ -2081,7 +2081,7 @@ export default function App() {
           DetailView is excluded because the page already has Get Directions
           + Claim Visit as its primary actions; layering the bottom bar on
           top makes the page feel busy and competes with those CTAs. */}
-      {view.name !== 'nearby' && view.name !== 'detail' && (
+      {view.name !== 'nearby' && view.name !== 'detail' && view.name !== 'submit' && (
         <HomeBottomBar
           onLeaders={goLeaders}
           onList={goList}
@@ -5428,21 +5428,17 @@ const S: Record<string, React.CSSProperties> = {
   // clearance above for the title block too.
   // Width is left/right margin-bound so it never overlaps the cell.
   latestSpotlight: {
-    position: 'absolute',
-    // Anchor spotlight in the gap between BY SINISTER and the top of the
-    // centered cell. The cell is roughly 330px tall and centered on the
-    // viewport, so its TOP edge is at ~(50% - 165px). With the tightened
-    // padding/margins below the spotlight is ~52–55px tall, so
-    // (50% - 230px) puts the spotlight's BOTTOM at ~(50% - 178px),
-    // leaving ~13px of breathing room above the cell.
-    top: 'calc(50% - 230px)',
-    left: '50%',
-    transform: 'translateX(-50%)',
+    // Natural flex-flow positioning: this sits as a flex child between
+    // homeFilmHeader (title block) and homeReelCenter (filmstrip), inside
+    // homeReelGroup. It claims its own vertical slot in the column flex
+    // layout instead of fighting absolute-position math. Margin-top
+    // controls the gap below BY SINISTER. The filmstrip below is itself
+    // position: fixed so it doesn't care how tall this banner is.
+    position: 'relative',
+    marginTop: 18,
     backgroundColor: 'rgba(10,10,10,0.55)',
     border: `1px solid ${SINISTER_RED}55`,
     borderRadius: 10,
-    // Tightened from '8px 18px'. Padding does most of the height-trim
-    // work since fonts can't go lower without becoming unreadable.
     padding: '4px 16px',
     minWidth: 220,
     maxWidth: '86vw',
@@ -5539,16 +5535,7 @@ const S: Record<string, React.CSSProperties> = {
     top: 0,
     left: 0,
     right: 0,
-    // Real height so absolutely-positioned children (the latest-
-    // submission spotlight) can resolve `top: calc(50% - Npx)` against
-    // something other than 0. Without bottom: 0 here, the container
-    // collapses to 0 height and the spotlight ends up at top: -175px,
-    // off-screen. pointerEvents: 'none' so this full-viewport container
-    // doesn't intercept taps meant for elements outside it (e.g. the
-    // submit button below); each child that needs clicks (filmstrip,
-    // spotlight) sets pointerEvents: 'auto' on itself.
-    bottom: 0,
-    pointerEvents: 'none',
+    pointerEvents: 'auto',
     display: 'flex',
     flexDirection: 'column',
     alignItems: 'center',
