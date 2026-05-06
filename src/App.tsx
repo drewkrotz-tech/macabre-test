@@ -215,6 +215,12 @@ async function apiGetBadges(handle: string): Promise<{ badges: BadgeRow[]; submi
 //
 // The app's SinisterSite type uses `imageUrl`, so we map photoUrl -> imageUrl
 // here. We also fill imageCredit with the submitter handle for attribution.
+//
+// Submitter and approvedAt are passed through as extra fields on each site
+// object so the detail page can render a "Submitted by @x · date" credit.
+// These aren't in the base SinisterSite type imported from ./locations
+// (which is the bundled-fallback shape), so we cast — at runtime the
+// fields are present whenever the server returns them.
 async function fetchLiveSites(): Promise<SinisterSite[]> {
   try {
     const res = await fetch(`${API_BASE}/sites`, {
@@ -234,7 +240,13 @@ async function fetchLiveSites(): Promise<SinisterSite[]> {
       coords: s.coords,
       imageUrl: s.photoUrl || s.imageUrl || '',
       imageCredit: s.submitter ? `@${s.submitter}` : 'Sinister Locations',
-    }));
+      // Pass-through fields for detail-page submitter credit. Optional —
+      // legacy seeded sites may not have them; the detail page handles
+      // both cases (shows "Submitted by Sinister" if submitter missing,
+      // omits the date if approvedAt missing).
+      submitter: s.submitter || null,
+      approvedAt: s.approvedAt || null,
+    } as SinisterSite & { submitter: string | null; approvedAt: string | null }));
   } catch (err) {
     console.warn('[app] Failed to fetch live sites; using bundled fallback.', err);
     return [];
@@ -261,46 +273,31 @@ const SINISTER_RED = '#C12B2B';
 //   back    (run home):  a chain-rattle whoosh — filtered white noise burst
 //                        with a quick decay envelope
 // ---------- Audio system ----------
-// ONE AudioContext for the whole app. Previously each sound (slide, button,
-// back, bell, plus the synth-based ones) created its own AudioContext, which
-// hit two iOS bugs hard:
-//   1. Safari/WKWebView caps the number of AudioContexts an app can create.
-//      Hitting the cap silently fails — that's what made "sometimes opening
-//      the app means no sound" — some contexts unlocked, others didn't, and
-//      which subset succeeded was non-deterministic.
-//   2. Each context needed its own user-gesture unlock + its own resume()
-//      after iOS suspended the WebView (returning to the app, locking the
-//      screen, taking a call). Nothing in the old code re-resumed contexts
-//      on foreground, so they'd silently die between sessions.
+// ONE AudioContext for the whole app. All file-based sounds (slide, button,
+// back, bell) and synth sounds (playForward, playPop, playSubDrop,
+// playGhostWisp) share it, each with its own GainNode for volume control.
 //
-// Why "no sound until I close & reopen the app twice" specifically:
-//   AudioContexts created BEFORE any user gesture are born in 'suspended'
-//   state and stay that way until you call resume() inside a gesture event
-//   handler. Pre-creating the context on App mount, then calling resume()
-//   on visibilitychange, is NOT enough — iOS only honors resume() if it's
-//   inside a touch/click handler. So on cold app launch:
-//     1. App mounts, context created suspended
-//     2. User taps a button. The touchstart listener calls resume()
-//        (returns a Promise; not yet resolved).
-//     3. React onClick fires SAME tick. ctx.state is still 'suspended'.
-//        The sound's start(0) fires on a suspended context — silently
-//        dropped.
-//     4. Resume completes a moment later. Context is now running, but
-//        the sound the user wanted to hear was already lost.
-//   Closing+reopening "fixed" it because next launch had a context that
-//   somehow survived in running state (or the second launch happened to
-//   tap fast enough that resume completed before onClick). Non-deterministic.
+// History: the app used to create FIVE separate AudioContexts (one per
+// sound family). Safari/WKWebView caps the number of contexts an app can
+// create, so the 5th sometimes silently failed — that's what made
+// "sometimes opening the app means no sound" non-deterministic. Single
+// shared context fixes that.
 //
-// The proper iOS unlock dance:
-//   On the FIRST user gesture, we create the context AND immediately play
-//   a silent zero-duration buffer SYNCHRONOUSLY inside the gesture handler.
-//   That silent buffer counts as audio playback INSIDE a user gesture,
-//   which is what iOS actually requires to unlock. After this, ctx.state
-//   is 'running' and any subsequent .start() calls work — including the
-//   one from the React onClick that's about to fire on the same tap.
+// On iOS first-tap-silence:
+//   iOS requires audio playback to happen inside a user-gesture handler
+//   to unlock the AudioContext. The standard workaround is to play a
+//   silent 1-sample buffer inside the first gesture so the first real
+//   sound isn't sacrificed — but that "silent unlock buffer" was
+//   instead silencing Drew's actual first tap (it occupied the slot the
+//   real sound wanted). Per Drew's prior trivia app experience,
+//   TestFlight may artificially silence the first audio play on cold
+//   launch in a way production App Store builds don't. So we keep
+//   things simple: just resume() the context on every use and on
+//   foreground transitions. If iOS swallows the first sound on cold
+//   launch in TestFlight, we live with it; production behavior may
+//   differ.
 
 let _audioCtx: AudioContext | null = null;
-let _audioUnlocked = false;
 let _audioUnlockInstalled = false;
 
 function getAudioCtx(): AudioContext | null {
@@ -314,80 +311,28 @@ function getAudioCtx(): AudioContext | null {
       return null;
     }
   }
+  // resume() is a no-op if the context is already running. Safe to call
+  // every time we hand out the context. Inside a real user gesture event
+  // handler (which is where the play* functions are called from), this
+  // is what unlocks iOS audio.
+  if (_audioCtx.state === 'suspended') {
+    _audioCtx.resume().catch(() => { /* silent */ });
+  }
   return _audioCtx;
 }
 
-// Performs the iOS unlock dance: ensure context exists, resume if suspended,
-// then play a 1-sample silent buffer to flush iOS's gesture-required lock.
-// Must be called INSIDE a real user-gesture event handler (touchstart,
-// pointerdown, click). Calling from a setTimeout, fetch callback, or
-// useEffect does NOT count as a user gesture on iOS.
-function unlockAudio() {
-  const ctx = getAudioCtx();
-  if (!ctx) return;
-  // resume() on a fresh context is a no-op if state is already 'running',
-  // and is the "iOS please honor this" signal if it's 'suspended'.
-  if (ctx.state === 'suspended') {
-    ctx.resume().catch(() => { /* silent */ });
-  }
-  // Silent buffer trick — this is what actually unlocks iOS audio.
-  // A 1-sample buffer at any sample rate is enough; iOS just needs
-  // .start(0) to be called inside the gesture handler.
-  try {
-    const buf = ctx.createBuffer(1, 1, 22050);
-    const src = ctx.createBufferSource();
-    src.buffer = buf;
-    src.connect(ctx.destination);
-    src.start(0);
-    _audioUnlocked = true;
-  } catch { /* silent */ }
-}
-
-// Install a one-time global unlock that fires on the very first user
-// interaction. Capture phase + the listener registered first means it
-// runs BEFORE any React onClick on the same gesture, so by the time
-// the onClick's play* call hits, ctx.state is already 'running' and
-// the sound plays as expected.
+// Install a global lifecycle handler that resumes the AudioContext on
+// every foreground transition (visibility / focus / pageshow). This
+// keeps audio working when the user comes back to the app from the
+// home screen, the lock screen, or a phone call.
 //
-// Also resumes on every foreground transition (visibility/focus/pageshow)
-// to recover from iOS suspending the WebView (background, lock screen,
-// phone call). Note: iOS only requires the gesture-bound unlock ONCE
-// per page load; subsequent resumes from visibility events work even
-// without a gesture, as long as the original gesture-bound unlock
-// happened first.
+// Importantly we do NOT play a silent buffer here. That was the previous
+// approach and it was muting the user's first real sound by occupying
+// the audio slot. Just resume() — that's enough for iOS.
 function installAudioUnlock() {
   if (_audioUnlockInstalled || typeof window === 'undefined') return;
   _audioUnlockInstalled = true;
 
-  const onFirstGesture = () => {
-    unlockAudio();
-  };
-  // capture: true so we run before React's bubble-phase onClick handlers.
-  // Not `once: true` — we re-attach the gesture lock on every gesture
-  // until ctx is confirmed unlocked, in case the very first gesture's
-  // unlock attempt fails (iOS can be flaky under load on cold start).
-  const opts: AddEventListenerOptions = { capture: true, passive: true };
-  const wrappedHandler = () => {
-    onFirstGesture();
-    if (_audioUnlocked && _audioCtx && _audioCtx.state === 'running') {
-      // Successfully unlocked; remove listeners.
-      window.removeEventListener('touchstart', wrappedHandler, opts);
-      window.removeEventListener('touchend', wrappedHandler, opts);
-      window.removeEventListener('pointerdown', wrappedHandler, opts);
-      window.removeEventListener('mousedown', wrappedHandler, opts);
-      window.removeEventListener('keydown', wrappedHandler, opts);
-    }
-  };
-  window.addEventListener('touchstart', wrappedHandler, opts);
-  window.addEventListener('touchend', wrappedHandler, opts);
-  window.addEventListener('pointerdown', wrappedHandler, opts);
-  window.addEventListener('mousedown', wrappedHandler, opts);
-  window.addEventListener('keydown', wrappedHandler, opts);
-
-  // Resume on every foreground transition. Once the initial gesture-
-  // unlock has happened, these resume() calls succeed without needing
-  // another gesture — iOS only requires the very first unlock to be
-  // gesture-bound.
   const resumeOnReturn = () => {
     const ctx = _audioCtx;
     if (ctx && ctx.state === 'suspended') {
@@ -911,6 +856,22 @@ function buildStyleCss() {
   }
   50% {
     transform: scale(1.08);
+  }
+}
+
+/* Spotlight pulse — gentle box-shadow + opacity breathing for the
+   "Latest Submission" banner on the home page. Centered scale included
+   so the badge breathes subtly without shifting the surrounding layout
+   (it's absolutely positioned, so a 1.5% scale doesn't disturb anything).
+   Slow 4.5s cycle so it reads as ambient rather than attention-grabbing. */
+@keyframes sinister-spotlight-pulse {
+  0%, 100% {
+    box-shadow: 0 0 14px ${SINISTER_RED}33, 0 0 4px ${BLACK}99;
+    transform: translateX(-50%) scale(1);
+  }
+  50% {
+    box-shadow: 0 0 26px ${SINISTER_RED}66, 0 0 8px ${BLACK}99;
+    transform: translateX(-50%) scale(1.015);
   }
 }
 
@@ -1913,6 +1874,7 @@ export default function App() {
           <HomeView
             sites={sites}
             onSelectCategory={goStateList}
+            onSelectSite={goDetail}
             onSubmit={goSubmit}
             onAbout={goAbout}
             onLeaders={goLeaders}
@@ -2921,9 +2883,11 @@ function ListView({ sites, currentLocation, onSelectSite, onBack }: {
         ) : level.kind === 'categories' ? (
           // ---- Level 1: Categories ----
           categoryRows.length === 0 ? (
-            <p style={S.aboutPara}>
-              No matches for "{query}". Try a different search.
-            </p>
+            <div style={S.emptyState}>
+              <div style={S.emptyStateIcon}>🔍</div>
+              <div style={S.emptyStateTitle}>Nothing matches</div>
+              <div style={S.emptyStateBody}>No categories match "{query}". Try a different search.</div>
+            </div>
           ) : (
             <div style={S.listSitesWrap}>
               {categoryRows.map(({ cat, count }) => {
@@ -2946,9 +2910,11 @@ function ListView({ sites, currentLocation, onSelectSite, onBack }: {
         ) : level.kind === 'states' ? (
           // ---- Level 2: States ----
           stateRows.length === 0 ? (
-            <p style={S.aboutPara}>
-              No matches for "{query}" in this category.
-            </p>
+            <div style={S.emptyState}>
+              <div style={S.emptyStateIcon}>🔍</div>
+              <div style={S.emptyStateTitle}>Nothing matches</div>
+              <div style={S.emptyStateBody}>No states match "{query}" in this category.</div>
+            </div>
           ) : (
             <div style={S.listSitesWrap}>
               {(() => {
@@ -2971,9 +2937,15 @@ function ListView({ sites, currentLocation, onSelectSite, onBack }: {
         ) : (
           // ---- Level 3: Sites ----
           siteRows.length === 0 ? (
-            <p style={S.aboutPara}>
-              No matches for "{query}" in this state.
-            </p>
+            <div style={S.emptyState}>
+              <div style={S.emptyStateIcon}>🕯</div>
+              <div style={S.emptyStateTitle}>Nothing here yet</div>
+              <div style={S.emptyStateBody}>
+                {query
+                  ? `No sites match "${query}" in this state.`
+                  : `No sites in this state yet. Submit one to be the first.`}
+              </div>
+            </div>
           ) : (
             <div style={S.listSitesWrap}>
               {(() => {
@@ -3022,9 +2994,65 @@ function SocialBar({ onAbout, flow }: { onAbout: () => void; flow?: boolean }) {
 }
 
 // ---------- HOME ----------
-function HomeView({ sites, onSelectCategory, onSubmit, onAbout, onLeaders, onList, onNearby }: {
+// ---------- Latest Submission Spotlight ----------
+// Small banner shown on the home screen between BY SINISTER and the
+// filmstrip cell, recognizing the most recently approved submission.
+// Tappable — goes straight to that site's detail page.
+//
+// Picks the site with the most recent `approvedAt` timestamp. Falls
+// back to the first site in the list if none have approvedAt set
+// (e.g. seeded sites that predate the submission flow).
+//
+// Positioned absolutely inside homeReelGroup so it sits in the existing
+// gap between the title block and the highlighted cell, without
+// affecting either's layout. If you ever shift the filmstrip vertically
+// or change the title height, the `top` value below may need to slide.
+function LatestSubmissionSpotlight({ sites, onSelectSite }: {
+  sites: SinisterSite[];
+  onSelectSite: (site: SinisterSite) => void;
+}) {
+  // Pick the most recent approved submission. We treat `approvedAt` as
+  // the source of truth; sites without it (legacy seeded ones) sort to
+  // the bottom and only show as a fallback if nothing else is available.
+  const latest = useMemo(() => {
+    if (!sites || sites.length === 0) return null;
+    const withDate = sites.filter(s => {
+      const a = (s as any).approvedAt;
+      return typeof a === 'string' && a.length > 0;
+    });
+    if (withDate.length > 0) {
+      const sorted = [...withDate].sort((a, b) => {
+        const ad = new Date((a as any).approvedAt).getTime();
+        const bd = new Date((b as any).approvedAt).getTime();
+        return bd - ad;
+      });
+      return sorted[0];
+    }
+    // No site has approvedAt — fall back to first in the list.
+    return sites[0];
+  }, [sites]);
+
+  if (!latest) return null;
+
+  const submitter = (latest as any).submitter || 'Sinister';
+
+  return (
+    <button
+      onClick={() => { playSubDrop(); onSelectSite(latest); }}
+      style={S.latestSpotlight}
+      aria-label={`Latest submission: ${latest.title} by ${submitter}`}
+    >
+      <div style={S.latestSpotlightLabel}>LATEST SUBMISSION</div>
+      <div style={S.latestSpotlightTitle}>{latest.title}</div>
+      <div style={S.latestSpotlightBy}>BY <span style={S.latestSpotlightHandle}>@{submitter}</span></div>
+    </button>
+  );
+}
+
+function HomeView({ sites, onSelectCategory, onSelectSite, onSubmit, onAbout, onLeaders, onList, onNearby }: {
   sites: SinisterSite[];
   onSelectCategory: (key: CategoryKey) => void;
+  onSelectSite: (site: SinisterSite) => void;
   onSubmit: () => void;
   onAbout: () => void;
   onLeaders: () => void;
@@ -3226,6 +3254,11 @@ function HomeView({ sites, onSelectCategory, onSubmit, onAbout, onLeaders, onLis
             <div style={{ ...S.titleStackBottom, fontFamily: '"LivingHell", "Jolly Lodger", system-ui, serif' }} className="sinister-glitch" data-text="Directory">Directory</div>
             <div style={S.bySinister}><BySinister /></div>
           </div>
+
+          {/* Latest submission spotlight. Absolutely positioned in the
+              gap between the title block above and the filmstrip below,
+              so it doesn't shift either. */}
+          <LatestSubmissionSpotlight sites={sites} onSelectSite={onSelectSite} />
 
           <div style={S.homeReelCenter}>
             <div style={S.filmstripOuter}>
@@ -4444,17 +4477,16 @@ function CategoryView({ label, color, sites, currentLocation, onSelectSite, onSu
               <div ref={scrollRef} style={S.filmstripWrap}>
                 <div style={S.filmstripFrames}>
                 {sequenceLength === 0 ? (
-                  <div style={{
-                    color: '#bbb',
-                    fontFamily: '"Lucida Console", monospace',
-                    fontSize: 14,
-                    textAlign: 'center',
-                    padding: '40px 20px',
-                    opacity: 0.7,
-                  }}>
-                    {sites.length === 0
-                      ? 'No locations submitted yet.'
-                      : `No locations match "${query}".`}
+                  <div style={S.emptyState}>
+                    <div style={S.emptyStateIcon}>🕯</div>
+                    <div style={S.emptyStateTitle}>
+                      {sites.length === 0 ? 'No sites here yet' : 'Nothing matches'}
+                    </div>
+                    <div style={S.emptyStateBody}>
+                      {sites.length === 0
+                        ? `No ${label.toLowerCase()} have been catalogued yet. Be the first — submit a location below.`
+                        : `Nothing matches "${query}". Try a different search.`}
+                    </div>
                   </div>
                 ) : cellsLooped.map((entry) => (
                   <button
@@ -4471,7 +4503,16 @@ function CategoryView({ label, color, sites, currentLocation, onSelectSite, onSu
                   >
                     <div style={S.filmFrameOverlay} />
                     <div style={S.filmFrameContent}>
-                      <div style={S.filmFrameLabel}>{entry.site.title}</div>
+                      {/* Most site titles look great at the full 48pt
+                          home-style font. But long submissions like
+                          "The Cavalier Hotel & Beach Club Resort" would
+                          overflow at 48pt — for those we drop to a
+                          smaller (36pt) variant that wraps to 2 lines.
+                          Threshold is character-count; tuned by eye to
+                          where 48pt starts looking cramped. */}
+                      <div style={entry.site.title.length > 22 ? S.filmFrameLabelSite : S.filmFrameLabel}>
+                        {entry.site.title}
+                      </div>
                       <div style={S.filmFrameCount}>
                         {entry.site.state}
                       </div>
@@ -4660,6 +4701,31 @@ function DetailView({ site, currentLocation, handle, deviceId, alreadyVisited, o
           {site.title}
         </div>
         {distMi && <div style={{ ...S.detailDistance, color: color }}>📍 {distMi} mi from you</div>}
+        {/* Submitter credit — recognizes the person who added this site to
+            the catalog. Submitting takes more effort than visiting, so the
+            credit sits prominently right under the title/distance, before
+            the description. Falls back to "Sinister" for legacy seeded
+            sites that don't have a submitter field stored. */}
+        {(() => {
+          const s = site as SinisterSite & { submitter?: string | null; approvedAt?: string | null };
+          const submitter = s.submitter || 'Sinister';
+          let dateStr = '';
+          if (s.approvedAt) {
+            try {
+              const d = new Date(s.approvedAt);
+              if (!isNaN(d.getTime())) {
+                dateStr = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+              }
+            } catch { /* silent */ }
+          }
+          return (
+            <div style={S.detailSubmitterCredit}>
+              <span style={S.detailSubmitterLabel}>Submitted by</span>
+              <span style={S.detailSubmitterHandle}>@{submitter}</span>
+              {dateStr && <span style={S.detailSubmitterDate}> · {dateStr}</span>}
+            </div>
+          );
+        })()}
         <div style={{ ...S.detailDivider, backgroundColor: SUBMIT_RED, boxShadow: `0 0 12px ${SUBMIT_RED}` }} />
         <div style={S.detailDescription}>
           {(site.fullDescription || site.shortDescription || '').split('\n\n').map((para, i) => <p key={i} style={S.detailPara}>{para}</p>)}
@@ -5310,6 +5376,73 @@ const S: Record<string, React.CSSProperties> = {
     textShadow: `0 0 8px ${SINISTER_RED}88`,
   },
 
+  // ---------- Latest Submission Spotlight ----------
+  // Sits absolutely-positioned inside homeReelGroup so it doesn't disturb
+  // either the title block (above) or the centered filmstrip (below).
+  // The cell is locked to viewport center via top: 50% on homeReelCenter,
+  // so the cell's TOP edge is at roughly (50vh - 124px) since the cell is
+  // 248px tall. The header bottom (BY SINISTER) sits at roughly 60+title
+  // height down from the top — plenty of clearance from the cell top.
+  // The spotlight goes vertically halfway between those: a top value of
+  // calc(50% - 175px) places it ~50px above the cell with comfortable
+  // clearance above for the title block too.
+  // Width is left/right margin-bound so it never overlaps the cell.
+  latestSpotlight: {
+    position: 'absolute',
+    top: 'calc(50% - 175px)',
+    left: '50%',
+    transform: 'translateX(-50%)',
+    backgroundColor: 'rgba(10,10,10,0.55)',
+    border: `1px solid ${SINISTER_RED}55`,
+    borderRadius: 12,
+    padding: '8px 18px',
+    minWidth: 240,
+    maxWidth: '88vw',
+    cursor: 'pointer',
+    pointerEvents: 'auto',
+    color: BONE,
+    textAlign: 'center' as const,
+    boxShadow: `0 0 18px ${SINISTER_RED}33, 0 0 4px ${BLACK}99`,
+    backdropFilter: 'blur(2px)',
+    zIndex: 3,
+    // Subtle pulsing glow so it draws the eye but isn't garish.
+    animation: 'sinister-spotlight-pulse 4.5s ease-in-out infinite',
+    transformOrigin: 'center center',
+  },
+  latestSpotlightLabel: {
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    fontSize: 9,
+    fontWeight: 700,
+    letterSpacing: '0.32em',
+    color: SINISTER_RED,
+    textShadow: `0 0 8px ${SINISTER_RED}cc`,
+    marginBottom: 3,
+  },
+  latestSpotlightTitle: {
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    fontSize: 14,
+    fontWeight: 700,
+    letterSpacing: '0.06em',
+    color: WHITE,
+    textShadow: `0 0 10px ${WHITE}66, 1px 1px 0 ${BLACK}`,
+    lineHeight: 1.2,
+    overflow: 'hidden' as const,
+    textOverflow: 'ellipsis' as const,
+    whiteSpace: 'nowrap' as const,
+  },
+  latestSpotlightBy: {
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    fontSize: 9,
+    fontWeight: 700,
+    letterSpacing: '0.18em',
+    color: '#8a7f70',
+    marginTop: 3,
+  },
+  latestSpotlightHandle: {
+    color: SINISTER_RED,
+    textShadow: `0 0 6px ${SINISTER_RED}88`,
+  },
+
   // ---------- Filmstrip home layout ----------
   homeFilmHeader: {
     position: 'relative',
@@ -5574,6 +5707,27 @@ const S: Record<string, React.CSSProperties> = {
     animation: 'sinister-cell-title-pulse 3.5s ease-in-out infinite',
     transformOrigin: 'center center',
     display: 'inline-block', // needed for transform on text content
+  },
+  // Variant of filmFrameLabel for site cells in CategoryView. Smaller
+  // base size + 2-line clamp so long site names like "The Cavalier
+  // Hotel & Beach Club Resort" don't overflow. Same font/color/animation
+  // so the visual identity is preserved.
+  filmFrameLabelSite: {
+    fontSize: 36,
+    fontFamily: '"Jolly Lodger", system-ui, serif',
+    color: '#FFFFFF',
+    letterSpacing: '0.03em',
+    lineHeight: 1.05,
+    textShadow: '0 0 14px #000, 0 0 24px rgba(0,0,0,0.85), 1px 1px 0 #000, 2px 2px 6px rgba(0,0,0,0.9)',
+    animation: 'sinister-cell-title-pulse 3.5s ease-in-out infinite',
+    transformOrigin: 'center center',
+    display: '-webkit-box' as any,
+    WebkitLineClamp: 2,
+    WebkitBoxOrient: 'vertical' as any,
+    overflow: 'hidden' as const,
+    maxWidth: '90%',
+    padding: '0 8px',
+    boxSizing: 'border-box' as const,
   },
   filmFrameCount: {
     fontSize: 12,
@@ -6050,6 +6204,40 @@ const S: Record<string, React.CSSProperties> = {
     margin: '0 auto',
   },
   aboutPara: { fontSize: 14, lineHeight: 1.6, marginBottom: 14 },
+
+  // Empty state — used when a list/grid has zero results to show. Shared
+  // across CategoryView (no sites in category yet, or search filtered to
+  // nothing) and ListView (every level's empty case). Centered with a
+  // small icon, a strong title, and a helpful body line so empty screens
+  // never feel broken.
+  emptyState: {
+    display: 'flex',
+    flexDirection: 'column' as const,
+    alignItems: 'center',
+    textAlign: 'center' as const,
+    padding: '60px 28px',
+    gap: 10,
+  },
+  emptyStateIcon: {
+    fontSize: 38,
+    opacity: 0.55,
+    filter: 'grayscale(0.3)',
+  },
+  emptyStateTitle: {
+    fontSize: 17,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    fontWeight: 700,
+    letterSpacing: '0.18em',
+    textTransform: 'uppercase' as const,
+    color: '#cfc6b6',
+  },
+  emptyStateBody: {
+    fontSize: 13,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    color: '#8a7f70',
+    lineHeight: 1.55,
+    maxWidth: 320,
+  },
   // Section divider for the About page — small caps banner with a thin
   // underline. Used to separate the How-To content from the brand /
   // submission policy blurb so the page scans cleanly without feeling like
@@ -6438,6 +6626,37 @@ const S: Record<string, React.CSSProperties> = {
   detailCategory: { fontSize: 12, letterSpacing: '0.2em', fontWeight: 700, marginBottom: 10 },
   detailTitle: { fontSize: 56, fontWeight: 400, fontFamily: '"Jolly Lodger", system-ui, serif', lineHeight: 1.05, marginBottom: 14, color: BONE, letterSpacing: '0.03em' },
   detailDistance: { fontSize: 13, fontWeight: 700, marginBottom: 18, letterSpacing: '0.15em' },
+  // Submitter credit row — sits between distance and divider. Subtle
+  // (smaller, less saturated) so it doesn't compete with the title for
+  // attention but is visible enough that submitters feel recognized.
+  detailSubmitterCredit: {
+    fontSize: 12,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    color: '#9a8d7a',
+    marginTop: -8,
+    marginBottom: 14,
+    letterSpacing: '0.08em',
+    display: 'flex',
+    alignItems: 'baseline',
+    gap: 6,
+    flexWrap: 'wrap' as const,
+  },
+  detailSubmitterLabel: {
+    fontWeight: 400,
+    color: '#7a6f5e',
+    textTransform: 'uppercase' as const,
+    fontSize: 10,
+    letterSpacing: '0.18em',
+  },
+  detailSubmitterHandle: {
+    fontWeight: 700,
+    color: SUBMIT_RED,
+    textShadow: `0 0 10px ${SUBMIT_RED}66`,
+  },
+  detailSubmitterDate: {
+    color: '#7a6f5e',
+    fontWeight: 400,
+  },
   detailDivider: { height: 2, margin: '18px 0', borderRadius: 2 },
   detailDescription: { fontSize: 15, lineHeight: 1.65, color: BONE },
   detailPara: { marginBottom: 16 },
