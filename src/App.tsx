@@ -1078,7 +1078,7 @@ function buildStyleCss() {
    - The native iOS overlay scrollbar (this is the thin grey one
      that briefly appears during scroll). It can't be hidden via
      CSS in all iOS versions, but recent versions DO honor
-     `scrollbar-width: none` on the scrolling element. */
+     scrollbar-width: none on the scrolling element. */
 body[data-view="detail"]::-webkit-scrollbar,
 body[data-view="about"]::-webkit-scrollbar,
 body[data-view="leaders"]::-webkit-scrollbar,
