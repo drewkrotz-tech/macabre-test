@@ -514,24 +514,51 @@ interface FileSoundSlot {
   rawBytes: ArrayBuffer | null;
   fetchStarted: boolean;
   initStarted: boolean;
+  // True if the user has already tapped to play this sound but the buffer
+  // wasn't decoded yet. When decode completes, we fire one play immediately
+  // so the first tap on cold launch isn't silently swallowed.
+  pendingPlay: boolean;
 }
 
 const _fileSounds: Record<'slide' | 'button' | 'back' | 'bell', FileSoundSlot> = {
-  slide:  { url: slideSound1, volume: SLIDE_VOLUME,  buffer: null, gain: null, rawBytes: null, fetchStarted: false, initStarted: false },
-  button: { url: buttonSound, volume: BUTTON_VOLUME, buffer: null, gain: null, rawBytes: null, fetchStarted: false, initStarted: false },
-  back:   { url: backSound,   volume: BACK_VOLUME,   buffer: null, gain: null, rawBytes: null, fetchStarted: false, initStarted: false },
-  bell:   { url: bellSound,   volume: BELL_VOLUME,   buffer: null, gain: null, rawBytes: null, fetchStarted: false, initStarted: false },
+  slide:  { url: slideSound1, volume: SLIDE_VOLUME,  buffer: null, gain: null, rawBytes: null, fetchStarted: false, initStarted: false, pendingPlay: false },
+  button: { url: buttonSound, volume: BUTTON_VOLUME, buffer: null, gain: null, rawBytes: null, fetchStarted: false, initStarted: false, pendingPlay: false },
+  back:   { url: backSound,   volume: BACK_VOLUME,   buffer: null, gain: null, rawBytes: null, fetchStarted: false, initStarted: false, pendingPlay: false },
+  bell:   { url: bellSound,   volume: BELL_VOLUME,   buffer: null, gain: null, rawBytes: null, fetchStarted: false, initStarted: false, pendingPlay: false },
 };
+
+// Internal: actually fire a buffer source for a slot. Caller is responsible
+// for ensuring slot.buffer + slot.gain are non-null before calling.
+function _fireFileSound(key: 'slide' | 'button' | 'back' | 'bell') {
+  const slot = _fileSounds[key];
+  const ctx = _audioCtx;
+  if (!ctx || !slot.buffer || !slot.gain) return;
+  try {
+    const src = ctx.createBufferSource();
+    src.buffer = slot.buffer;
+    src.connect(slot.gain);
+    src.start(0);
+  } catch { /* silent */ }
+}
 
 // Phase 1: fetch the raw audio bytes. Doesn't need AudioContext, can run
 // at any time including app boot before any user gesture. Idempotent.
+// If a play was queued while we were fetching, kick off the decode chain
+// (which will fire the queued play when it completes).
 function prefetchFileSound(key: 'slide' | 'button' | 'back' | 'bell') {
   const slot = _fileSounds[key];
   if (slot.fetchStarted) return;
   slot.fetchStarted = true;
   fetch(slot.url)
     .then(r => r.arrayBuffer())
-    .then(ab => { slot.rawBytes = ab; })
+    .then(ab => {
+      slot.rawBytes = ab;
+      // If the user already tapped while we were fetching, advance to
+      // decode now. ensureFileSound is a no-op if AudioContext isn't
+      // unlocked yet, in which case the next tap (which will unlock it)
+      // will pick this up.
+      if (slot.pendingPlay) ensureFileSound(key);
+    })
     .catch(() => { slot.fetchStarted = false; /* allow retry */ });
 }
 
@@ -551,6 +578,11 @@ if (typeof window !== 'undefined') {
 
 // Phase 2: decode the bytes into an AudioBuffer + create the GainNode.
 // Requires AudioContext, runs lazily on first play (post-unlock).
+// If a play is queued (pendingPlay), fire it the moment decode resolves —
+// this is what fixes cold-launch first-tap-silent: the user's first tap
+// unlocks the context and triggers ensureFileSound, and even though the
+// buffer isn't ready synchronously, we still play it ~few-hundred-ms
+// later instead of swallowing it.
 function ensureFileSound(key: 'slide' | 'button' | 'back' | 'bell') {
   const slot = _fileSounds[key];
   if (slot.initStarted) return;
@@ -560,7 +592,8 @@ function ensureFileSound(key: 'slide' | 'button' | 'back' | 'bell') {
   const ctx = getAudioCtx();
   if (!ctx) return;
   // Need the raw bytes to decode. If they haven't arrived yet, leave
-  // initStarted=false and try again on next play.
+  // initStarted=false; the prefetch resolver will call us back when bytes
+  // arrive (provided pendingPlay is set).
   if (!slot.rawBytes) return;
   slot.initStarted = true;
   try {
@@ -574,6 +607,12 @@ function ensureFileSound(key: 'slide' | 'button' | 'back' | 'bell') {
       .then(buf => {
         slot.buffer = buf;
         slot.rawBytes = null; // free the raw bytes once decoded
+        // Fire the queued play, if any. Once consumed, clear the flag
+        // so we don't re-fire on every subsequent tap.
+        if (slot.pendingPlay) {
+          slot.pendingPlay = false;
+          _fireFileSound(key);
+        }
       })
       .catch(() => { slot.initStarted = false; /* allow retry */ });
   } catch { /* silent */ }
@@ -584,24 +623,21 @@ function playFileSound(key: 'slide' | 'button' | 'back' | 'bell') {
   // Lazy-init the decode + gain chain on first call.
   ensureFileSound(key);
   const ctx = _audioCtx;
-  if (!ctx || !slot.buffer || !slot.gain) return;
-  const buffer = slot.buffer;
-  const gain = slot.gain;
-  const fire = () => {
-    try {
-      const src = ctx.createBufferSource();
-      src.buffer = buffer;
-      src.connect(gain);
-      src.start(0);
-    } catch { /* silent */ }
-  };
-  // If the context is running, fire SYNCHRONOUSLY in the same tap event
-  // so iOS doesn't drop the sample for being outside the user gesture.
-  // Only defer via resume() if actually suspended.
+  // Buffer not ready yet (cold launch, decode in flight, or fetch in
+  // flight). Mark a pending play so whichever async step finishes last
+  // (prefetch → ensureFileSound → decodeAudioData.then) fires the
+  // sound. The AudioContext was already resume()d inside this same user
+  // gesture by getAudioCtx() in ensureFileSound above, so deferred
+  // plays from .then() callbacks are still allowed by iOS.
+  if (!ctx || !slot.buffer || !slot.gain) {
+    slot.pendingPlay = true;
+    return;
+  }
+  // Buffer ready: fire synchronously in the same tap event.
   if (ctx.state === 'running') {
-    fire();
+    _fireFileSound(key);
   } else {
-    ctx.resume().then(fire).catch(() => { /* silent */ });
+    ctx.resume().then(() => _fireFileSound(key)).catch(() => { /* silent */ });
   }
 }
 
@@ -5492,7 +5528,16 @@ const S: Record<string, React.CSSProperties> = {
     top: 0,
     left: 0,
     right: 0,
-    pointerEvents: 'auto',
+    // Real height so absolutely-positioned children (the latest-
+    // submission spotlight) can resolve `top: calc(50% - Npx)` against
+    // something other than 0. Without bottom: 0 here, the container
+    // collapses to 0 height and the spotlight ends up at top: -175px,
+    // off-screen. pointerEvents: 'none' so this full-viewport container
+    // doesn't intercept taps meant for elements outside it (e.g. the
+    // submit button below); each child that needs clicks (filmstrip,
+    // spotlight) sets pointerEvents: 'auto' on itself.
+    bottom: 0,
+    pointerEvents: 'none',
     display: 'flex',
     flexDirection: 'column',
     alignItems: 'center',
