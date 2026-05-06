@@ -604,6 +604,13 @@ type _ListLevelSnapshot =
   | { kind: 'states'; category: CategoryKey }
   | { kind: 'sites'; category: CategoryKey; state: string };
 let _listLevelMemory: _ListLevelSnapshot | null = null;
+// Hook the swipe-back gesture uses to step ListView's internal drill-down
+// back one level (sites -> states -> categories) instead of popping the
+// nav stack and exiting to home. Set by ListView on mount, cleared on
+// unmount. When non-null, returning true means "we handled it, don't pop
+// the nav stack." Returning false means "I'm at the top level, please
+// pop normally."
+let _listSwipeBackHook: (() => boolean) | null = null;
 
 // ---------- Toasts ----------
 // Lightweight global toast system. Any component can call showToast(msg)
@@ -1387,6 +1394,19 @@ export default function App() {
         }
         axis = 'h';
         dragging = true;
+        // Check if ListView wants to handle this swipe internally (drill
+        // back through its category/state/site levels instead of exiting
+        // to home). If so, fire the hook now, abort the swipe gesture
+        // entirely, and let ListView's normal re-render show the prior
+        // level. No peek layer, no nav-stack pop. The hook returns true
+        // when it handled it, false when ListView is at its top level
+        // and wants to exit normally.
+        if (_listSwipeBackHook && _listSwipeBackHook()) {
+          tracking = false;
+          dragging = false;
+          axis = 'none';
+          return;
+        }
         // Now that the gesture has committed to horizontal, stage the
         // previous view so the peek layer mounts. This is the right
         // moment - we know the user wants to swipe back, and the layer
@@ -1626,16 +1646,20 @@ export default function App() {
     playButton();
     setView({ name: 'submit' });
   }
+  // Note on sounds: these four nav functions (goAbout/goLeaders/goList/
+  // goNearby) used to call playButton() at the top, but the only place
+  // that invokes them is the HomeBottomBar — and that bar's onClick
+  // handlers already play the correct Sub Drop / Ghost Wisp sound BEFORE
+  // calling these. Leaving playButton() here meant both sounds played
+  // simultaneously and the louder click drowned out Sub Drop. Sound is
+  // now the bottom bar's responsibility, not these nav functions'.
   function goAbout() {
-    playButton();
     setView({ name: 'about' });
   }
   function goLeaders() {
-    playButton();
     setView({ name: 'leaders' });
   }
   function goList() {
-    playButton();
     // Opening List View fresh from the menu should always start at the
     // top (Categories) level. The module-level _listLevelMemory exists
     // ONLY to preserve drill-down across the swipe-back-from-Detail
@@ -1644,7 +1668,6 @@ export default function App() {
     setView({ name: 'list' });
   }
   function goNearby() {
-    playButton();
     setView({ name: 'nearby' });
   }
   function goHome() {
@@ -2612,6 +2635,37 @@ function ListView({ sites, currentLocation, onSelectSite, onBack }: {
     _listLevelMemory = next;
     setLevelState(next);
   };
+  // Ref mirror of `level` so the swipe-back hook below always reads the
+  // current value rather than capturing it in a closure at hook-install
+  // time. Without this the hook would always see whatever level was set
+  // when ListView first mounted.
+  const levelRef = useRef(level);
+  levelRef.current = level;
+
+  // Register a swipe-back hook with the App's gesture handler. When the
+  // user swipes back at level 3 (sites) we step to level 2 (states); at
+  // level 2 we step to level 1 (categories); at level 1 we return false
+  // so the gesture handler falls through to its normal nav-stack pop
+  // (which exits ListView entirely back to home). Cleared on unmount so
+  // no other view inadvertently inherits this handler.
+  useEffect(() => {
+    _listSwipeBackHook = () => {
+      const cur = levelRef.current;
+      if (cur.kind === 'sites') {
+        playBackSound();
+        setLevel({ kind: 'states', category: cur.category });
+        return true;
+      }
+      if (cur.kind === 'states') {
+        playBackSound();
+        setLevel({ kind: 'categories' });
+        return true;
+      }
+      return false;
+    };
+    return () => { _listSwipeBackHook = null; };
+  }, []);
+
   const [query, setQuery] = useState('');
   const q = query.trim().toLowerCase();
 
