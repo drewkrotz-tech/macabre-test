@@ -864,9 +864,10 @@ function buildStyleCss() {
    so the badge breathes subtly without shifting the surrounding layout
    (it's absolutely positioned, so a 1.5% scale doesn't disturb anything).
    Slow 4.5s cycle so it reads as ambient rather than attention-grabbing.
-   Colors are hardcoded here (not interpolated from JS constants) because
-   this CSS string runs BEFORE the const declarations for BLACK/etc are
-   initialized — referencing them via ${} would throw a ReferenceError. */
+   Colors are hardcoded here (rather than interpolating JS color
+   constants) because this CSS string runs BEFORE the const declarations
+   for BLACK/etc. are initialized — referencing them via interpolation
+   would throw a ReferenceError. */
 @keyframes sinister-spotlight-pulse {
   0%, 100% {
     box-shadow: 0 0 14px rgba(193, 43, 43, 0.2), 0 0 4px rgba(10, 10, 10, 0.6);
