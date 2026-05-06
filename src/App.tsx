@@ -5429,20 +5429,28 @@ const S: Record<string, React.CSSProperties> = {
   // Width is left/right margin-bound so it never overlaps the cell.
   latestSpotlight: {
     position: 'absolute',
-    top: 'calc(50% - 175px)',
+    // Anchor spotlight in the gap between BY SINISTER and the top of the
+    // centered cell. The cell is roughly 330px tall and centered on the
+    // viewport, so its TOP edge is at ~(50% - 165px). With the tightened
+    // padding/margins below the spotlight is ~52–55px tall, so
+    // (50% - 230px) puts the spotlight's BOTTOM at ~(50% - 178px),
+    // leaving ~13px of breathing room above the cell.
+    top: 'calc(50% - 230px)',
     left: '50%',
     transform: 'translateX(-50%)',
     backgroundColor: 'rgba(10,10,10,0.55)',
     border: `1px solid ${SINISTER_RED}55`,
-    borderRadius: 12,
-    padding: '8px 18px',
-    minWidth: 240,
-    maxWidth: '88vw',
+    borderRadius: 10,
+    // Tightened from '8px 18px'. Padding does most of the height-trim
+    // work since fonts can't go lower without becoming unreadable.
+    padding: '4px 16px',
+    minWidth: 220,
+    maxWidth: '86vw',
     cursor: 'pointer',
     pointerEvents: 'auto',
     color: BONE,
     textAlign: 'center' as const,
-    boxShadow: `0 0 18px ${SINISTER_RED}33, 0 0 4px ${BLACK}99`,
+    boxShadow: `0 0 16px ${SINISTER_RED}33, 0 0 4px ${BLACK}99`,
     backdropFilter: 'blur(2px)',
     zIndex: 3,
     // Subtle pulsing glow so it draws the eye but isn't garish.
@@ -5456,7 +5464,8 @@ const S: Record<string, React.CSSProperties> = {
     letterSpacing: '0.32em',
     color: SINISTER_RED,
     textShadow: `0 0 8px ${SINISTER_RED}cc`,
-    marginBottom: 3,
+    // Trimmed from 3 — every pixel counts since fonts stay fixed.
+    marginBottom: 1,
   },
   latestSpotlightTitle: {
     fontFamily: 'system-ui, -apple-system, sans-serif',
@@ -5465,7 +5474,8 @@ const S: Record<string, React.CSSProperties> = {
     letterSpacing: '0.06em',
     color: WHITE,
     textShadow: `0 0 10px ${WHITE}66, 1px 1px 0 ${BLACK}`,
-    lineHeight: 1.2,
+    // Tightened from 1.2 — reduces row height without affecting glyph size.
+    lineHeight: 1.05,
     overflow: 'hidden' as const,
     textOverflow: 'ellipsis' as const,
     whiteSpace: 'nowrap' as const,
@@ -5476,7 +5486,8 @@ const S: Record<string, React.CSSProperties> = {
     fontWeight: 700,
     letterSpacing: '0.18em',
     color: '#8a7f70',
-    marginTop: 3,
+    // Trimmed from 3 — same reasoning as the label marginBottom.
+    marginTop: 1,
   },
   latestSpotlightHandle: {
     color: SINISTER_RED,
