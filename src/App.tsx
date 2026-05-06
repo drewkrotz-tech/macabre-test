@@ -260,20 +260,88 @@ const SINISTER_RED = '#C12B2B';
 //                        sweep with bandpass filter for a cracked-wood feel
 //   back    (run home):  a chain-rattle whoosh — filtered white noise burst
 //                        with a quick decay envelope
-// AudioContext is lazy-created on first use (browsers block AudioContext
-// until a user gesture) and reused across plays to avoid setup stutter.
+// ---------- Audio system ----------
+// ONE AudioContext for the whole app. Previously each sound (slide, button,
+// back, bell, plus the synth-based ones) created its own AudioContext, which
+// hit two iOS bugs hard:
+//   1. Safari/WKWebView caps the number of AudioContexts an app can create.
+//      Hitting the cap silently fails — that's what made "sometimes opening
+//      the app means no sound" — some contexts unlocked, others didn't, and
+//      which subset succeeded was non-deterministic.
+//   2. Each context needed its own user-gesture unlock + its own resume()
+//      after iOS suspended the WebView (returning to the app, locking the
+//      screen, taking a call). Nothing in the old code re-resumed contexts
+//      on foreground, so they'd silently die between sessions.
+//
+// This unified system: one shared AudioContext, one shared listener that
+// resumes it on first user gesture AND every time the app returns to
+// foreground. Each file-based sound gets its own GainNode for independent
+// volume control but they all connect to the same destination.
+//
+// Synth-based sounds (playForward, playPop, playSubDrop, playGhostWisp)
+// already use this shared context via getAudioCtx() — no change needed.
+
 let _audioCtx: AudioContext | null = null;
+let _audioUnlockInstalled = false;
+
 function getAudioCtx(): AudioContext | null {
   if (typeof window === 'undefined') return null;
   if (!_audioCtx) {
     const Ctor = (window as any).AudioContext || (window as any).webkitAudioContext;
     if (!Ctor) return null;
-    _audioCtx = new Ctor();
+    try {
+      _audioCtx = new Ctor();
+    } catch {
+      return null;
+    }
   }
   if (_audioCtx.state === 'suspended') {
     _audioCtx.resume().catch(() => {});
   }
   return _audioCtx;
+}
+
+// Install a one-time global unlock that resumes the shared AudioContext on
+// the very first user interaction, plus a visibility hook that resumes on
+// every foreground transition. Safe to call repeatedly — the flag prevents
+// duplicate listeners. Called from the App component on mount.
+function installAudioUnlock() {
+  if (_audioUnlockInstalled || typeof window === 'undefined') return;
+  _audioUnlockInstalled = true;
+
+  const resumeAll = () => {
+    const ctx = _audioCtx;
+    if (ctx && ctx.state === 'suspended') {
+      ctx.resume().catch(() => {});
+    }
+  };
+
+  // Fire on the first user gesture of any kind. Capture phase + once: true
+  // so we catch it before any handler can stop propagation, and so we only
+  // pay the cost once. iOS unlocks audio inside this callback because it's
+  // synchronous within the gesture event.
+  const onFirstGesture = () => {
+    // Force-create the context if it wasn't already, then resume.
+    getAudioCtx();
+    resumeAll();
+  };
+  const opts: AddEventListenerOptions = { once: true, capture: true, passive: true };
+  window.addEventListener('touchstart', onFirstGesture, opts);
+  window.addEventListener('touchend', onFirstGesture, opts);
+  window.addEventListener('pointerdown', onFirstGesture, opts);
+  window.addEventListener('mousedown', onFirstGesture, opts);
+  window.addEventListener('keydown', onFirstGesture, opts);
+
+  // Resume on every foreground transition. iOS suspends the WebView's
+  // AudioContext when the app is backgrounded, the screen locks, or a
+  // phone call comes in. Without this, the context stays suspended on
+  // return and every sound silently fails until the user fully closes
+  // and reopens the app — exactly the bug Drew kept hitting.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') resumeAll();
+  });
+  window.addEventListener('focus', resumeAll);
+  window.addEventListener('pageshow', resumeAll);
 }
 
 function playForward() {
@@ -345,281 +413,154 @@ function playPop() {
   } catch { /* silent */ }
 }
 
-// Single slide audio instance — Web Audio API implementation.
-// HTMLAudioElement.volume is IGNORED on iOS WebView, which is why the
-// slide sound was deafening on iPhone despite volume=0.105. Web Audio's
-// GainNode honors volume on iOS. Pre-decoded AudioBuffer also gives
-// instant playback (no decode-on-play delay) and reliable firing on
-// every scroll — the previous symptom of "delayed and inconsistent" is
-// HTMLAudio's mid-decode play() calls being dropped.
+// ---------- Bottom-bar / menu sounds ----------
+// playSubDrop — deep bass thud for the bottom-bar pill buttons
+// (Locations Near Me + the menu items in the More popup). Sine wave
+// pitched from 140Hz down to 45Hz over 220ms. No high-frequency
+// content, all weight, fits the "sinister/foreboding" tone the rest
+// of the app sets. Uses the shared getAudioCtx() singleton so it
+// inherits the same iOS resume/unlock flow that playButton/playPop
+// already rely on.
+function playSubDrop() {
+  const ctx = getAudioCtx();
+  if (!ctx) return;
+  try {
+    const now = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(140, now);
+    osc.frequency.exponentialRampToValueAtTime(45, now + 0.18);
+    gain.gain.setValueAtTime(0, now);
+    gain.gain.linearRampToValueAtTime(0.22, now + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.22);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(now);
+    osc.stop(now + 0.25);
+  } catch { /* silent */ }
+}
+
+// playGhostWisp — rising bandpass-filtered noise burst for the More
+// menu OPEN action specifically. Different from playSubDrop so that
+// opening the menu sounds different from picking an item out of it,
+// giving the user a small audible cue that something appeared rather
+// than that they navigated. ~220ms of breathy whoosh sweeping from
+// 600Hz up to 2.4kHz.
+function playGhostWisp() {
+  const ctx = getAudioCtx();
+  if (!ctx) return;
+  try {
+    const now = ctx.currentTime;
+    const dur = 0.22;
+    const buf = ctx.createBuffer(1, Math.max(1, Math.floor(ctx.sampleRate * dur)), ctx.sampleRate);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < data.length; i++) {
+      // Sine envelope so the noise fades in and out smoothly
+      const env = Math.sin(Math.PI * (i / data.length));
+      data[i] = (Math.random() * 2 - 1) * env;
+    }
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    const filt = ctx.createBiquadFilter();
+    filt.type = 'bandpass';
+    filt.frequency.setValueAtTime(600, now);
+    filt.frequency.exponentialRampToValueAtTime(2400, now + 0.18);
+    filt.Q.value = 4;
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0.55, now);
+    src.connect(filt);
+    filt.connect(gain);
+    gain.connect(ctx.destination);
+    src.start(now);
+  } catch { /* silent */ }
+}
+
+// ---------- File-based sounds (slide / button / back / bell) ----------
+// All four file-based sounds share the same _audioCtx (see top of audio
+// section). Each gets its own decoded AudioBuffer + GainNode for volume
+// control, but they all connect to the same destination — so we never
+// hit iOS's per-app AudioContext cap.
 //
-// Falls back to HTMLAudioElement if Web Audio fails to init (older
-// browsers, very locked-down WebViews).
+// Each sound has an init function that fetches + decodes once. Init is
+// idempotent. The play function fires synchronously inside the user's
+// tap event so iOS doesn't drop the sample. If the context is suspended
+// (post-background, etc.), we resume() and fire on the resolution.
+//
+// HTMLAudioElement fallbacks were dropped: on iOS WebView they ignore
+// volume settings AND drop mid-decode play() calls. They were causing
+// more bugs than they prevented.
+
 const SLIDE_VOLUME = 0.05;
-let _slideAudioCtx: AudioContext | null = null;
-let _slideAudioBuffer: AudioBuffer | null = null;
-let _slideAudioGain: GainNode | null = null;
-let _slideAudioInitStarted = false;
-let _slideAudio: HTMLAudioElement | null = null; // fallback only
-function ensureSlideAudio() {
-  if (_slideAudioInitStarted) return;
-  _slideAudioInitStarted = true;
-  // Try Web Audio path first.
-  try {
-    const Ctx: typeof AudioContext = (window as any).AudioContext || (window as any).webkitAudioContext;
-    if (Ctx) {
-      _slideAudioCtx = new Ctx();
-      _slideAudioGain = _slideAudioCtx.createGain();
-      _slideAudioGain.gain.value = SLIDE_VOLUME;
-      _slideAudioGain.connect(_slideAudioCtx.destination);
-      // Fetch + decode the asset URL into a buffer for instant playback.
-      fetch(slideSound1)
-        .then(r => r.arrayBuffer())
-        .then(ab => _slideAudioCtx!.decodeAudioData(ab))
-        .then(buf => { _slideAudioBuffer = buf; })
-        .catch(() => { /* silent — fallback below covers it */ });
-    }
-  } catch { /* silent */ }
-  // HTMLAudio fallback (only used if Web Audio path fails).
-  try {
-    _slideAudio = new Audio(slideSound1);
-    _slideAudio.preload = 'auto';
-    _slideAudio.volume = SLIDE_VOLUME;
-  } catch { /* silent */ }
-}
-// Tracks whether we've played the priming silent buffer through the slide
-// audio chain. iOS's first start(0) after AudioContext resume can ignore
-// the GainNode for one frame (loud first scroll). The first call to
-// playSlide primes the audio path with a silent buffer and skips actually
-// playing the real sound — by the second scroll, iOS has established the
-// gain stage and the real sound plays at the correct volume.
-let _slidePrimed = false;
-function playSlide() {
-  try {
-    ensureSlideAudio();
-    if (!_slideAudioCtx || !_slideAudioBuffer || !_slideAudioGain) {
-      return;
-    }
-    const ctx = _slideAudioCtx;
-    const buf = _slideAudioBuffer;
-    const gain = _slideAudioGain;
-    const fire = () => {
-      try {
-        const src = ctx.createBufferSource();
-        src.buffer = buf;
-        src.connect(gain);
-        src.start(0);
-      } catch { /* silent */ }
-    };
-    // If already running, fire SYNCHRONOUSLY in the same tap event.
-    // iOS drops samples that fire outside the user-gesture event handler,
-    // and ctx.resume() always defers via Promise even when the context is
-    // already running — that's what was eating the first sound.
-    if (ctx.state !== 'running') {
-      ctx.resume().then(fire).catch(() => { /* silent */ });
-    } else {
-      fire();
-    }
-  } catch { /* silent */ }
-}
-
-// Single button click audio instance — Web Audio API for instant, reliable
-// firing on iOS. Same pattern as the slide sound. HTMLAudio fallback kept
-// for older WebViews. Volume at 0.20 honored by GainNode.
 const BUTTON_VOLUME = 0.20;
-let _buttonAudioCtx: AudioContext | null = null;
-let _buttonAudioBuffer: AudioBuffer | null = null;
-let _buttonAudioGain: GainNode | null = null;
-let _buttonAudioInitStarted = false;
-let _buttonAudio: HTMLAudioElement | null = null; // fallback only
-function ensureButtonAudio() {
-  if (_buttonAudioInitStarted) return;
-  _buttonAudioInitStarted = true;
-  try {
-    const Ctx: typeof AudioContext = (window as any).AudioContext || (window as any).webkitAudioContext;
-    if (Ctx) {
-      _buttonAudioCtx = new Ctx();
-      _buttonAudioGain = _buttonAudioCtx.createGain();
-      _buttonAudioGain.gain.value = BUTTON_VOLUME;
-      _buttonAudioGain.connect(_buttonAudioCtx.destination);
-      fetch(buttonSound)
-        .then(r => r.arrayBuffer())
-        .then(ab => _buttonAudioCtx!.decodeAudioData(ab))
-        .then(buf => { _buttonAudioBuffer = buf; })
-        .catch(() => { /* silent */ });
-    }
-  } catch { /* silent */ }
-  try {
-    _buttonAudio = new Audio(buttonSound);
-    _buttonAudio.preload = 'auto';
-    _buttonAudio.volume = BUTTON_VOLUME;
-  } catch { /* silent */ }
-}
-function playButton() {
-  try {
-    ensureButtonAudio();
-    if (_buttonAudioCtx && _buttonAudioBuffer && _buttonAudioGain) {
-      const ctx = _buttonAudioCtx;
-      const buf = _buttonAudioBuffer;
-      const gain = _buttonAudioGain;
-      // If already running, fire SYNCHRONOUSLY in the same tap event so
-      // iOS doesn't drop the sample for being outside the user gesture.
-      // Only defer via resume() if the context is actually suspended.
-      const fire = () => {
-        try {
-          const src = ctx.createBufferSource();
-          src.buffer = buf;
-          src.connect(gain);
-          src.start(0);
-        } catch { /* silent */ }
-      };
-      if (ctx.state !== 'running') {
-        ctx.resume().then(fire).catch(() => {
-          // Resume failed (e.g. no user gesture yet) — fall through to
-          // HTMLAudioElement which is more permissive.
-          if (_buttonAudio) {
-            try { _buttonAudio.currentTime = 0; void _buttonAudio.play(); } catch { /* silent */ }
-          }
-        });
-      } else {
-        fire();
-      }
-      return;
-    }
-    if (_buttonAudio) {
-      _buttonAudio.currentTime = 0;
-      void _buttonAudio.play();
-    }
-  } catch { /* silent */ }
-}
-
-// Single back navigation audio instance — Web Audio API for instant, reliable
-// firing on iOS. Same pattern as button/slide. HTMLAudio fallback kept.
 const BACK_VOLUME = 0.20;
-let _backAudioCtx: AudioContext | null = null;
-let _backAudioBuffer: AudioBuffer | null = null;
-let _backAudioGain: GainNode | null = null;
-let _backAudioInitStarted = false;
-let _backAudio: HTMLAudioElement | null = null; // fallback only
-function ensureBackAudio() {
-  if (_backAudioInitStarted) return;
-  _backAudioInitStarted = true;
-  try {
-    const Ctx: typeof AudioContext = (window as any).AudioContext || (window as any).webkitAudioContext;
-    if (Ctx) {
-      _backAudioCtx = new Ctx();
-      _backAudioGain = _backAudioCtx.createGain();
-      _backAudioGain.gain.value = BACK_VOLUME;
-      _backAudioGain.connect(_backAudioCtx.destination);
-      fetch(backSound)
-        .then(r => r.arrayBuffer())
-        .then(ab => _backAudioCtx!.decodeAudioData(ab))
-        .then(buf => { _backAudioBuffer = buf; })
-        .catch(() => { /* silent */ });
-    }
-  } catch { /* silent */ }
-  try {
-    _backAudio = new Audio(backSound);
-    _backAudio.preload = 'auto';
-    _backAudio.volume = BACK_VOLUME;
-  } catch { /* silent */ }
+const BELL_VOLUME = 0.30;
+
+interface FileSoundSlot {
+  url: string;
+  volume: number;
+  buffer: AudioBuffer | null;
+  gain: GainNode | null;
+  initStarted: boolean;
 }
-function playBackSound() {
+
+const _fileSounds: Record<'slide' | 'button' | 'back' | 'bell', FileSoundSlot> = {
+  slide:  { url: slideSound1, volume: SLIDE_VOLUME,  buffer: null, gain: null, initStarted: false },
+  button: { url: buttonSound, volume: BUTTON_VOLUME, buffer: null, gain: null, initStarted: false },
+  back:   { url: backSound,   volume: BACK_VOLUME,   buffer: null, gain: null, initStarted: false },
+  bell:   { url: bellSound,   volume: BELL_VOLUME,   buffer: null, gain: null, initStarted: false },
+};
+
+function ensureFileSound(key: 'slide' | 'button' | 'back' | 'bell') {
+  const slot = _fileSounds[key];
+  if (slot.initStarted) return;
+  const ctx = getAudioCtx();
+  if (!ctx) return;
+  slot.initStarted = true;
   try {
-    ensureBackAudio();
-    if (_backAudioCtx && _backAudioBuffer && _backAudioGain) {
-      const ctx = _backAudioCtx;
-      const buf = _backAudioBuffer;
-      const gain = _backAudioGain;
-      const fire = () => {
-        try {
-          const src = ctx.createBufferSource();
-          src.buffer = buf;
-          src.connect(gain);
-          src.start(0);
-        } catch { /* silent */ }
-      };
-      if (ctx.state !== 'running') {
-        ctx.resume().then(fire).catch(() => {
-          if (_backAudio) {
-            try { _backAudio.currentTime = 0; void _backAudio.play(); } catch { /* silent */ }
-          }
-        });
-      } else {
-        fire();
-      }
-      return;
-    }
-    if (_backAudio) {
-      _backAudio.currentTime = 0;
-      void _backAudio.play();
-    }
+    slot.gain = ctx.createGain();
+    slot.gain.gain.value = slot.volume;
+    slot.gain.connect(ctx.destination);
+    fetch(slot.url)
+      .then(r => r.arrayBuffer())
+      .then(ab => ctx.decodeAudioData(ab))
+      .then(buf => { slot.buffer = buf; })
+      .catch(() => { /* silent — sound just won't play, app keeps working */ });
   } catch { /* silent */ }
 }
 
-// Single bell audio instance — Web Audio API for instant, reliable firing
-// on iOS. Same pattern as button/back/slide. HTMLAudio fallback kept.
-const BELL_VOLUME = 0.30;
-let _bellAudioCtx: AudioContext | null = null;
-let _bellAudioBuffer: AudioBuffer | null = null;
-let _bellAudioGain: GainNode | null = null;
-let _bellAudioInitStarted = false;
-let _bellAudio: HTMLAudioElement | null = null; // fallback only
-function ensureBellAudio() {
-  if (_bellAudioInitStarted) return;
-  _bellAudioInitStarted = true;
-  try {
-    const Ctx: typeof AudioContext = (window as any).AudioContext || (window as any).webkitAudioContext;
-    if (Ctx) {
-      _bellAudioCtx = new Ctx();
-      _bellAudioGain = _bellAudioCtx.createGain();
-      _bellAudioGain.gain.value = BELL_VOLUME;
-      _bellAudioGain.connect(_bellAudioCtx.destination);
-      fetch(bellSound)
-        .then(r => r.arrayBuffer())
-        .then(ab => _bellAudioCtx!.decodeAudioData(ab))
-        .then(buf => { _bellAudioBuffer = buf; })
-        .catch(() => { /* silent */ });
-    }
-  } catch { /* silent */ }
-  try {
-    _bellAudio = new Audio(bellSound);
-    _bellAudio.preload = 'auto';
-    _bellAudio.volume = BELL_VOLUME;
-  } catch { /* silent */ }
+function playFileSound(key: 'slide' | 'button' | 'back' | 'bell') {
+  const slot = _fileSounds[key];
+  // Lazy init on first call so we don't try to create AudioContext nodes
+  // before the user has tapped (some browsers throw on early creation).
+  ensureFileSound(key);
+  const ctx = _audioCtx;
+  if (!ctx || !slot.buffer || !slot.gain) return;
+  const buffer = slot.buffer;
+  const gain = slot.gain;
+  const fire = () => {
+    try {
+      const src = ctx.createBufferSource();
+      src.buffer = buffer;
+      src.connect(gain);
+      src.start(0);
+    } catch { /* silent */ }
+  };
+  // If the context is running, fire SYNCHRONOUSLY in the same tap event
+  // so iOS doesn't drop the sample for being outside the user gesture.
+  // Only defer via resume() if actually suspended.
+  if (ctx.state === 'running') {
+    fire();
+  } else {
+    ctx.resume().then(fire).catch(() => { /* silent */ });
+  }
 }
-function playBell() {
-  try {
-    ensureBellAudio();
-    if (_bellAudioCtx && _bellAudioBuffer && _bellAudioGain) {
-      const ctx = _bellAudioCtx;
-      const buf = _bellAudioBuffer;
-      const gain = _bellAudioGain;
-      const fire = () => {
-        try {
-          const src = ctx.createBufferSource();
-          src.buffer = buf;
-          src.connect(gain);
-          src.start(0);
-        } catch { /* silent */ }
-      };
-      if (ctx.state !== 'running') {
-        ctx.resume().then(fire).catch(() => {
-          if (_bellAudio) {
-            try { _bellAudio.currentTime = 0; void _bellAudio.play(); } catch { /* silent */ }
-          }
-        });
-      } else {
-        fire();
-      }
-      return;
-    }
-    if (_bellAudio) {
-      _bellAudio.currentTime = 0;
-      void _bellAudio.play();
-    }
-  } catch { /* silent */ }
-}
+
+function playSlide()      { playFileSound('slide'); }
+function playButton()     { playFileSound('button'); }
+function playBackSound()  { playFileSound('back'); }
+function playBell()       { playFileSound('bell'); }
+
 
 // ---------- CategoryView scroll memory ----------
 // CategoryView's filmstrip uses an internal scroll container (the
@@ -646,6 +587,24 @@ function _catScrollLog(...args: unknown[]) {
   if (_CAT_SCROLL_DEBUG) console.log('[catScroll]', ...args);
 }
 
+// ---------- ListView drill-down memory ----------
+// ListView has three internal levels (Categories -> States -> Sites)
+// implemented as local component state, NOT separate views in the nav
+// stack. That made the drill-down feel snappy but also meant tapping a
+// site at level 3 -> swiping back from DetailView -> ListView would
+// remount and reset to level 1 (Categories), losing the user's place.
+//
+// Same pattern as _categoryScrollMap: store the last-known level at
+// module scope so the swipe-back-induced double remount of ListView
+// (once in peek layer, once in real wrapper) both pick up the same
+// value. Reset to top-level when ListView is opened fresh from outside
+// (handled inside ListView itself via the back button at level 1).
+type _ListLevelSnapshot =
+  | { kind: 'categories' }
+  | { kind: 'states'; category: CategoryKey }
+  | { kind: 'sites'; category: CategoryKey; state: string };
+let _listLevelMemory: _ListLevelSnapshot | null = null;
+
 // ---------- Toasts ----------
 // Lightweight global toast system. Any component can call showToast(msg)
 // and a small notification slides up from above the bottom bar for ~2.5
@@ -668,56 +627,11 @@ function showToast(message: string, tone: ToastTone = 'default', durationMs = 25
 }
 
 // ---------- Audio lifecycle ----------
-// iOS does two annoying things to AudioContexts in a Capacitor WebView:
-//   1. Suspends them when the app is backgrounded, the screen locks, or
-//      another app plays audio. resume() is async, so the first start(0)
-//      after foregrounding fires while the context is still frozen and
-//      the sample is silently dropped — that's the "no sound on reopen
-//      until I close & reopen the app" symptom.
-//   2. Sometimes leaves `state` as 'running' even though the audio clock
-//      is actually frozen (this is the rarer mystery case). Calling
-//      resume() on an already-running context is a no-op, so it's safe
-//      and free to call resume unconditionally on every play. Doing that
-//      bypasses the state-check trap entirely.
-//
-// wakeAllAudio resumes every cached AudioContext we own. We call it on:
-//   - mount
-//   - visibilitychange when document becomes visible
-//   - pageshow (covers iOS bfcache restore that doesn't fire visibility)
-//   - EVERY user gesture (not just the first one — the once: true that
-//     used to be here meant we never rearmed after a second background
-//     cycle)
-function wakeAllAudio() {
-  const ctxs: Array<AudioContext | null> = [
-    _audioCtx, _slideAudioCtx, _buttonAudioCtx, _backAudioCtx, _bellAudioCtx,
-  ];
-  for (const ctx of ctxs) {
-    if (!ctx) continue;
-    if (ctx.state === 'suspended' || (ctx.state as string) === 'interrupted') {
-      ctx.resume().catch(() => { /* silent */ });
-    }
-  }
-}
+// All audio lifecycle logic now lives in installAudioUnlock() at the top
+// of the audio section. Single shared AudioContext means we only have to
+// resume one thing on foreground/visibility/gesture events — no need for
+// the previous wakeAllAudio() loop over multiple contexts.
 
-// Install lifecycle handlers exactly once. The module-level guard means
-// HMR / fast-refresh in dev won't double-install.
-let _audioLifecycleInstalled = false;
-function installAudioLifecycle() {
-  if (_audioLifecycleInstalled) return;
-  if (typeof document === 'undefined') return;
-  _audioLifecycleInstalled = true;
-  const onVisible = () => {
-    if (!document.hidden) wakeAllAudio();
-  };
-  document.addEventListener('visibilitychange', onVisible);
-  window.addEventListener('pageshow', wakeAllAudio);
-  // First user gesture safety net — once any tap happens, resume contexts
-  // and remove the listener. Capture phase + once: true so we win against
-  // anything that might stopPropagation.
-  const onFirstGesture = () => { wakeAllAudio(); };
-  window.addEventListener('pointerdown', onFirstGesture, { capture: true, once: true });
-  window.addEventListener('touchstart', onFirstGesture, { capture: true, once: true, passive: true } as any);
-}
 
 // ---------- Categories ----------
 // Tile border colors: red is the new default for "blue" categories, since
@@ -1039,6 +953,25 @@ function buildStyleCss() {
 /* Hide horizontal scrollbar on the slide filmstrip on WebKit */
 .sinister-pressable::-webkit-scrollbar { display: none; }
 
+/* Hide the iOS document scroll indicator on specific views only.
+   Body gets data-view="detail" / "about" / "leaders" set by a small
+   effect when those views mount, and reverts on unmount. The home
+   filmstrip and other internal scroll containers are untouched
+   because they aren't the document scroller. */
+body[data-view="detail"]::-webkit-scrollbar,
+body[data-view="about"]::-webkit-scrollbar,
+body[data-view="leaders"]::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
+}
+body[data-view="detail"],
+body[data-view="about"],
+body[data-view="leaders"] {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
 /* Animated film grain — used inside the .projector-grain layer */
 .projector-grain {
   background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='180' height='180'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 0.55 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
@@ -1351,49 +1284,19 @@ export default function App() {
     return () => { cancelled = true; };
   }, []);
 
-  // Eagerly start decoding all audio buffers + prime gain chains on first touch
+  // Audio system bootstrap. Installs the single global unlock that resumes
+  // the shared AudioContext on first user gesture AND on every foreground
+  // transition (visibility, focus, pageshow). Also kicks off pre-loading of
+  // the four file-based sound buffers so they're ready when the user taps.
+  // See the audio section at the top of the file for the full architecture.
   useEffect(() => {
-    try { ensureSlideAudio(); } catch { /* silent */ }
-    try { ensureButtonAudio(); } catch { /* silent */ }
-    try { ensureBackAudio(); } catch { /* silent */ }
-    try { ensureBellAudio(); } catch { /* silent */ }
-    // Install foreground/visibility listeners so the AudioContexts get
-    // resumed when the user comes back to the app from the home screen,
-    // a phone call, the lock screen, etc. Without this the first sound
-    // tap after returning is silently dropped on iOS.
-    try { installAudioLifecycle(); } catch { /* silent */ }
-    let primed = false;
-    const primeOnFirstTouch = () => {
-      if (primed) return;
-      primed = true;
-      const ctxs: Array<{ ctx: AudioContext | null; gain: GainNode | null }> = [
-        { ctx: _slideAudioCtx, gain: _slideAudioGain },
-        { ctx: _buttonAudioCtx, gain: _buttonAudioGain },
-        { ctx: _backAudioCtx, gain: _backAudioGain },
-        { ctx: _bellAudioCtx, gain: _bellAudioGain },
-      ];
-      for (const { ctx, gain } of ctxs) {
-        if (!ctx || !gain) continue;
-        try {
-          if (ctx.state === 'suspended') ctx.resume().catch(() => { /* silent */ });
-          const sr = ctx.sampleRate;
-          const silent = ctx.createBuffer(1, Math.floor(sr * 0.05), sr);
-          const primer = ctx.createBufferSource();
-          primer.buffer = silent;
-          primer.connect(gain);
-          primer.start(0);
-        } catch { /* silent */ }
-      }
-      try { _slidePrimed = true; } catch { /* silent */ }
-      window.removeEventListener('pointerdown', primeOnFirstTouch);
-      window.removeEventListener('touchstart', primeOnFirstTouch);
-    };
-    window.addEventListener('pointerdown', primeOnFirstTouch, { passive: true });
-    window.addEventListener('touchstart', primeOnFirstTouch, { passive: true });
-    return () => {
-      window.removeEventListener('pointerdown', primeOnFirstTouch);
-      window.removeEventListener('touchstart', primeOnFirstTouch);
-    };
+    try { installAudioUnlock(); } catch { /* silent */ }
+    // Pre-fetch + decode all four file sounds so the first tap doesn't
+    // race a network/decode round-trip. ensureFileSound is idempotent.
+    try { ensureFileSound('slide'); } catch { /* silent */ }
+    try { ensureFileSound('button'); } catch { /* silent */ }
+    try { ensureFileSound('back'); } catch { /* silent */ }
+    try { ensureFileSound('bell'); } catch { /* silent */ }
   }, []);
 
   // ----- iOS-style swipe-back drag (ref-based) -----
@@ -1733,6 +1636,11 @@ export default function App() {
   }
   function goList() {
     playButton();
+    // Opening List View fresh from the menu should always start at the
+    // top (Categories) level. The module-level _listLevelMemory exists
+    // ONLY to preserve drill-down across the swipe-back-from-Detail
+    // double mount — not across separate visits to the screen.
+    _listLevelMemory = null;
     setView({ name: 'list' });
   }
   function goNearby() {
@@ -2019,12 +1927,13 @@ export default function App() {
       <div ref={_dragWrapperRef} style={{ willChange: 'transform', position: 'relative', zIndex: 2, backgroundColor: '#0A0A0A' }}><div key={viewKey} className="sinister-view-enter">
         {viewElement}
       </div></div>
-      {/* Global bottom bar — visible on every screen except the Map view.
-          The map page has its own back button + map controls so this bar
-          would visually clutter and overlap interactive elements. Lifting
-          this out of HomeView means it persists during navigation, no
-          longer disappearing on inner pages like Hauntings or DetailView. */}
-      {view.name !== 'nearby' && (
+      {/* Global bottom bar — visible on every screen except the Map view
+          and DetailView. The map page has its own back button + map controls
+          so this bar would visually clutter and overlap interactive elements.
+          DetailView is excluded because the page already has Get Directions
+          + Claim Visit as its primary actions; layering the bottom bar on
+          top makes the page feel busy and competes with those CTAs. */}
+      {view.name !== 'nearby' && view.name !== 'detail' && (
         <HomeBottomBar
           onLeaders={goLeaders}
           onList={goList}
@@ -2310,7 +2219,7 @@ function HomeBottomBar({ onLeaders, onList, onAbout, onNearby }: {
         <div style={S.moreMenuWrap} className="sinister-more-menu">
           <button
             style={S.moreMenuItem}
-            onClick={() => { playButton(); closeMore(); onLeaders(); }}
+            onClick={() => { playSubDrop(); closeMore(); onLeaders(); }}
           >
             <span style={S.socialIcon}>👑</span>
             <span style={S.moreMenuLabel}>Dread Leaders</span>
@@ -2318,7 +2227,7 @@ function HomeBottomBar({ onLeaders, onList, onAbout, onNearby }: {
           <div style={S.moreMenuDivider} />
           <button
             style={S.moreMenuItem}
-            onClick={() => { playButton(); closeMore(); onList(); }}
+            onClick={() => { playSubDrop(); closeMore(); onList(); }}
           >
             <span style={S.socialIcon}>📜</span>
             <span style={S.moreMenuLabel}>List View</span>
@@ -2326,7 +2235,7 @@ function HomeBottomBar({ onLeaders, onList, onAbout, onNearby }: {
           <div style={S.moreMenuDivider} />
           <button
             style={S.moreMenuItem}
-            onClick={() => { playButton(); closeMore(); onAbout(); }}
+            onClick={() => { playSubDrop(); closeMore(); onAbout(); }}
           >
             <span style={S.socialIcon}>ℹ️</span>
             <span style={S.moreMenuLabel}>About</span>
@@ -2337,14 +2246,21 @@ function HomeBottomBar({ onLeaders, onList, onAbout, onNearby }: {
       <div style={S.socialBar}>
         <button
           style={S.socialBtn}
-          onClick={() => { playButton(); onNearby(); }}
+          onClick={() => { playSubDrop(); onNearby(); }}
         >
           <span style={S.socialIcon}>📍</span>
           <span style={S.socialLabel}>Locations Near Me</span>
         </button>
         <button
           style={{ ...S.socialBtn, ...(moreOpen ? S.socialBtnActive : {}) }}
-          onClick={() => { playButton(); setMoreOpen(v => !v); }}
+          onClick={() => {
+            // Ghost Wisp on OPEN (menu appearing), Sub Drop on CLOSE
+            // (menu dismissed) — gives the user a distinct audible cue
+            // for "something appeared" vs. "I'm tucking it away."
+            if (moreOpen) playSubDrop();
+            else playGhostWisp();
+            setMoreOpen(v => !v);
+          }}
         >
           <span style={S.socialIcon}>☰</span>
           <span style={S.socialLabel}>More</span>
@@ -2374,6 +2290,15 @@ function LeadersView({ currentHandle, onSelectHandle, onBack }: {
   onSelectHandle: (handle: string) => void;
   onBack: () => void;
 }) {
+  // Hide the iOS document scroll indicator while this view is mounted.
+  useEffect(() => {
+    document.body.setAttribute('data-view', 'leaders');
+    return () => {
+      if (document.body.getAttribute('data-view') === 'leaders') {
+        document.body.removeAttribute('data-view');
+      }
+    };
+  }, []);
   const [tab, setTab] = useState<'submitters' | 'visitors'>('submitters');
   const [submitters, setSubmitters] = useState<LeaderRow[] | null>(null);
   const [visitors, setVisitors] = useState<LeaderRow[] | null>(null);
@@ -2414,13 +2339,13 @@ function LeadersView({ currentHandle, onSelectHandle, onBack }: {
       <div style={S.leaderTabs}>
         <button
           style={{ ...S.leaderTab, ...(tab === 'submitters' ? S.leaderTabActive : {}) }}
-          onClick={() => { playButton(); setTab('submitters'); }}
+          onClick={() => { playSubDrop(); setTab('submitters'); }}
         >
           Submitters
         </button>
         <button
           style={{ ...S.leaderTab, ...(tab === 'visitors' ? S.leaderTabActive : {}) }}
-          onClick={() => { playButton(); setTab('visitors'); }}
+          onClick={() => { playSubDrop(); setTab('visitors'); }}
         >
           Visitors
         </button>
@@ -2431,7 +2356,7 @@ function LeadersView({ currentHandle, onSelectHandle, onBack }: {
         <div style={{ padding: '0 20px', marginBottom: 8 }}>
           <button
             style={{ ...S.leaderMineBtn, border: `2px solid ${WHITE}`, color: WHITE }}
-            onClick={() => { playForward(); onSelectHandle(currentHandle); }}
+            onClick={() => { playSubDrop(); onSelectHandle(currentHandle); }}
           >
             🏅 View My Badges ({currentHandle})
           </button>
@@ -2464,7 +2389,7 @@ function LeadersView({ currentHandle, onSelectHandle, onBack }: {
                 <button
                   key={`${row.handle}:${i}`}
                   style={{ ...S.leaderRow, ...(isMe ? S.leaderRowMe : {}) }}
-                  onClick={() => { playForward(); onSelectHandle(row.handle); }}
+                  onClick={() => { playSubDrop(); onSelectHandle(row.handle); }}
                 >
                   <span style={S.leaderRank}>{i + 1}</span>
                   <span style={S.leaderHandle}>{row.handle}{isMe ? ' (you)' : ''}</span>
@@ -2674,7 +2599,19 @@ function ListView({ sites, currentLocation, onSelectSite, onBack }: {
     | { kind: 'categories' }
     | { kind: 'states'; category: CategoryKey }
     | { kind: 'sites'; category: CategoryKey; state: string };
-  const [level, setLevel] = useState<Level>({ kind: 'categories' });
+  // Initialize from module-level memory so swipe-back from DetailView
+  // returns to whichever level the user was on when they tapped a site,
+  // instead of always resetting to the top Categories list.
+  const [level, setLevelState] = useState<Level>(() => {
+    return (_listLevelMemory as Level) || { kind: 'categories' };
+  });
+  // Wrap setLevel so every state change also updates the module memory.
+  // That way the next mount of ListView (peek layer or real wrapper)
+  // sees the same value — no race, no timers.
+  const setLevel = (next: Level) => {
+    _listLevelMemory = next;
+    setLevelState(next);
+  };
   const [query, setQuery] = useState('');
   const q = query.trim().toLowerCase();
 
@@ -3150,7 +3087,7 @@ function HomeView({ sites, onSelectCategory, onSubmit, onAbout, onLeaders, onLis
         onClick={onSubmit}
         style={S.submitFixedButton}
       >
-        <span style={S.submitFixedButtonText}>Submit a Location</span>
+        <span style={S.submitFixedButtonText}>SUBMIT A LOCATION</span>
       </button>
     </div>
   );
@@ -3506,6 +3443,15 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
 
 
 function AboutView({ onBack }: { onBack: () => void }) {
+  // Hide the iOS document scroll indicator while this view is mounted.
+  useEffect(() => {
+    document.body.setAttribute('data-view', 'about');
+    return () => {
+      if (document.body.getAttribute('data-view') === 'about') {
+        document.body.removeAttribute('data-view');
+      }
+    };
+  }, []);
   return (
     <div style={S.appBg}>
       <header style={S.header}>
@@ -3870,7 +3816,7 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack }: {
   // DetailView's Get Directions button uses. Lets the slide-up card route
   // straight to maps without a stop in DetailView.
   const openDirections = (site: SinisterSite) => {
-    playBell();
+    playSubDrop();
     const lat = site.coords.lat;
     const lng = site.coords.lng;
     const label = encodeURIComponent(site.title);
@@ -4361,7 +4307,7 @@ function CategoryView({ label, color, sites, currentLocation, onSelectSite, onSu
         onClick={onSubmit}
         style={S.submitFixedButton}
       >
-        <span style={S.submitFixedButtonText}>Submit a Location</span>
+        <span style={S.submitFixedButtonText}>SUBMIT A LOCATION</span>
       </button>
     </div>
   );
@@ -4377,6 +4323,18 @@ function DetailView({ site, currentLocation, handle, deviceId, alreadyVisited, o
   onVisited: (siteId: string) => void;
   onBack: () => void;
 }) {
+  // Hide the iOS document scroll indicator while this view is mounted.
+  // The CSS rule for body[data-view="detail"] handles the actual hiding;
+  // we just toggle the attribute. Cleared on unmount so other views are
+  // unaffected.
+  useEffect(() => {
+    document.body.setAttribute('data-view', 'detail');
+    return () => {
+      if (document.body.getAttribute('data-view') === 'detail') {
+        document.body.removeAttribute('data-view');
+      }
+    };
+  }, []);
   const color = CATEGORY_COLOR[site.category as CategoryKey] || WHITE;
   const distM = currentLocation ? distanceMeters(currentLocation.lat, currentLocation.lng, site.coords.lat, site.coords.lng) : null;
   const distMi = distM ? (distM / 1609.34).toFixed(1) : null;
@@ -4451,7 +4409,7 @@ function DetailView({ site, currentLocation, handle, deviceId, alreadyVisited, o
     }
   };
   const handleDirections = () => {
-    playBell();
+    playSubDrop();
     // Smart cross-platform directions opener:
     //   1. Try `geo:` scheme — iOS/Android show an "open with..." picker so
     //      the user lands in their preferred maps app (Apple Maps, Google Maps,
@@ -5568,8 +5526,11 @@ const S: Record<string, React.CSSProperties> = {
   },
 
   // Submit a Locale — fixed above the social bar so it's always visible.
-  // Black fill with a glowing white outline matches the social bar buttons
-  // and reads cleanly with the Jolly Lodger font.
+  // Restyled to match the "BY SINISTER" tagline under the main logo: system
+  // bold sans-serif, uppercase, sinister red with a red glow. Bumped in
+  // size from the original 26pt Jolly Lodger so it reads as the primary
+  // call-to-action — submissions are how the catalog grows, so this needs
+  // to grab the eye on the home page and on every category view.
   submitFixedButton: {
     position: 'fixed',
     left: '50%',
@@ -5581,16 +5542,18 @@ const S: Record<string, React.CSSProperties> = {
     transform: 'translateX(-50%)',
     zIndex: 3,
     backgroundColor: 'transparent',
-    border: `2px solid ${WHITE}`,
-    color: WHITE,
-    fontFamily: '"Jolly Lodger", system-ui, serif',
-    fontSize: 26,
-    letterSpacing: '0.04em',
-    padding: '10px 28px',
+    border: `2px solid ${SINISTER_RED}`,
+    color: SINISTER_RED,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    fontSize: 18,
+    fontWeight: 700,
+    letterSpacing: '0.22em',
+    textTransform: 'uppercase' as const,
+    padding: '14px 34px',
     borderRadius: 12,
     cursor: 'pointer',
-    boxShadow: `0 0 16px ${WHITE}aa, 0 0 32px ${WHITE}55, inset 0 0 12px rgba(255,255,255,0.15)`,
-    textShadow: `0 0 10px ${WHITE}, 0 0 18px ${WHITE}88`,
+    boxShadow: `0 0 16px ${SINISTER_RED}aa, 0 0 32px ${SINISTER_RED}55, inset 0 0 12px rgba(193,43,43,0.15)`,
+    textShadow: `0 0 10px ${SINISTER_RED}, 0 0 18px ${SINISTER_RED}88`,
   },
   // Inner span on the submit button so just the TEXT pulses (button frame
   // stays still). Same animation as filmstrip cell titles for consistency.
@@ -5662,16 +5625,22 @@ const S: Record<string, React.CSSProperties> = {
   // Pill button used in the home bottom bar. Wider than the original 3-button
   // layout since there are now only 2 (Locations Near Me / More) sharing the
   // available width.
+  //
+  // Typography matches the "X Locations" count text under each home cell —
+  // system bold sans-serif with wide letter-spacing — so the bottom bar
+  // reads as the same family of supporting UI text instead of a random
+  // third font.
   socialBtn: {
     flex: 1,
     maxWidth: 200,
     backgroundColor: 'rgba(0,0,0,0.45)',
     border: `1.5px solid ${WHITE}`,
     color: WHITE,
-    fontFamily: 'inherit',
-    fontSize: 12,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    fontSize: 14,
     fontWeight: 700,
-    letterSpacing: '0.05em',
+    letterSpacing: '0.18em',
+    textTransform: 'uppercase' as const,
     padding: '10px 12px',
     borderRadius: 14,
     cursor: 'pointer',
@@ -5689,20 +5658,19 @@ const S: Record<string, React.CSSProperties> = {
     boxShadow: `0 0 16px ${WHITE}88, 0 0 28px ${WHITE}33`,
     textShadow: `0 0 8px ${WHITE}aa`,
   },
-  socialIcon: { fontSize: 14, lineHeight: 1 },
-  socialLabel: { fontSize: 12 },
+  socialIcon: { fontSize: 16, lineHeight: 1 },
+  socialLabel: { fontSize: 14 },
 
   // ---- More menu popup ----
   // Anchored above the More button (right-aligned). Sits at zIndex 11 so it
   // floats over the home bottom bar (zIndex 10) and the page content. Width
-  // matches roughly half the screen so it lines up neatly above the
-  // right-side button without spanning the full bar.
+  // bumped to 220 so the wider letter-spacing on the labels has room.
   moreMenuWrap: {
     position: 'fixed',
     bottom: 70,
     right: 14,
     zIndex: 11,
-    minWidth: 180,
+    minWidth: 220,
     backgroundColor: 'rgba(13, 13, 13, 0.97)',
     border: `1px solid ${WHITE}55`,
     borderRadius: 12,
@@ -5710,20 +5678,24 @@ const S: Record<string, React.CSSProperties> = {
     boxShadow: `0 0 20px rgba(0,0,0,0.7), 0 0 28px ${WHITE}22`,
     backdropFilter: 'blur(6px)',
   },
+  // Items in the More popup. Same typographic family as socialBtn (system
+  // bold sans, wide letter-spacing, uppercase) so opening the menu doesn't
+  // suddenly switch fonts on the user.
   moreMenuItem: {
     display: 'flex',
     alignItems: 'center',
     gap: 10,
     width: '100%',
     boxSizing: 'border-box' as const,
-    padding: '13px 16px',
+    padding: '14px 16px',
     backgroundColor: 'transparent',
     border: 'none',
     color: BONE,
-    fontFamily: 'inherit',
-    fontSize: 13,
-    fontWeight: 600,
-    letterSpacing: '0.04em',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    fontSize: 15,
+    fontWeight: 700,
+    letterSpacing: '0.18em',
+    textTransform: 'uppercase' as const,
     cursor: 'pointer',
     textAlign: 'left' as const,
   },
