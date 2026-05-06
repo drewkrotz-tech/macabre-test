@@ -273,15 +273,34 @@ const SINISTER_RED = '#C12B2B';
 //      screen, taking a call). Nothing in the old code re-resumed contexts
 //      on foreground, so they'd silently die between sessions.
 //
-// This unified system: one shared AudioContext, one shared listener that
-// resumes it on first user gesture AND every time the app returns to
-// foreground. Each file-based sound gets its own GainNode for independent
-// volume control but they all connect to the same destination.
+// Why "no sound until I close & reopen the app twice" specifically:
+//   AudioContexts created BEFORE any user gesture are born in 'suspended'
+//   state and stay that way until you call resume() inside a gesture event
+//   handler. Pre-creating the context on App mount, then calling resume()
+//   on visibilitychange, is NOT enough — iOS only honors resume() if it's
+//   inside a touch/click handler. So on cold app launch:
+//     1. App mounts, context created suspended
+//     2. User taps a button. The touchstart listener calls resume()
+//        (returns a Promise; not yet resolved).
+//     3. React onClick fires SAME tick. ctx.state is still 'suspended'.
+//        The sound's start(0) fires on a suspended context — silently
+//        dropped.
+//     4. Resume completes a moment later. Context is now running, but
+//        the sound the user wanted to hear was already lost.
+//   Closing+reopening "fixed" it because next launch had a context that
+//   somehow survived in running state (or the second launch happened to
+//   tap fast enough that resume completed before onClick). Non-deterministic.
 //
-// Synth-based sounds (playForward, playPop, playSubDrop, playGhostWisp)
-// already use this shared context via getAudioCtx() — no change needed.
+// The proper iOS unlock dance:
+//   On the FIRST user gesture, we create the context AND immediately play
+//   a silent zero-duration buffer SYNCHRONOUSLY inside the gesture handler.
+//   That silent buffer counts as audio playback INSIDE a user gesture,
+//   which is what iOS actually requires to unlock. After this, ctx.state
+//   is 'running' and any subsequent .start() calls work — including the
+//   one from the React onClick that's about to fire on the same tap.
 
 let _audioCtx: AudioContext | null = null;
+let _audioUnlocked = false;
 let _audioUnlockInstalled = false;
 
 function getAudioCtx(): AudioContext | null {
@@ -295,53 +314,91 @@ function getAudioCtx(): AudioContext | null {
       return null;
     }
   }
-  if (_audioCtx.state === 'suspended') {
-    _audioCtx.resume().catch(() => {});
-  }
   return _audioCtx;
 }
 
-// Install a one-time global unlock that resumes the shared AudioContext on
-// the very first user interaction, plus a visibility hook that resumes on
-// every foreground transition. Safe to call repeatedly — the flag prevents
-// duplicate listeners. Called from the App component on mount.
+// Performs the iOS unlock dance: ensure context exists, resume if suspended,
+// then play a 1-sample silent buffer to flush iOS's gesture-required lock.
+// Must be called INSIDE a real user-gesture event handler (touchstart,
+// pointerdown, click). Calling from a setTimeout, fetch callback, or
+// useEffect does NOT count as a user gesture on iOS.
+function unlockAudio() {
+  const ctx = getAudioCtx();
+  if (!ctx) return;
+  // resume() on a fresh context is a no-op if state is already 'running',
+  // and is the "iOS please honor this" signal if it's 'suspended'.
+  if (ctx.state === 'suspended') {
+    ctx.resume().catch(() => { /* silent */ });
+  }
+  // Silent buffer trick — this is what actually unlocks iOS audio.
+  // A 1-sample buffer at any sample rate is enough; iOS just needs
+  // .start(0) to be called inside the gesture handler.
+  try {
+    const buf = ctx.createBuffer(1, 1, 22050);
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(ctx.destination);
+    src.start(0);
+    _audioUnlocked = true;
+  } catch { /* silent */ }
+}
+
+// Install a one-time global unlock that fires on the very first user
+// interaction. Capture phase + the listener registered first means it
+// runs BEFORE any React onClick on the same gesture, so by the time
+// the onClick's play* call hits, ctx.state is already 'running' and
+// the sound plays as expected.
+//
+// Also resumes on every foreground transition (visibility/focus/pageshow)
+// to recover from iOS suspending the WebView (background, lock screen,
+// phone call). Note: iOS only requires the gesture-bound unlock ONCE
+// per page load; subsequent resumes from visibility events work even
+// without a gesture, as long as the original gesture-bound unlock
+// happened first.
 function installAudioUnlock() {
   if (_audioUnlockInstalled || typeof window === 'undefined') return;
   _audioUnlockInstalled = true;
 
-  const resumeAll = () => {
-    const ctx = _audioCtx;
-    if (ctx && ctx.state === 'suspended') {
-      ctx.resume().catch(() => {});
+  const onFirstGesture = () => {
+    unlockAudio();
+  };
+  // capture: true so we run before React's bubble-phase onClick handlers.
+  // Not `once: true` — we re-attach the gesture lock on every gesture
+  // until ctx is confirmed unlocked, in case the very first gesture's
+  // unlock attempt fails (iOS can be flaky under load on cold start).
+  const opts: AddEventListenerOptions = { capture: true, passive: true };
+  const wrappedHandler = () => {
+    onFirstGesture();
+    if (_audioUnlocked && _audioCtx && _audioCtx.state === 'running') {
+      // Successfully unlocked; remove listeners.
+      window.removeEventListener('touchstart', wrappedHandler, opts);
+      window.removeEventListener('touchend', wrappedHandler, opts);
+      window.removeEventListener('pointerdown', wrappedHandler, opts);
+      window.removeEventListener('mousedown', wrappedHandler, opts);
+      window.removeEventListener('keydown', wrappedHandler, opts);
     }
   };
+  window.addEventListener('touchstart', wrappedHandler, opts);
+  window.addEventListener('touchend', wrappedHandler, opts);
+  window.addEventListener('pointerdown', wrappedHandler, opts);
+  window.addEventListener('mousedown', wrappedHandler, opts);
+  window.addEventListener('keydown', wrappedHandler, opts);
 
-  // Fire on the first user gesture of any kind. Capture phase + once: true
-  // so we catch it before any handler can stop propagation, and so we only
-  // pay the cost once. iOS unlocks audio inside this callback because it's
-  // synchronous within the gesture event.
-  const onFirstGesture = () => {
-    // Force-create the context if it wasn't already, then resume.
-    getAudioCtx();
-    resumeAll();
+  // Resume on every foreground transition. Once the initial gesture-
+  // unlock has happened, these resume() calls succeed without needing
+  // another gesture — iOS only requires the very first unlock to be
+  // gesture-bound.
+  const resumeOnReturn = () => {
+    const ctx = _audioCtx;
+    if (ctx && ctx.state === 'suspended') {
+      ctx.resume().catch(() => { /* silent */ });
+    }
   };
-  const opts: AddEventListenerOptions = { once: true, capture: true, passive: true };
-  window.addEventListener('touchstart', onFirstGesture, opts);
-  window.addEventListener('touchend', onFirstGesture, opts);
-  window.addEventListener('pointerdown', onFirstGesture, opts);
-  window.addEventListener('mousedown', onFirstGesture, opts);
-  window.addEventListener('keydown', onFirstGesture, opts);
-
-  // Resume on every foreground transition. iOS suspends the WebView's
-  // AudioContext when the app is backgrounded, the screen locks, or a
-  // phone call comes in. Without this, the context stays suspended on
-  // return and every sound silently fails until the user fully closes
-  // and reopens the app — exactly the bug Drew kept hitting.
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') resumeAll();
+    if (document.visibilityState === 'visible') resumeOnReturn();
   });
-  window.addEventListener('focus', resumeAll);
-  window.addEventListener('pageshow', resumeAll);
+  window.addEventListener('focus', resumeOnReturn);
+  window.addEventListener('pageshow', resumeOnReturn);
 }
 
 function playForward() {
@@ -505,38 +562,81 @@ interface FileSoundSlot {
   volume: number;
   buffer: AudioBuffer | null;
   gain: GainNode | null;
+  // Raw ArrayBuffer fetched eagerly on app load, before any user gesture.
+  // Fetching audio bytes does NOT require an AudioContext — only
+  // decodeAudioData and playback do. Pre-fetching here means the first
+  // tap doesn't race a network round trip.
+  rawBytes: ArrayBuffer | null;
+  fetchStarted: boolean;
   initStarted: boolean;
 }
 
 const _fileSounds: Record<'slide' | 'button' | 'back' | 'bell', FileSoundSlot> = {
-  slide:  { url: slideSound1, volume: SLIDE_VOLUME,  buffer: null, gain: null, initStarted: false },
-  button: { url: buttonSound, volume: BUTTON_VOLUME, buffer: null, gain: null, initStarted: false },
-  back:   { url: backSound,   volume: BACK_VOLUME,   buffer: null, gain: null, initStarted: false },
-  bell:   { url: bellSound,   volume: BELL_VOLUME,   buffer: null, gain: null, initStarted: false },
+  slide:  { url: slideSound1, volume: SLIDE_VOLUME,  buffer: null, gain: null, rawBytes: null, fetchStarted: false, initStarted: false },
+  button: { url: buttonSound, volume: BUTTON_VOLUME, buffer: null, gain: null, rawBytes: null, fetchStarted: false, initStarted: false },
+  back:   { url: backSound,   volume: BACK_VOLUME,   buffer: null, gain: null, rawBytes: null, fetchStarted: false, initStarted: false },
+  bell:   { url: bellSound,   volume: BELL_VOLUME,   buffer: null, gain: null, rawBytes: null, fetchStarted: false, initStarted: false },
 };
 
+// Phase 1: fetch the raw audio bytes. Doesn't need AudioContext, can run
+// at any time including app boot before any user gesture. Idempotent.
+function prefetchFileSound(key: 'slide' | 'button' | 'back' | 'bell') {
+  const slot = _fileSounds[key];
+  if (slot.fetchStarted) return;
+  slot.fetchStarted = true;
+  fetch(slot.url)
+    .then(r => r.arrayBuffer())
+    .then(ab => { slot.rawBytes = ab; })
+    .catch(() => { slot.fetchStarted = false; /* allow retry */ });
+}
+
+// Pre-fetch all four sound files at module load. By the time the user
+// takes their first tap (which unlocks the AudioContext and decodes the
+// already-fetched bytes), the network round trip is already done.
+if (typeof window !== 'undefined') {
+  // Defer slightly so we don't block React's initial render on these
+  // four extra HTTP requests. setTimeout 0 puts them after first paint.
+  setTimeout(() => {
+    prefetchFileSound('slide');
+    prefetchFileSound('button');
+    prefetchFileSound('back');
+    prefetchFileSound('bell');
+  }, 0);
+}
+
+// Phase 2: decode the bytes into an AudioBuffer + create the GainNode.
+// Requires AudioContext, runs lazily on first play (post-unlock).
 function ensureFileSound(key: 'slide' | 'button' | 'back' | 'bell') {
   const slot = _fileSounds[key];
   if (slot.initStarted) return;
+  // Make sure phase 1 has at least started — if for some reason the
+  // module-load prefetch didn't run yet, kick it off.
+  prefetchFileSound(key);
   const ctx = getAudioCtx();
   if (!ctx) return;
+  // Need the raw bytes to decode. If they haven't arrived yet, leave
+  // initStarted=false and try again on next play.
+  if (!slot.rawBytes) return;
   slot.initStarted = true;
   try {
     slot.gain = ctx.createGain();
     slot.gain.gain.value = slot.volume;
     slot.gain.connect(ctx.destination);
-    fetch(slot.url)
-      .then(r => r.arrayBuffer())
-      .then(ab => ctx.decodeAudioData(ab))
-      .then(buf => { slot.buffer = buf; })
-      .catch(() => { /* silent — sound just won't play, app keeps working */ });
+    // decodeAudioData mutates the ArrayBuffer in some engines, so we
+    // pass a copy and clear the original after decode.
+    const bytesCopy = slot.rawBytes.slice(0);
+    ctx.decodeAudioData(bytesCopy)
+      .then(buf => {
+        slot.buffer = buf;
+        slot.rawBytes = null; // free the raw bytes once decoded
+      })
+      .catch(() => { slot.initStarted = false; /* allow retry */ });
   } catch { /* silent */ }
 }
 
 function playFileSound(key: 'slide' | 'button' | 'back' | 'bell') {
   const slot = _fileSounds[key];
-  // Lazy init on first call so we don't try to create AudioContext nodes
-  // before the user has tapped (some browsers throw on early creation).
+  // Lazy-init the decode + gain chain on first call.
   ensureFileSound(key);
   const ctx = _audioCtx;
   if (!ctx || !slot.buffer || !slot.gain) return;
@@ -968,19 +1068,43 @@ function buildStyleCss() {
    Body gets data-view="detail" / "about" / "leaders" set by a small
    effect when those views mount, and reverts on unmount. The home
    filmstrip and other internal scroll containers are untouched
-   because they aren't the document scroller. */
+   because they aren't the document scroller.
+
+   Belt-and-suspenders approach because iOS WKWebView's scroll
+   indicator can appear via different paths depending on iOS version:
+   - ::-webkit-scrollbar (older WebKit-style scrollbar)
+   - ::-webkit-scrollbar-thumb / -track (the parts of the same)
+   - scrollbar-width: none (Firefox and modern WebKit)
+   - The native iOS overlay scrollbar (this is the thin grey one
+     that briefly appears during scroll). It can't be hidden via
+     CSS in all iOS versions, but recent versions DO honor
+     `scrollbar-width: none` on the scrolling element. */
 body[data-view="detail"]::-webkit-scrollbar,
 body[data-view="about"]::-webkit-scrollbar,
-body[data-view="leaders"]::-webkit-scrollbar {
-  display: none;
-  width: 0;
-  height: 0;
+body[data-view="leaders"]::-webkit-scrollbar,
+body[data-view="detail"]::-webkit-scrollbar-thumb,
+body[data-view="about"]::-webkit-scrollbar-thumb,
+body[data-view="leaders"]::-webkit-scrollbar-thumb,
+body[data-view="detail"]::-webkit-scrollbar-track,
+body[data-view="about"]::-webkit-scrollbar-track,
+body[data-view="leaders"]::-webkit-scrollbar-track,
+html[data-view="detail"]::-webkit-scrollbar,
+html[data-view="about"]::-webkit-scrollbar,
+html[data-view="leaders"]::-webkit-scrollbar {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+  -webkit-appearance: none !important;
+  background: transparent !important;
 }
 body[data-view="detail"],
 body[data-view="about"],
-body[data-view="leaders"] {
-  scrollbar-width: none;
-  -ms-overflow-style: none;
+body[data-view="leaders"],
+html[data-view="detail"],
+html[data-view="about"],
+html[data-view="leaders"] {
+  scrollbar-width: none !important;
+  -ms-overflow-style: none !important;
 }
 
 /* Animated film grain — used inside the .projector-grain layer */
@@ -1295,19 +1419,14 @@ export default function App() {
     return () => { cancelled = true; };
   }, []);
 
-  // Audio system bootstrap. Installs the single global unlock that resumes
-  // the shared AudioContext on first user gesture AND on every foreground
-  // transition (visibility, focus, pageshow). Also kicks off pre-loading of
-  // the four file-based sound buffers so they're ready when the user taps.
-  // See the audio section at the top of the file for the full architecture.
+  // Audio system bootstrap. Installs the gesture-bound unlock listener
+  // that flushes iOS's "audio requires user gesture" lock on first tap.
+  // Sound buffers are fetched+decoded lazily on first play (NOT here)
+  // because creating buffer-decode work tied to a still-suspended context
+  // before any user gesture wastes effort and can race the unlock.
+  // See the audio section at the top of the file for full architecture.
   useEffect(() => {
     try { installAudioUnlock(); } catch { /* silent */ }
-    // Pre-fetch + decode all four file sounds so the first tap doesn't
-    // race a network/decode round-trip. ensureFileSound is idempotent.
-    try { ensureFileSound('slide'); } catch { /* silent */ }
-    try { ensureFileSound('button'); } catch { /* silent */ }
-    try { ensureFileSound('back'); } catch { /* silent */ }
-    try { ensureFileSound('bell'); } catch { /* silent */ }
   }, []);
 
   // ----- iOS-style swipe-back drag (ref-based) -----
@@ -2321,9 +2440,13 @@ function LeadersView({ currentHandle, onSelectHandle, onBack }: {
   // Hide the iOS document scroll indicator while this view is mounted.
   useEffect(() => {
     document.body.setAttribute('data-view', 'leaders');
+    document.documentElement.setAttribute('data-view', 'leaders');
     return () => {
       if (document.body.getAttribute('data-view') === 'leaders') {
         document.body.removeAttribute('data-view');
+      }
+      if (document.documentElement.getAttribute('data-view') === 'leaders') {
+        document.documentElement.removeAttribute('data-view');
       }
     };
   }, []);
@@ -3505,9 +3628,13 @@ function AboutView({ onBack }: { onBack: () => void }) {
   // Hide the iOS document scroll indicator while this view is mounted.
   useEffect(() => {
     document.body.setAttribute('data-view', 'about');
+    document.documentElement.setAttribute('data-view', 'about');
     return () => {
       if (document.body.getAttribute('data-view') === 'about') {
         document.body.removeAttribute('data-view');
+      }
+      if (document.documentElement.getAttribute('data-view') === 'about') {
+        document.documentElement.removeAttribute('data-view');
       }
     };
   }, []);
@@ -4384,13 +4511,19 @@ function DetailView({ site, currentLocation, handle, deviceId, alreadyVisited, o
 }) {
   // Hide the iOS document scroll indicator while this view is mounted.
   // The CSS rule for body[data-view="detail"] handles the actual hiding;
-  // we just toggle the attribute. Cleared on unmount so other views are
-  // unaffected.
+  // we just toggle the attribute. Set on both documentElement (html) and
+  // body because iOS WKWebView is inconsistent about which element is
+  // the actual document scroller across versions. Cleared on unmount so
+  // other views are unaffected.
   useEffect(() => {
     document.body.setAttribute('data-view', 'detail');
+    document.documentElement.setAttribute('data-view', 'detail');
     return () => {
       if (document.body.getAttribute('data-view') === 'detail') {
         document.body.removeAttribute('data-view');
+      }
+      if (document.documentElement.getAttribute('data-view') === 'detail') {
+        document.documentElement.removeAttribute('data-view');
       }
     };
   }, []);
