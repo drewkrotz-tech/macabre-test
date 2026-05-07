@@ -23,7 +23,7 @@ if (typeof document !== 'undefined' && !document.getElementById('__livinghell-fo
 import { SINISTER_SITES as FALLBACK_SITES, SinisterSite } from './locations';
 
 // ---------- Production server URL ----------
-const API_BASE = 'https://api.sinistertrivia.com';
+const API_BASE = 'https://dread.sinistertrivia.com';
 
 // ---------- Device identity (handle system) ----------
 // Auto-generated stable id stored on first launch. Used to prove ownership of
