@@ -1,41 +1,34 @@
-// geofencing.ts — Sinister Locales geofencing layer (v2)
+// geofencing.ts — Sinister Locales geofencing layer (v3, Transistor plugin)
 //
-// On NATIVE (iOS/Android via Capacitor):
-//   - Requests notification + location permissions on demand
-//   - Watches user position in the background (foreground service on Android,
-//     iOS background-location mode)
-//   - Maintains an active set of the 20 closest sites (Apple's per-app fence
-//     limit). Recomputes when the user moves > RECALC_THRESHOLD_M.
-//   - On region enter: fires a local notification "You're near {title}"
-//   - Notification tap (foreground OR background) dispatches a window
-//     'sinister:open-site' event that App.tsx listens to.
+// Switched from @capacitor-community/background-geolocation (which couldn't
+// monitor regions while the JS engine was suspended on iOS) to
+// @transistorsoft/capacitor-background-geolocation. The Transistor plugin
+// wraps CLLocationManager.startMonitoring(for: CLCircularRegion) on iOS,
+// which runs in CoreLocation's process — so iOS will wake the app from a
+// terminated state when the user crosses a geofence boundary, even hours
+// or days later. That fixes the core "no notifications when app is closed"
+// problem that App_84 through App_170 were stuck on.
 //
-// On WEB (StackBlitz preview):
-//   - Falls back to navigator.geolocation.watchPosition for the location
-//     dot in the UI. No notifications, no background.
+// Public API is unchanged so App.tsx doesn't need edits:
+//   setSites, startGeofencing, stopGeofencing, requestPermissions,
+//   getDebugLog, clearDebugLog, distanceMeters, simulateLocation
 //
-// Changes vs v1:
-//   - REPLACED `new Function('s', 'return import(s)')` with real dynamic
-//     `await import()` calls. The Function-constructor hack was bypassing
-//     Vite's module resolution AND failing silently inside Capacitor on
-//     iOS, which was the root cause of the Submit button never enabling
-//     (no permission prompt -> no Settings entry -> currentLocation null).
-//   - Cached imported plugin modules at module scope so we don't re-import
-//     on every fence check.
-//   - Added a debug log ring buffer (getDebugLog()) so App.tsx can show
-//     what's actually happening on TestFlight without us rebuilding.
-//   - Added foreground notification listener (localNotificationReceived)
-//     so taps work whether the app is open or backgrounded.
-//   - Added an Android notification channel init (no-op on iOS).
-//   - Permission response now distinguishes "always" vs "whileInUse" so
-//     App.tsx can show a one-time "Enable Always for drive-by alerts" UI.
+// Behaviour:
+//   - On startGeofencing(): feed the 20 nearest sites to the native plugin
+//     as proper iOS regions (radius 800m / ~0.5 mile each)
+//   - Plugin's onGeofence event fires on enter, even from a fully-killed app
+//   - We schedule a local notification "You're near {title}" on enter
+//   - When the user moves > RECALC_THRESHOLD_M, we recompute the 20 closest
+//     sites and refresh the active fences
+//   - WEB fallback (Vite dev / browser preview) uses navigator.geolocation
+//     for the dot in the UI — no notifications, no background.
 
 import type { SinisterSite } from './locations';
 
 // ---------- Tunables ----------
-const GEOFENCE_RADIUS_M = 800;        // 0.5 mile per site
+const GEOFENCE_RADIUS_M = 800;        // 0.5 mile per site (matches v2)
 const MAX_FENCES = 20;                // Apple's per-app limit
-const RECALC_THRESHOLD_M = 1500;      // recompute fence set when user moves > this from anchor
+const RECALC_THRESHOLD_M = 1500;      // refresh fences when user moves > this from anchor
 const NOTIFICATION_COOLDOWN_MS = 30 * 60 * 1000; // don't re-notify same site within 30 min
 const ANDROID_CHANNEL_ID = 'sinister_proximity';
 
@@ -58,6 +51,14 @@ function getPlatform(): 'ios' | 'android' | 'web' {
 const DEBUG_LOG_MAX = 200;
 const _debugLog: string[] = [];
 function dlog(msg: string) {
+  // Drain pre-buffered messages from module-load time on first call
+  try {
+    const buf = (globalThis as any).__earlyLogBuf as string[] | undefined;
+    if (buf && buf.length) {
+      for (const l of buf) _debugLog.push(l);
+      buf.length = 0;
+    }
+  } catch {}
   const ts = new Date().toISOString().slice(11, 19);
   const line = `[${ts}] ${msg}`;
   _debugLog.push(line);
@@ -72,45 +73,86 @@ export function clearDebugLog() {
   _debugLog.length = 0;
 }
 
-// ---------- Cached plugin modules ----------
-let _bgGeoMod: any = null;
-let _localNotifMod: any = null;
-
-async function loadBgGeo(): Promise<any> {
-  if (_bgGeoMod) return _bgGeoMod;
-  // Web preview (StackBlitz) doesn't have native plugins installed — only
-  // try the import on actual native platforms. The @vite-ignore comment
-  // also tells Vite's import-analysis to skip this string at preview time
-  // so the dev overlay doesn't crash with "package not found." On iOS,
-  // Codemagic's build machine has the package installed and the import
-  // resolves normally at runtime.
-  if (!isNative()) return null;
+// --- Global error trap (kept from v2 for diagnosis) ---
+(function installGlobalErrorTrap(){
+  if (typeof window === 'undefined') return;
+  if ((window as any).__geoErrTrapInstalled) return;
+  (window as any).__geoErrTrapInstalled = true;
   try {
-    const mod: any = await import(/* @vite-ignore */ '@capacitor-community/background-geolocation');
-    _bgGeoMod = mod.BackgroundGeolocation || mod.default?.BackgroundGeolocation || mod.default || mod;
-    if (!_bgGeoMod || typeof _bgGeoMod.addWatcher !== 'function') {
-      dlog('bg-geolocation module loaded but addWatcher missing; keys=' + Object.keys(mod || {}).join(','));
-      _bgGeoMod = null;
-    }
-  } catch (err: any) {
-    dlog('bg-geolocation import failed: ' + (err?.message || err));
-    _bgGeoMod = null;
+    window.addEventListener('error', (ev: any) => {
+      const msg = ev?.error?.message || ev?.message || String(ev);
+      const stk = ev?.error?.stack ? (' | ' + String(ev.error.stack).split('\n').slice(0,3).join(' :: ')) : '';
+      _modulePushLog('GLOBAL ERROR: ' + msg + stk);
+    });
+    window.addEventListener('unhandledrejection', (ev: any) => {
+      const r = ev?.reason;
+      const msg = r?.message || String(r);
+      const stk = r?.stack ? (' | ' + String(r.stack).split('\n').slice(0,3).join(' :: ')) : '';
+      _modulePushLog('UNHANDLED REJECTION: ' + msg + stk);
+    });
+  } catch {}
+})();
+function _modulePushLog(msg: string) {
+  try {
+    const ts = new Date().toISOString().slice(11, 19);
+    const line = '[' + ts + '] ' + msg;
+    (globalThis as any).__earlyLogBuf = (globalThis as any).__earlyLogBuf || [];
+    (globalThis as any).__earlyLogBuf.push(line);
+  } catch {}
+}
+_modulePushLog('GEOFENCING MODULE LOADED (v3 Transistor)');
+
+// ---------- Plugin proxies ----------
+// LocalNotifications still uses Capacitor's registerPlugin — that part is
+// unchanged. The Transistor BG geolocation plugin is imported as an ES module
+// since it ships its own JS API surface.
+import { registerPlugin } from '@capacitor/core';
+
+// We import lazily so web builds don't choke trying to load native bindings.
+// The plugin works on iOS via the JS bridge; on web the import resolves but
+// any method call is a no-op or rejects.
+let _BG: any = null;
+async function loadBgGeo(): Promise<any | null> {
+  if (_BG) return _BG;
+  if (!isNative()) {
+    dlog('loadBgGeo: not native, skipping plugin import');
+    return null;
   }
-  return _bgGeoMod;
+  try {
+    dlog('loadBgGeo: dynamic import @transistorsoft/capacitor-background-geolocation');
+    const mod = await import('@transistorsoft/capacitor-background-geolocation');
+    // The plugin exports BackgroundGeolocation as default; some bundlers also
+    // expose it on .BackgroundGeolocation. Try both.
+    _BG = (mod as any).default || (mod as any).BackgroundGeolocation || mod;
+    dlog('loadBgGeo: plugin loaded, has ready=' + (typeof _BG?.ready === 'function'));
+    return _BG;
+  } catch (err: any) {
+    dlog('loadBgGeo: import failed: ' + (err?.message || err));
+    return null;
+  }
 }
 
-async function loadLocalNotif(): Promise<any> {
+interface LocalNotifPlugin {
+  schedule(opts: { notifications: any[] }): Promise<any>;
+  requestPermissions(): Promise<{ display: string }>;
+  createChannel?(opts: any): Promise<void>;
+  removeAllListeners?(): Promise<void>;
+  addListener(eventName: string, cb: (data: any) => void): { remove: () => void } | Promise<any>;
+}
+let _localNotifMod: LocalNotifPlugin | null = null;
+function loadLocalNotif(): LocalNotifPlugin | null {
   if (_localNotifMod) return _localNotifMod;
   if (!isNative()) return null;
   try {
-    const mod: any = await import(/* @vite-ignore */ '@capacitor/local-notifications');
-    _localNotifMod = mod.LocalNotifications || mod.default?.LocalNotifications || mod.default || mod;
-    if (!_localNotifMod || typeof _localNotifMod.schedule !== 'function') {
-      dlog('local-notifications module loaded but schedule missing; keys=' + Object.keys(mod || {}).join(','));
-      _localNotifMod = null;
+    const proxy = registerPlugin<LocalNotifPlugin>('LocalNotifications');
+    if (!proxy) {
+      dlog('LocalNotifications registerPlugin returned null');
+      return null;
     }
+    _localNotifMod = proxy;
+    dlog('LocalNotifications plugin registered');
   } catch (err: any) {
-    dlog('local-notifications import failed: ' + (err?.message || err));
+    dlog('LocalNotifications registerPlugin failed: ' + (err?.message || err));
     _localNotifMod = null;
   }
   return _localNotifMod;
@@ -124,25 +166,40 @@ export type Permissions = {
 };
 
 let _watchId: number | null = null;
-let _nativeWatchHandle: any = null;
+let _bgReady = false;
+let _bgStarted = false;
 let _siteList: SinisterSite[] = [];
 let _activeFenceIds: Set<string> = new Set();
 let _lastAnchor: { lat: number; lng: number } | null = null;
 let _lastNotifiedAt: Map<string, number> = new Map();
+// Per-site presence tracking. A site id lives in this set from the moment
+// we get a confirmed ENTER until we get a debounced EXIT. While a site is
+// in the set, additional ENTER events are ignored as GPS jitter — that
+// stops the hotel-stay repeat-notification bug. The 30-min cooldown above
+// stays in place as defense-in-depth in case we ever miss an EXIT.
+let _currentlyInside: Set<string> = new Set();
+// In-flight EXIT debounce timers keyed by site id. We don't trust the very
+// first EXIT event because GPS at the radius boundary flickers; we wait
+// EXIT_DEBOUNCE_MS for the device to stay outside before treating exit as
+// real. If we get an ENTER for the same site before the timer fires, we
+// cancel — that was just jitter.
+const EXIT_DEBOUNCE_MS = 60 * 1000;
+let _pendingExitTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
 let _onPosition: ((lat: number, lng: number) => void) | null = null;
 let _notifListenersAttached = false;
+let _bgListenersAttached = false;
 
 export function setSites(sites: SinisterSite[]) {
   _siteList = sites;
   dlog(`setSites: ${sites.length} sites loaded`);
-  if (_lastAnchor && isNative()) {
+  if (_lastAnchor && isNative() && _bgStarted) {
     void recomputeFences(_lastAnchor.lat, _lastAnchor.lng);
   }
 }
 
 async function attachNotifListeners(): Promise<void> {
   if (_notifListenersAttached) return;
-  const LN = await loadLocalNotif();
+  const LN = loadLocalNotif();
   if (!LN) return;
   try {
     if (typeof LN.removeAllListeners === 'function') {
@@ -168,7 +225,7 @@ async function attachNotifListeners(): Promise<void> {
 
 async function ensureAndroidChannel(): Promise<void> {
   if (getPlatform() !== 'android') return;
-  const LN = await loadLocalNotif();
+  const LN = loadLocalNotif();
   if (!LN || typeof LN.createChannel !== 'function') return;
   try {
     await LN.createChannel({
@@ -186,70 +243,202 @@ async function ensureAndroidChannel(): Promise<void> {
   }
 }
 
+// Wire up Transistor plugin event listeners — we do this once on first
+// ready(). The onGeofence handler is what fires when iOS wakes the app
+// from a region cross, even if the app was fully terminated.
+async function attachBgListeners(BG: any): Promise<void> {
+  if (_bgListenersAttached) return;
+  try {
+    BG.onLocation((location: any) => {
+      const lat = location?.coords?.latitude;
+      const lng = location?.coords?.longitude;
+      if (typeof lat !== 'number' || typeof lng !== 'number') return;
+      if (_onPosition) _onPosition(lat, lng);
+      // Recompute fences if user has drifted far from anchor
+      if (!_lastAnchor || distanceMeters(lat, lng, _lastAnchor.lat, _lastAnchor.lng) > RECALC_THRESHOLD_M) {
+        _lastAnchor = { lat, lng };
+        void recomputeFences(lat, lng);
+      }
+    }, (err: any) => {
+      dlog('onLocation error: ' + (err?.message || err));
+    });
+
+    BG.onGeofence((event: any) => {
+      // event = { identifier, action: 'ENTER'|'EXIT'|'DWELL', location: {...} }
+      const id = event?.identifier;
+      const action = event?.action;
+      dlog(`onGeofence: ${action} ${id}`);
+
+      const site = _siteList.find(s => s.id === id);
+      if (!site) {
+        dlog('onGeofence: site not found for id=' + id);
+        return;
+      }
+
+      if (action === 'ENTER') {
+        // Cancel any pending exit debounce for this site — we entered again
+        // before the exit was confirmed, so the prior "exit" was just GPS
+        // jitter at the boundary.
+        const pending = _pendingExitTimers.get(site.id);
+        if (pending) {
+          clearTimeout(pending);
+          _pendingExitTimers.delete(site.id);
+          dlog('onGeofence: cancelled pending exit for ' + site.title);
+        }
+        // If we already think the user is inside this site, this ENTER is
+        // a duplicate (GPS reacquisition, signal regain, etc.). Suppress —
+        // this is the core of the hotel-stay fix.
+        if (_currentlyInside.has(site.id)) {
+          dlog('onGeofence: already inside ' + site.title + ', ignoring duplicate ENTER');
+          return;
+        }
+        // Defense-in-depth time cooldown: still respected so a misbehaving
+        // exit-handling path can't spam notifications.
+        const now = Date.now();
+        const lastAt = _lastNotifiedAt.get(site.id) || 0;
+        if (now - lastAt < NOTIFICATION_COOLDOWN_MS) {
+          dlog('onGeofence: cooldown active for ' + site.title);
+          // Still mark as inside so subsequent jitter ENTERs are deduped.
+          _currentlyInside.add(site.id);
+          return;
+        }
+        _currentlyInside.add(site.id);
+        _lastNotifiedAt.set(site.id, now);
+        void fireNotification(site);
+        return;
+      }
+
+      if (action === 'EXIT') {
+        // Don't trust the first EXIT — wait EXIT_DEBOUNCE_MS to confirm
+        // the user really left and isn't just dancing on the boundary.
+        if (_pendingExitTimers.has(site.id)) {
+          // Already a pending confirmation — let it run.
+          return;
+        }
+        const timer = setTimeout(() => {
+          _currentlyInside.delete(site.id);
+          _pendingExitTimers.delete(site.id);
+          dlog('onGeofence: confirmed exit from ' + site.title);
+        }, EXIT_DEBOUNCE_MS);
+        _pendingExitTimers.set(site.id, timer);
+        dlog('onGeofence: pending exit from ' + site.title + ' (debouncing)');
+        return;
+      }
+
+      // DWELL or anything else — ignore for now.
+    });
+
+    BG.onMotionChange((event: any) => {
+      dlog('onMotionChange: isMoving=' + event?.isMoving);
+    });
+
+    BG.onProviderChange((event: any) => {
+      dlog('onProviderChange: status=' + event?.status + ' enabled=' + event?.enabled);
+    });
+
+    _bgListenersAttached = true;
+    dlog('BG listeners attached');
+  } catch (err: any) {
+    dlog('attachBgListeners failed: ' + (err?.message || err));
+  }
+}
+
+// Ready the Transistor plugin once. Subsequent calls are no-ops because the
+// plugin remembers state across launches (that's the whole point — so iOS
+// can re-launch the app on a region cross and the plugin is still configured).
+async function ensureBgReady(BG: any): Promise<boolean> {
+  if (_bgReady) return true;
+  try {
+    dlog('BG.ready: configuring plugin');
+    const state = await BG.ready({
+      // Distance-based location sampling. We don't need high frequency — we
+      // mainly use locations to refresh the active fence set as the user moves.
+      desiredAccuracy: BG.DESIRED_ACCURACY_HIGH,
+      distanceFilter: 50,
+      // Geofencing: respond to ENTER events. EXIT we can leave on for future
+      // "you're leaving" features; DWELL would fire after standing inside a
+      // fence for a while — not useful for us.
+      geofenceModeHighAccuracy: false,
+      // Lifecycle: we WANT tracking to keep going when the user closes the
+      // app, and to auto-restart on device reboot. This is the whole reason
+      // we swapped plugins.
+      stopOnTerminate: false,
+      startOnBoot: true,
+      // Notifications layer (Android-specific). On iOS the plugin handles
+      // its own background-mode setup via Info.plist UIBackgroundModes.
+      foregroundService: true,
+      notification: {
+        title: 'The Dread Directory',
+        text: 'Watching for nearby sinister sites',
+      },
+      // Quiet logging. Set to LOG_LEVEL_VERBOSE if we need to debug a build.
+      debug: false,
+      logLevel: BG.LOG_LEVEL_WARNING,
+    });
+    dlog('BG.ready: state.enabled=' + state?.enabled + ' authorization=' + state?.providerState?.status);
+    _bgReady = true;
+    return true;
+  } catch (err: any) {
+    dlog('BG.ready failed: ' + (err?.message || err));
+    return false;
+  }
+}
+
 export async function requestPermissions(): Promise<Permissions> {
-  dlog('requestPermissions ENTRY, isNative=' + isNative());
+  dlog('RP-1 ENTRY, isNative=' + isNative());
   if (!isNative()) {
     return { location: 'unknown', notifications: false };
   }
 
   const result: Permissions = { location: 'unknown', notifications: false };
 
-  const LN = await loadLocalNotif();
+  // 1. Local notifications (5s timeout — known to hang on some iOS versions)
+  const LN = loadLocalNotif();
   if (LN) {
     try {
-      const perm = await LN.requestPermissions();
+      const perm: any = await Promise.race([
+        LN.requestPermissions(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('LN.requestPermissions timeout')), 5000)),
+      ]);
       result.notifications = perm?.display === 'granted';
-      dlog('notification permission: ' + perm?.display);
+      dlog('RP-LN: notification permission: ' + perm?.display);
       await ensureAndroidChannel();
       await attachNotifListeners();
     } catch (err: any) {
-      dlog('requestPermissions(LN) failed: ' + (err?.message || err));
+      dlog('RP-LN failed: ' + (err?.message || err));
     }
-  } else {
-    dlog('LocalNotifications module not available');
   }
 
+  // 2. Background location (the Transistor way — we ready() the plugin and
+  //    then ask for "Always" authorization).
   const BG = await loadBgGeo();
   if (BG) {
     try {
-      let promptFiredId: string | null = null;
-      const watcherId = await BG.addWatcher(
-        {
-          backgroundMessage: 'The Dread Directory is watching for nearby sites.',
-          backgroundTitle: 'Nearby Sites',
-          requestPermissions: true,
-          stale: false,
-          distanceFilter: 50,
-        },
-        (location: any, error: any) => {
-          if (error) {
-            dlog('initial watcher error: code=' + error.code + ' msg=' + error.message);
-            if (error.code === 'NOT_AUTHORIZED' || error.code === 'PERMISSION_DENIED') {
-              result.location = 'denied';
-            }
-            return;
-          }
-          if (location) {
-            if (result.location === 'unknown') result.location = 'whileInUse';
-            dlog('initial fix: ' + location.latitude.toFixed(4) + ',' + location.longitude.toFixed(4));
-          }
-        }
-      );
-      promptFiredId = watcherId;
-      try {
-        await BG.removeWatcher({ id: promptFiredId });
-        dlog('priming watcher removed');
-      } catch (err: any) {
-        dlog('removeWatcher (priming) failed: ' + (err?.message || err));
+      await ensureBgReady(BG);
+      await attachBgListeners(BG);
+      // requestPermission returns the AUTHORIZATION_STATUS_* enum value.
+      // ALWAYS = 3, WHEN_IN_USE = 4, DENIED = 1, NOT_DETERMINED = 0.
+      // The plugin will surface the iOS "Always Allow" prompt the first time.
+      const status = await BG.requestPermission();
+      dlog('RP-BG: requestPermission returned status=' + status);
+      if (status === BG.AUTHORIZATION_STATUS_ALWAYS) {
+        result.location = 'always';
+      } else if (status === BG.AUTHORIZATION_STATUS_WHEN_IN_USE) {
+        result.location = 'whileInUse';
+      } else if (status === BG.AUTHORIZATION_STATUS_DENIED) {
+        result.location = 'denied';
+      } else {
+        result.location = 'unknown';
       }
     } catch (err: any) {
-      dlog('requestPermissions(BG) failed: ' + (err?.message || err));
+      dlog('RP-BG failed: ' + (err?.message || err));
       result.location = 'denied';
     }
   } else {
     dlog('BackgroundGeolocation module not available');
   }
 
+  dlog('RP done: location=' + result.location + ' notifs=' + result.notifications);
   return result;
 }
 
@@ -277,40 +466,40 @@ export async function startGeofencing(onPosition: (lat: number, lng: number) => 
     return;
   }
 
+  await ensureBgReady(BG);
+  await attachBgListeners(BG);
+
+  // Get an initial position so we can set up the first batch of fences.
+  // Don't fail if this errors — onLocation will populate _lastAnchor on
+  // the next motion event anyway.
   try {
-    _nativeWatchHandle = await BG.addWatcher(
-      {
-        backgroundMessage: 'The Dread Directory is watching for nearby sites.',
-        backgroundTitle: 'Nearby Sites',
-        // Belt-and-suspenders: re-request here too. If requestPermissions()
-        // earlier didn't fully grant (or returned before the prompt was
-        // answered), this still gets us a working watcher once the user
-        // grants. iOS won't show a duplicate prompt if already granted.
-        requestPermissions: true,
-        stale: false,
-        distanceFilter: 50,
-      },
-      async (location: any, error: any) => {
-        if (error) {
-          dlog('watcher error: code=' + error.code + ' msg=' + error.message);
-          return;
-        }
-        if (!location) return;
-        const lat: number = location.latitude;
-        const lng: number = location.longitude;
-
-        if (_onPosition) _onPosition(lat, lng);
-
-        if (!_lastAnchor || distanceMeters(lat, lng, _lastAnchor.lat, _lastAnchor.lng) > RECALC_THRESHOLD_M) {
-          _lastAnchor = { lat, lng };
-          await recomputeFences(lat, lng);
-        }
-        checkFenceTriggers(lat, lng);
-      }
-    );
-    dlog('native watcher started, handle=' + _nativeWatchHandle);
+    const loc = await BG.getCurrentPosition({
+      timeout: 30,
+      maximumAge: 60000,
+      desiredAccuracy: 100,
+    });
+    const lat = loc?.coords?.latitude;
+    const lng = loc?.coords?.longitude;
+    if (typeof lat === 'number' && typeof lng === 'number') {
+      _lastAnchor = { lat, lng };
+      if (_onPosition) _onPosition(lat, lng);
+      await recomputeFences(lat, lng);
+      dlog('startGeofencing: initial fix ' + lat.toFixed(4) + ',' + lng.toFixed(4));
+    }
   } catch (err: any) {
-    dlog('startGeofencing addWatcher failed: ' + (err?.message || err));
+    dlog('startGeofencing: getCurrentPosition failed: ' + (err?.message || err));
+  }
+
+  // Start the plugin. From here the OS-level geofences are armed; the app
+  // can be closed and iOS will still wake it on region crosses.
+  try {
+    if (!_bgStarted) {
+      const state = await BG.start();
+      _bgStarted = true;
+      dlog('BG.start: enabled=' + state?.enabled);
+    }
+  } catch (err: any) {
+    dlog('BG.start failed: ' + (err?.message || err));
   }
 }
 
@@ -323,61 +512,94 @@ export async function stopGeofencing(): Promise<void> {
     _watchId = null;
   }
 
-  if (_nativeWatchHandle && isNative()) {
+  if (isNative() && _bgStarted) {
     const BG = await loadBgGeo();
     if (BG) {
       try {
-        await BG.removeWatcher({ id: _nativeWatchHandle });
-        dlog('native watcher removed');
+        await BG.removeGeofences();
+        await BG.stop();
+        _bgStarted = false;
+        _activeFenceIds.clear();
+        dlog('BG stopped + fences removed');
       } catch (err: any) {
-        dlog('removeWatcher failed: ' + (err?.message || err));
+        dlog('BG.stop failed: ' + (err?.message || err));
       }
     }
-    _nativeWatchHandle = null;
   }
 }
 
 export function simulateLocation(lat: number, lng: number) {
   if (_onPosition) _onPosition(lat, lng);
-  if (isNative()) {
-    // Native: only fakes the UI hook, not the OS position.
-  } else {
-    checkFenceTriggers(lat, lng);
+  if (!isNative()) {
+    // Web simulator: manually run the fence check since we don't have native fences.
+    const now = Date.now();
+    for (const site of _siteList) {
+      const d = distanceMeters(lat, lng, site.coords.lat, site.coords.lng);
+      if (d > GEOFENCE_RADIUS_M) continue;
+      const lastAt = _lastNotifiedAt.get(site.id) || 0;
+      if (now - lastAt < NOTIFICATION_COOLDOWN_MS) continue;
+      _lastNotifiedAt.set(site.id, now);
+      dlog(`SIM TRIGGER: ${site.title} at ${Math.round(d)}m`);
+      void fireNotification(site);
+    }
   }
 }
 
 // ---------- Internal helpers ----------
 
+// Ranks sites by distance from (lat,lng) and pushes the top 20 to the native
+// plugin as proper iOS regions. The plugin's removeGeofences() + addGeofences()
+// pattern is atomic enough for our needs — we don't worry about briefly
+// having zero fences active during the swap because the user has to be
+// physically near a site at that exact moment for it to matter.
 async function recomputeFences(lat: number, lng: number): Promise<void> {
   if (_siteList.length === 0) return;
+  if (!isNative()) {
+    // Web: we don't push to a native plugin, but we still update the active set
+    // so simulateLocation() knows what to check.
+    const ranked = _siteList
+      .map(s => ({ site: s, d: distanceMeters(lat, lng, s.coords.lat, s.coords.lng) }))
+      .sort((a, b) => a.d - b.d)
+      .slice(0, MAX_FENCES);
+    _activeFenceIds = new Set(ranked.map(r => r.site.id));
+    return;
+  }
+
+  const BG = await loadBgGeo();
+  if (!BG) return;
+
   const ranked = _siteList
     .map(s => ({ site: s, d: distanceMeters(lat, lng, s.coords.lat, s.coords.lng) }))
     .sort((a, b) => a.d - b.d)
     .slice(0, MAX_FENCES);
-  const newIds = new Set(ranked.map(r => r.site.id));
-  _activeFenceIds = newIds;
-  dlog(`recomputeFences: ${newIds.size} active, nearest=${ranked[0]?.site.title} (${Math.round(ranked[0]?.d || 0)}m)`);
-}
 
-function checkFenceTriggers(lat: number, lng: number): void {
-  const now = Date.now();
-  for (const site of _siteList) {
-    if (!_activeFenceIds.has(site.id)) continue;
-    const d = distanceMeters(lat, lng, site.coords.lat, site.coords.lng);
-    if (d > GEOFENCE_RADIUS_M) continue;
+  const fences = ranked.map(r => ({
+    identifier: r.site.id,
+    radius: GEOFENCE_RADIUS_M,
+    latitude: r.site.coords.lat,
+    longitude: r.site.coords.lng,
+    notifyOnEntry: true,
+    notifyOnExit: true,
+    notifyOnDwell: false,
+    extras: {
+      siteId: r.site.id,
+      title: r.site.title,
+    },
+  }));
 
-    const lastAt = _lastNotifiedAt.get(site.id) || 0;
-    if (now - lastAt < NOTIFICATION_COOLDOWN_MS) continue;
-
-    _lastNotifiedAt.set(site.id, now);
-    dlog(`TRIGGER: ${site.title} at ${Math.round(d)}m`);
-    void fireNotification(site);
+  try {
+    await BG.removeGeofences();
+    await BG.addGeofences(fences);
+    _activeFenceIds = new Set(fences.map(f => f.identifier));
+    dlog(`recomputeFences: ${fences.length} active, nearest=${ranked[0]?.site.title} (${Math.round(ranked[0]?.d || 0)}m)`);
+  } catch (err: any) {
+    dlog('recomputeFences failed: ' + (err?.message || err));
   }
 }
 
 async function fireNotification(site: SinisterSite): Promise<void> {
   if (!isNative()) return;
-  const LN = await loadLocalNotif();
+  const LN = loadLocalNotif();
   if (!LN) {
     dlog('fireNotification: LN unavailable');
     return;
@@ -389,6 +611,11 @@ async function fireNotification(site: SinisterSite): Promise<void> {
           id: hashString(site.id) % 2000000000,
           title: 'The Dread Directory',
           body: `You're near ${site.title}. Tap to see the story.`,
+          // iOS plays notifications silently if `sound` is missing. 'default'
+          // tells iOS to use the system notification sound. Without this,
+          // the banner appears but no audio plays — which is why Drew
+          // never heard one despite notification permission being granted.
+          sound: 'default',
           extra: { siteId: site.id },
           channelId: ANDROID_CHANNEL_ID,
         },
