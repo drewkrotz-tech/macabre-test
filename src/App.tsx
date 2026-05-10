@@ -1331,7 +1331,7 @@ type View =
   | { name: 'about' }
   | { name: 'leaders' }
   | { name: 'badges'; handle: string }
-  | { name: 'nearby' }
+  | { name: 'nearby'; category?: CategoryKey }
   | { name: 'list' };
 
 export default function App() {
@@ -1752,11 +1752,15 @@ export default function App() {
   // Centralized navigation helpers so sound playback is consistent and we
   // never forget to play the right sound on a transition.
   function goStateList(key: CategoryKey) {
-    // Skips the state-grid step entirely. Go directly to the location list
-    // for the category with no state filter; the user can refine by state
-    // (or anything else) using the search bar in CategoryView.
+    // Category cells on the home screen now open the map filtered to that
+    // category, instead of the scrollable list of every site in the category.
+    // The scrollable list was getting sluggish past ~130 sites in a single
+    // category, and the map is a better fit for "go visit these places"
+    // intent anyway. The old `category` view still exists for back-stack
+    // routing from Detail / List View; it's just no longer the destination
+    // from the home cells.
     playButton();
-    setView({ name: 'category', category: key });
+    setView({ name: 'nearby', category: key });
   }
   function goCategoryState(key: CategoryKey, state: string) {
     playButton();
@@ -1906,7 +1910,9 @@ export default function App() {
     } else if (v.name === 'list') {
       return { key: 'list', element: <ListView sites={sites} currentLocation={currentLocation} onSelectSite={goDetail} onBack={goHome} /> };
     } else if (v.name === 'nearby') {
-      return { key: 'nearby', element: <NearbyView sites={sites} currentLocation={currentLocation} onSelectSite={goDetail} onBack={goHome} /> };
+      const catEntry = v.category ? CATEGORIES.find(c => c.key === v.category) : null;
+      const catLabel = catEntry?.label || (v.category ? titleCase(v.category) : null);
+      return { key: v.category ? `nearby-${v.category}` : 'nearby', element: <NearbyView sites={sites} currentLocation={currentLocation} onSelectSite={goDetail} onBack={goHome} categoryFilter={v.category} categoryLabel={catLabel || undefined} /> };
     } else {
       return {
         key: 'home',
@@ -3866,11 +3872,20 @@ function loadMapKitJS(token: string): Promise<any> {
   return _mapkitLoadPromise;
 }
 
-function NearbyView({ sites, currentLocation, onSelectSite, onBack }: {
+function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilter, categoryLabel }: {
   sites: SinisterSite[];
   currentLocation: { lat: number; lng: number } | null;
   onSelectSite: (site: SinisterSite) => void;
   onBack: () => void;
+  // When set, only render pins for sites in this category. Used by the home
+  // category cells, which now route directly to a filtered map instead of
+  // the old scrollable category list. When unset (e.g. the bottom-bar
+  // "Locations Near Me" button), every category shows up on the map.
+  categoryFilter?: CategoryKey;
+  // Display label for the filtered category (e.g. "Hauntings"). Used in the
+  // header so the user sees what they're looking at; falls back to the
+  // generic "Locations Near Me" when no filter is set.
+  categoryLabel?: string;
 }) {
   const mapElRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<any>(null);
@@ -3884,11 +3899,16 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack }: {
   const [selectedSite, setSelectedSite] = useState<{ site: SinisterSite; distMi: number } | null>(null);
 
   // Compute nearby sites once we have a location. We sort + cap at 50 so
-  // huge metros don't paint hundreds of pins.
+  // huge metros don't paint hundreds of pins. When categoryFilter is set
+  // (home cell tapped a specific category), filter the input list first so
+  // only that category's sites compete for the 50-pin cap.
   const nearbySites = useMemo(() => {
     if (!livePos) return [] as { site: SinisterSite; distMi: number }[];
     const radiusM = NEARBY_RADIUS_MILES * METERS_PER_MILE;
-    return sites
+    const source = categoryFilter
+      ? sites.filter((s) => s.category === categoryFilter)
+      : sites;
+    return source
       .map((s) => ({
         site: s,
         distM: distanceMeters(livePos.lat, livePos.lng, s.coords.lat, s.coords.lng),
@@ -3897,7 +3917,7 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack }: {
       .sort((a, b) => a.distM - b.distM)
       .slice(0, 50)
       .map((x) => ({ site: x.site, distMi: x.distM / METERS_PER_MILE }));
-  }, [sites, livePos]);
+  }, [sites, livePos, categoryFilter]);
 
   // Initialize the map once on mount. The map sits in mapElRef; we recenter
   // and re-pin via subsequent effects rather than tearing it down.
@@ -4111,9 +4131,9 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack }: {
             textShadow: `0 0 14px ${WHITE}cc, 0 0 28px ${WHITE}66`,
           }}
           className="sinister-glitch"
-          data-text="Locations Near Me"
+          data-text={categoryLabel || "Locations Near Me"}
         >
-          Locations Near Me
+          {categoryLabel || "Locations Near Me"}
         </div>
         <div style={S.listSubtitle}>
           {nearbySites.length} {nearbySites.length === 1 ? 'site' : 'sites'} within {NEARBY_RADIUS_MILES} mi
