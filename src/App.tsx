@@ -3812,12 +3812,6 @@ const MAPKIT_JS_TOKEN = 'eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IkdYTFVDNUJ
 // that distant pins dominate the screen.
 const RADIUS_OPTIONS_MILES = [5, 10, 25, 50, 100] as const;
 const DEFAULT_RADIUS_MILES = 25;
-// Hard cap on rendered pins regardless of radius. MapKit JS stays smooth
-// well past this number, but visual density on a phone screen starts
-// suffering past ~50. Pins are sorted by distance so the closest always
-// win the cap — if a user has 312 sites within 100mi, they see the 50
-// nearest.
-const NEARBY_PIN_CAP = 50;
 const METERS_PER_MILE = 1609.34;
 
 // Per-category map pin glyphs. MapKit MarkerAnnotation renders the glyph
@@ -3896,7 +3890,6 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
   const mapElRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<any>(null);
   const userAnnotationRef = useRef<any>(null);
-  const dropPinAnnotationRef = useRef<any>(null);
   const siteAnnotationsRef = useRef<any[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [livePos, setLivePos] = useState<{ lat: number; lng: number } | null>(currentLocation);
@@ -3922,26 +3915,24 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
   );
 
   // Compute nearby sites with the current radius and effective center.
-  // Sort + cap at NEARBY_PIN_CAP (50) so dense areas don't paint hundreds
-  // of pins; the closest sites always win the cap. totalInRange tracks the
-  // pre-cap count so the subtitle can show "50 of 312 within 100 mi".
-  const { nearbySites, totalInRange } = useMemo(() => {
-    if (!effectiveCenter) return { nearbySites: [] as { site: SinisterSite; distMi: number }[], totalInRange: 0 };
+  // Sort by distance so the closest sites are reasoned about first, but
+  // render ALL of them — MapKit's clustering handles dense areas by
+  // collapsing overlapping pins into numbered cluster circles. There's
+  // no longer a hard cap, since clustering keeps even 200+ pins readable.
+  const nearbySites = useMemo(() => {
+    if (!effectiveCenter) return [] as { site: SinisterSite; distMi: number }[];
     const radiusM = radiusMi * METERS_PER_MILE;
     const source = categoryFilter
       ? sites.filter((s) => s.category === categoryFilter)
       : sites;
-    const inRange = source
+    return source
       .map((s) => ({
         site: s,
         distM: distanceMeters(effectiveCenter.lat, effectiveCenter.lng, s.coords.lat, s.coords.lng),
       }))
       .filter((x) => x.distM <= radiusM)
-      .sort((a, b) => a.distM - b.distM);
-    const capped = inRange
-      .slice(0, NEARBY_PIN_CAP)
+      .sort((a, b) => a.distM - b.distM)
       .map((x) => ({ site: x.site, distMi: x.distM / METERS_PER_MILE }));
-    return { nearbySites: capped, totalInRange: inRange.length };
   }, [sites, effectiveCenter, categoryFilter, radiusMi]);
 
   // Initialize the map once on mount. The map sits in mapElRef; we recenter
@@ -3964,6 +3955,30 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
           showsMapTypeControl: false,
           isRotationEnabled: true,
         });
+        // Cluster annotation factory — called by MapKit when two or more
+        // site pins overlap at the current zoom level. We render a colored
+        // marker whose glyph is the count (e.g. "12"). Color is taken from
+        // the clusteringIdentifier, which we set to the category key when
+        // building each site pin — that way clusters match category color
+        // even on the all-category map. Falls back to a neutral red if
+        // somehow no identifier is set.
+        map.annotationForCluster = (clusterAnnotation: any) => {
+          const id: string = clusterAnnotation.clusteringIdentifier || '';
+          const color = (CATEGORY_COLOR as any)[id] || '#d92a2a';
+          const count = clusterAnnotation.memberAnnotations?.length || 0;
+          return new mk.MarkerAnnotation(clusterAnnotation.coordinate, {
+            color,
+            glyphText: String(count),
+            title: `${count} sites`,
+            subtitle: '',
+            selected: false,
+            calloutEnabled: false,
+            animates: false,
+            // Mark this annotation so the select handler can recognize
+            // it as a cluster and zoom in instead of opening a card.
+            data: { isCluster: true, members: clusterAnnotation.memberAnnotations },
+          });
+        };
         mapRef.current = map;
       })
       .catch((err) => {
@@ -4022,27 +4037,79 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
     }
 
     // Update or create the user dot. We use a custom MarkerAnnotation so
-    // we can color it blue and override the glyph. Tapping the user dot
-    // is also our gesture for "clear the drop pin and recenter on me",
-    // handled inside the selection handler below.
+    // we can color it blue and override the glyph. The dot is DRAGGABLE
+    // — dragging it sets pinCenter to the new coordinate, which moves the
+    // radius search to that spot. When pinCenter is null the dot sits at
+    // the real location (blue); when pinCenter is set the dot is at the
+    // dragged location (recolored red by the dragged-state effect below).
+    // Tapping a Reset button or the dot itself clears pinCenter and snaps
+    // it back to the real location.
     if (userAnnotationRef.current) {
-      userAnnotationRef.current.coordinate = new mk.Coordinate(livePos.lat, livePos.lng);
+      // Only sync to livePos when we're NOT in dragged mode — otherwise
+      // we'd yank the dot back to the user's real location every GPS update.
+      if (!pinCenter) {
+        userAnnotationRef.current.coordinate = new mk.Coordinate(livePos.lat, livePos.lng);
+      }
     } else {
       const dot = new mk.MarkerAnnotation(
         new mk.Coordinate(livePos.lat, livePos.lng),
         {
           color: '#2a8aff',
           glyphColor: '#ffffff',
-          title: 'You',
+          title: 'Drag me to search elsewhere',
           subtitle: '',
           selected: false,
           calloutEnabled: false,
+          draggable: true,
         },
       );
       map.addAnnotation(dot);
       userAnnotationRef.current = dot;
     }
-  }, [livePos]);
+  }, [livePos, pinCenter]);
+
+  // Drag-end handler — when the user releases the dragged dot, capture
+  // the new coordinate as pinCenter. MapKit's drag-end fires on the
+  // annotation, not the map, so we attach it once after the dot exists.
+  // We use a layout effect tied to a sentinel so it re-binds if the dot
+  // is ever recreated.
+  const dragHandlerBoundRef = useRef(false);
+  useEffect(() => {
+    const map = mapRef.current;
+    const mk = (window as any).mapkit;
+    const dot = userAnnotationRef.current;
+    if (!map || !mk || !dot || dragHandlerBoundRef.current) return;
+    const onDragEnd = () => {
+      const c = dot.coordinate;
+      if (!c) return;
+      playPop();
+      setPinCenter({ lat: c.latitude, lng: c.longitude });
+      setSelectedSite(null);
+    };
+    try { dot.addEventListener('drag-end', onDragEnd); dragHandlerBoundRef.current = true; } catch { /* silent */ }
+    return () => {
+      try { dot.removeEventListener('drag-end', onDragEnd); } catch { /* silent */ }
+      dragHandlerBoundRef.current = false;
+    };
+  }, [livePos]); // re-evaluate after first livePos arrives (when dot gets created)
+
+  // Recolor the user dot to reflect dragged vs. at-real-location state.
+  // Red = you've dragged it to search a different area. Blue = at your
+  // real GPS location. Also moves the dot to pinCenter when dragged.
+  useEffect(() => {
+    const mk = (window as any).mapkit;
+    const dot = userAnnotationRef.current;
+    if (!mk || !dot) return;
+    if (pinCenter) {
+      dot.coordinate = new mk.Coordinate(pinCenter.lat, pinCenter.lng);
+      dot.color = '#d92a2a';
+      dot.title = 'Search center — drag to move';
+    } else if (livePos) {
+      dot.coordinate = new mk.Coordinate(livePos.lat, livePos.lng);
+      dot.color = '#2a8aff';
+      dot.title = 'Drag me to search elsewhere';
+    }
+  }, [pinCenter, livePos]);
 
   // Re-zoom the visible region whenever the user changes radius or drops/
   // clears the drop pin. We pan-and-zoom to keep the radius circle filling
@@ -4066,65 +4133,11 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
     }
   }, [radiusMi, pinCenter, effectiveCenter]);
 
-  // Drop-pin annotation sync. When pinCenter is set we render a red marker
-  // at that location; when it's cleared we remove the marker. Kept separate
-  // from the user-dot effect so the two annotations don't trample each
-  // other's lifecycle.
-  useEffect(() => {
-    const map = mapRef.current;
-    const mk = (window as any).mapkit;
-    if (!map || !mk) return;
-    if (pinCenter) {
-      if (dropPinAnnotationRef.current) {
-        dropPinAnnotationRef.current.coordinate = new mk.Coordinate(pinCenter.lat, pinCenter.lng);
-      } else {
-        const drop = new mk.MarkerAnnotation(
-          new mk.Coordinate(pinCenter.lat, pinCenter.lng),
-          {
-            color: '#d92a2a',
-            glyphColor: '#ffffff',
-            glyphText: '⊙',
-            title: 'Search center',
-            subtitle: '',
-            selected: false,
-            calloutEnabled: false,
-            animates: false,
-          },
-        );
-        map.addAnnotation(drop);
-        dropPinAnnotationRef.current = drop;
-      }
-    } else if (dropPinAnnotationRef.current) {
-      try { map.removeAnnotation(dropPinAnnotationRef.current); } catch { /* silent */ }
-      dropPinAnnotationRef.current = null;
-    }
-  }, [pinCenter]);
-
-  // Long-press anywhere on the map drops a search-center pin and re-runs
-  // the radius search from that point. MapKit JS emits `long-press` with
-  // either a coordinate or a page point depending on platform; we handle
-  // both. We also wire the user-dot tap as a reset gesture.
-  useEffect(() => {
-    const map = mapRef.current;
-    const mk = (window as any).mapkit;
-    if (!map || !mk) return;
-
-    const onLongPress = (e: any) => {
-      let coord: any = e?.coordinate || null;
-      if (!coord && e?.pointOnPage && typeof map.convertPointOnPageToCoordinate === 'function') {
-        try { coord = map.convertPointOnPageToCoordinate(e.pointOnPage); } catch { /* silent */ }
-      }
-      if (!coord) return;
-      playPop();
-      setPinCenter({ lat: coord.latitude, lng: coord.longitude });
-      setSelectedSite(null);
-    };
-
-    try { map.addEventListener('long-press', onLongPress); } catch { /* silent */ }
-    return () => {
-      try { map.removeEventListener('long-press', onLongPress); } catch { /* silent */ }
-    };
-  }, []);
+  // Drop-pin and long-press code used to live here. Both are now obsolete:
+  // the user dot is draggable, so dragging it serves the same purpose as a
+  // separate drop pin would have. MapKit JS does not actually emit a
+  // `long-press` event despite earlier attempts to use one, so that handler
+  // was a no-op and has been removed.
 
   // Render site pins whenever the nearby set changes.
   // Tapping a pin sets selectedSite (state below), which renders the
@@ -4169,6 +4182,10 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
           animates: false,
           // We render our own slide-up card instead of MapKit's bubble.
           calloutEnabled: false,
+          // Cluster pins that share the same category so dense areas
+          // collapse to numbered circles. The cluster factory on the
+          // map reads this identifier to pick the cluster's color.
+          clusteringIdentifier: site.category,
         },
       );
       annToSite.set(ann, entry);
@@ -4181,18 +4198,55 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
     // keeps the card open (no toggle on pin tap — we toggle only on
     // close-X or map-background tap, which is more predictable). Plays
     // a small upward pop to match the upward slide-in motion of the card.
-    // Special cases: tapping the user dot clears any active drop-pin
-    // search center (back to real location). Tapping the drop pin itself
-    // is also a clear gesture — feels natural to "tap to remove".
+    // Special cases:
+    //   - Tapping the user dot when it's been dragged clears the search
+    //     center and snaps back to the real location.
+    //   - Tapping a cluster zooms in to break the cluster apart instead
+    //     of opening a slide-up card (clusters represent multiple sites,
+    //     not one).
     const onSelect = (e: any) => {
       const ann = e?.annotation;
       if (!ann) return;
-      if (ann === userAnnotationRef.current || ann === dropPinAnnotationRef.current) {
+      if (ann === userAnnotationRef.current) {
         if (pinCenter) {
           playBackSound();
           setPinCenter(null);
           setSelectedSite(null);
         }
+        return;
+      }
+      // Cluster annotations get a `data.isCluster` flag from the factory
+      // in the map init. Members are the underlying site annotations the
+      // cluster collapsed; we compute a region that bounds them and zoom
+      // in. MapKit will then re-cluster (or break clusters apart) for
+      // the new zoom level automatically.
+      if (ann.data?.isCluster) {
+        playPop();
+        const mk = (window as any).mapkit;
+        const members: any[] = ann.data.members || [];
+        if (mk && members.length > 1) {
+          // Compute lat/lng bounds of the cluster's members + a small
+          // pad so the pins don't sit flush against the viewport edge.
+          let minLat = Infinity, maxLat = -Infinity, minLng = Infinity, maxLng = -Infinity;
+          for (const m of members) {
+            const c = m.coordinate;
+            if (!c) continue;
+            if (c.latitude < minLat) minLat = c.latitude;
+            if (c.latitude > maxLat) maxLat = c.latitude;
+            if (c.longitude < minLng) minLng = c.longitude;
+            if (c.longitude > maxLng) maxLng = c.longitude;
+          }
+          const padLat = Math.max((maxLat - minLat) * 0.4, 0.005);
+          const padLng = Math.max((maxLng - minLng) * 0.4, 0.005);
+          const center = new mk.Coordinate((minLat + maxLat) / 2, (minLng + maxLng) / 2);
+          const span = new mk.CoordinateSpan(
+            (maxLat - minLat) + padLat * 2,
+            (maxLng - minLng) + padLng * 2,
+          );
+          try { map.setRegionAnimated(new mk.CoordinateRegion(center, span), true); }
+          catch { map.region = new mk.CoordinateRegion(center, span); }
+        }
+        setSelectedSite(null);
         return;
       }
       const matched = annToSite.get(ann);
@@ -4259,9 +4313,7 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
           {categoryLabel || "Locations Near Me"}
         </div>
         <div style={S.listSubtitle}>
-          {totalInRange > NEARBY_PIN_CAP
-            ? `${nearbySites.length} of ${totalInRange} sites within ${radiusMi} mi`
-            : `${nearbySites.length} ${nearbySites.length === 1 ? 'site' : 'sites'} within ${radiusMi} mi`}
+          {nearbySites.length} {nearbySites.length === 1 ? 'site' : 'sites'} within {radiusMi} mi
           {pinCenter && ' · from dropped pin'}
         </div>
         {/* Radius chips — let the user widen or narrow the search without
