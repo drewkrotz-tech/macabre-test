@@ -3804,7 +3804,7 @@ function AboutView({ onBack }: { onBack: () => void }) {
 // shipping to production, generate a long-term token (up to 365 days) at
 // developer.apple.com → Maps → Tokens, with a domain restriction set to
 // sinistertrivia.com.
-const MAPKIT_JS_TOKEN = 'eyJraWQiOiJQNTgzOEJGMlNHIiwidHlwIjoiSldUIiwiYWxnIjoiRVMyNTYifQ.eyJpc3MiOiI4SzZUOTc3N1I5IiwiaWF0IjoxNzc3OTg0ODU4LCJzY29wZSI6Im1hcGtpdF9qcyIsImV4cCI6MTc3ODY1NTU5OX0.7h9gMm7v8GJtjIjHdzQ3QUvg-nmyq-WkRU4OopbHrx93zTaAHq2ISkMfnWt858PD73zAxJmLSAT8q9ohNUcsyw';
+const MAPKIT_JS_TOKEN = 'eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IkdYTFVDNUJKNlMifQ.eyJpc3MiOiI4SzZUOTc3N1I5IiwiaWF0IjoxNzc4NDI1Mzc5LCJleHAiOjE3OTM5NzczNzksIm9yaWdpbiI6IioiLCJtYXBJZCI6Im1hcHMuY29tLnNpbmlzdGVydHJpdmlhLmxvY2F0aW9ucyJ9.vasaEZU_W43UpH3sgfyTv2_Ed-UM9CXYS10GkPY9_IL6HZ7yMvTODRproN3cbIjFxJPLLf0ZgwvZtZ933C8F9A';
 const NEARBY_RADIUS_MILES = 20;
 const METERS_PER_MILE = 1609.34;
 
@@ -4517,7 +4517,15 @@ function CategoryView({ label, color, sites, currentLocation, onSelectSite, onSu
               <div ref={scrollRef} style={S.filmstripWrap}>
                 <div style={S.filmstripFrames}>
                 {sequenceLength === 0 ? (
-                  <div style={S.emptyState}>
+                  <div style={{
+                    ...S.emptyState,
+                    // Fill the filmstrip's full height (filmstripOuter is 776px)
+                    // and center vertically so the empty-state copy sits in the
+                    // mask's fully-opaque middle band, well below the giant
+                    // category title which lives in the faded top region.
+                    minHeight: 776,
+                    justifyContent: 'center' as const,
+                  }}>
                     <div style={S.emptyStateIcon}>🕯</div>
                     <div style={S.emptyStateTitle}>
                       {sites.length === 0 ? 'No sites here yet' : 'Nothing matches'}
