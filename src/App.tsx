@@ -1925,7 +1925,6 @@ export default function App() {
             onAbout={goAbout}
             onLeaders={goLeaders}
             onList={goList}
-            onNearby={goNearby}
           />
         ),
       };
@@ -2092,7 +2091,6 @@ export default function App() {
           onLeaders={goLeaders}
           onList={goList}
           onAbout={goAbout}
-          onNearby={goNearby}
         />
       )}
       <ToastHost />
@@ -2330,16 +2328,21 @@ function SkeletonRow({ height = 48, delay = 0 }: { height?: number; delay?: numb
 // List View (flat directory of all categories/states/locations, also
 // scaffolded), and About. Instagram and YouTube links moved to AboutView
 // where they already live, so users still have one tap to reach them.
-function HomeBottomBar({ onLeaders, onList, onAbout, onNearby }: {
+function HomeBottomBar({ onLeaders, onList, onAbout }: {
   onLeaders: () => void;
   onList: () => void;
   onAbout: () => void;
-  onNearby: () => void;
 }) {
-  // Two pill buttons on the home page bottom bar: "Locations Near Me" (left)
-  // opens the Map View (NearbyView), and "More" (right) opens a popup that
-  // contains Dread Leaders, List View, and About. Submit a Location stays
-  // unchanged above this bar.
+  // Two pill buttons on the home page bottom bar: "List View" (left)
+  // opens the full categorized list of every site, and "More" (right)
+  // opens a popup that contains Dread Leaders and About. Submit a Location
+  // stays unchanged above this bar.
+  //
+  // The List View used to live in the More popup and the left button used
+  // to be "Locations Near Me" (an all-categories map). Now that home cells
+  // route directly to category-filtered maps, the all-categories map was
+  // redundant and List View earned the prime real-estate spot — it's the
+  // "see everything" escape hatch.
   //
   // The More popup is anchored above the More button (right-aligned). It
   // closes when:
@@ -2381,14 +2384,6 @@ function HomeBottomBar({ onLeaders, onList, onAbout, onNearby }: {
           <div style={S.moreMenuDivider} />
           <button
             style={S.moreMenuItem}
-            onClick={() => { playSubDrop(); closeMore(); onList(); }}
-          >
-            <span style={S.socialIcon}>📜</span>
-            <span style={S.moreMenuLabel}>List View</span>
-          </button>
-          <div style={S.moreMenuDivider} />
-          <button
-            style={S.moreMenuItem}
             onClick={() => { playSubDrop(); closeMore(); onAbout(); }}
           >
             <span style={S.socialIcon}>ℹ️</span>
@@ -2400,10 +2395,10 @@ function HomeBottomBar({ onLeaders, onList, onAbout, onNearby }: {
       <div style={S.socialBar}>
         <button
           style={S.socialBtn}
-          onClick={() => { playSubDrop(); onNearby(); }}
+          onClick={() => { playSubDrop(); onList(); }}
         >
-          <span style={S.socialIcon}>📍</span>
-          <span style={S.socialLabel}>Locations Near Me</span>
+          <span style={S.socialIcon}>📜</span>
+          <span style={S.socialLabel}>List View</span>
         </button>
         <button
           style={{ ...S.socialBtn, ...(moreOpen ? S.socialBtnActive : {}) }}
@@ -3095,7 +3090,7 @@ function LatestSubmissionSpotlight({ sites, onSelectSite }: {
   );
 }
 
-function HomeView({ sites, onSelectCategory, onSelectSite, onSubmit, onAbout, onLeaders, onList, onNearby }: {
+function HomeView({ sites, onSelectCategory, onSelectSite, onSubmit, onAbout, onLeaders, onList }: {
   sites: SinisterSite[];
   onSelectCategory: (key: CategoryKey) => void;
   onSelectSite: (site: SinisterSite) => void;
@@ -3103,7 +3098,6 @@ function HomeView({ sites, onSelectCategory, onSelectSite, onSubmit, onAbout, on
   onAbout: () => void;
   onLeaders: () => void;
   onList: () => void;
-  onNearby: () => void;
 }) {
   const counts: Record<string, number> = {};
   for (const s of sites) counts[s.category] = (counts[s.category] || 0) + 1;
@@ -3811,7 +3805,19 @@ function AboutView({ onBack }: { onBack: () => void }) {
 // developer.apple.com → Maps → Tokens, with a domain restriction set to
 // sinistertrivia.com.
 const MAPKIT_JS_TOKEN = 'eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IkdYTFVDNUJKNlMifQ.eyJpc3MiOiI4SzZUOTc3N1I5IiwiaWF0IjoxNzc4NDI1Mzc5LCJleHAiOjE3OTM5NzczNzksIm9yaWdpbiI6IioiLCJtYXBJZCI6Im1hcHMuY29tLnNpbmlzdGVydHJpdmlhLmxvY2F0aW9ucyJ9.vasaEZU_W43UpH3sgfyTv2_Ed-UM9CXYS10GkPY9_IL6HZ7yMvTODRproN3cbIjFxJPLLf0ZgwvZtZ933C8F9A';
-const NEARBY_RADIUS_MILES = 20;
+// Radius selector for NearbyView. The map view used to be locked at 20mi
+// but as the catalog grew and the home cells started routing here per-
+// category, users in less-dense areas needed a way to widen the search.
+// 25 is the default — drivable for an evening trip without being so wide
+// that distant pins dominate the screen.
+const RADIUS_OPTIONS_MILES = [5, 10, 25, 50, 100] as const;
+const DEFAULT_RADIUS_MILES = 25;
+// Hard cap on rendered pins regardless of radius. MapKit JS stays smooth
+// well past this number, but visual density on a phone screen starts
+// suffering past ~50. Pins are sorted by distance so the closest always
+// win the cap — if a user has 312 sites within 100mi, they see the 50
+// nearest.
+const NEARBY_PIN_CAP = 50;
 const METERS_PER_MILE = 1609.34;
 
 // Per-category map pin glyphs. MapKit MarkerAnnotation renders the glyph
@@ -3890,6 +3896,7 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
   const mapElRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<any>(null);
   const userAnnotationRef = useRef<any>(null);
+  const dropPinAnnotationRef = useRef<any>(null);
   const siteAnnotationsRef = useRef<any[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [livePos, setLivePos] = useState<{ lat: number; lng: number } | null>(currentLocation);
@@ -3897,27 +3904,45 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
   // preview card renders over the bottom of the map. Tapping the map
   // background, the card's × button, or another pin updates this.
   const [selectedSite, setSelectedSite] = useState<{ site: SinisterSite; distMi: number } | null>(null);
+  // Search radius in miles — user picks from RADIUS_OPTIONS_MILES via chips
+  // above the map. Survives the lifetime of this view (resets when user
+  // backs out and comes back).
+  const [radiusMi, setRadiusMi] = useState<number>(DEFAULT_RADIUS_MILES);
+  // Optional drop-pin location. When the user long-presses anywhere on the
+  // map, we drop a marker there and re-center the radius search on that
+  // point instead of their real location. Tap Reset (or the user dot) to
+  // clear and snap back to real location.
+  const [pinCenter, setPinCenter] = useState<{ lat: number; lng: number } | null>(null);
 
-  // Compute nearby sites once we have a location. We sort + cap at 50 so
-  // huge metros don't paint hundreds of pins. When categoryFilter is set
-  // (home cell tapped a specific category), filter the input list first so
-  // only that category's sites compete for the 50-pin cap.
-  const nearbySites = useMemo(() => {
-    if (!livePos) return [] as { site: SinisterSite; distMi: number }[];
-    const radiusM = NEARBY_RADIUS_MILES * METERS_PER_MILE;
+  // The effective search center is the drop-pin if one is set, otherwise
+  // the user's real location.
+  const effectiveCenter = useMemo(
+    () => pinCenter || livePos,
+    [pinCenter, livePos],
+  );
+
+  // Compute nearby sites with the current radius and effective center.
+  // Sort + cap at NEARBY_PIN_CAP (50) so dense areas don't paint hundreds
+  // of pins; the closest sites always win the cap. totalInRange tracks the
+  // pre-cap count so the subtitle can show "50 of 312 within 100 mi".
+  const { nearbySites, totalInRange } = useMemo(() => {
+    if (!effectiveCenter) return { nearbySites: [] as { site: SinisterSite; distMi: number }[], totalInRange: 0 };
+    const radiusM = radiusMi * METERS_PER_MILE;
     const source = categoryFilter
       ? sites.filter((s) => s.category === categoryFilter)
       : sites;
-    return source
+    const inRange = source
       .map((s) => ({
         site: s,
-        distM: distanceMeters(livePos.lat, livePos.lng, s.coords.lat, s.coords.lng),
+        distM: distanceMeters(effectiveCenter.lat, effectiveCenter.lng, s.coords.lat, s.coords.lng),
       }))
       .filter((x) => x.distM <= radiusM)
-      .sort((a, b) => a.distM - b.distM)
-      .slice(0, 50)
+      .sort((a, b) => a.distM - b.distM);
+    const capped = inRange
+      .slice(0, NEARBY_PIN_CAP)
       .map((x) => ({ site: x.site, distMi: x.distM / METERS_PER_MILE }));
-  }, [sites, livePos, categoryFilter]);
+    return { nearbySites: capped, totalInRange: inRange.length };
+  }, [sites, effectiveCenter, categoryFilter, radiusMi]);
 
   // Initialize the map once on mount. The map sits in mapElRef; we recenter
   // and re-pin via subsequent effects rather than tearing it down.
@@ -3975,6 +4000,8 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
 
   // Recenter the map and update the user dot whenever livePos changes.
   // Only recenters on the FIRST fix to avoid yanking the map every move.
+  // Subsequent recenters happen when the user changes the radius (zoom
+  // out to fit the new span) or drops a pin (jump to the pin's location).
   const didInitialCenterRef = useRef(false);
   useEffect(() => {
     const map = mapRef.current;
@@ -3986,7 +4013,7 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
       const center = new mk.Coordinate(livePos.lat, livePos.lng);
       // Convert miles to meters for span. CoordinateRegion uses degrees,
       // so we approximate: 1 deg lat ~= 111km. Span = 2 * radius.
-      const spanDeg = (NEARBY_RADIUS_MILES * 2 * METERS_PER_MILE) / 111000;
+      const spanDeg = (radiusMi * 2 * METERS_PER_MILE) / 111000;
       map.region = new mk.CoordinateRegion(
         center,
         new mk.CoordinateSpan(spanDeg, spanDeg),
@@ -3995,7 +4022,9 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
     }
 
     // Update or create the user dot. We use a custom MarkerAnnotation so
-    // we can color it blue and override the glyph.
+    // we can color it blue and override the glyph. Tapping the user dot
+    // is also our gesture for "clear the drop pin and recenter on me",
+    // handled inside the selection handler below.
     if (userAnnotationRef.current) {
       userAnnotationRef.current.coordinate = new mk.Coordinate(livePos.lat, livePos.lng);
     } else {
@@ -4007,12 +4036,95 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
           title: 'You',
           subtitle: '',
           selected: false,
+          calloutEnabled: false,
         },
       );
       map.addAnnotation(dot);
       userAnnotationRef.current = dot;
     }
   }, [livePos]);
+
+  // Re-zoom the visible region whenever the user changes radius or drops/
+  // clears the drop pin. We pan-and-zoom to keep the radius circle filling
+  // the viewport so users see the area their search covers.
+  useEffect(() => {
+    const map = mapRef.current;
+    const mk = (window as any).mapkit;
+    if (!map || !mk || !effectiveCenter) return;
+    // Skip the very first frame — the initial-center effect already set
+    // the region; running this immediately afterward would double-set it.
+    if (!didInitialCenterRef.current) return;
+    const center = new mk.Coordinate(effectiveCenter.lat, effectiveCenter.lng);
+    const spanDeg = (radiusMi * 2 * METERS_PER_MILE) / 111000;
+    try {
+      map.setRegionAnimated(
+        new mk.CoordinateRegion(center, new mk.CoordinateSpan(spanDeg, spanDeg)),
+        true,
+      );
+    } catch {
+      map.region = new mk.CoordinateRegion(center, new mk.CoordinateSpan(spanDeg, spanDeg));
+    }
+  }, [radiusMi, pinCenter, effectiveCenter]);
+
+  // Drop-pin annotation sync. When pinCenter is set we render a red marker
+  // at that location; when it's cleared we remove the marker. Kept separate
+  // from the user-dot effect so the two annotations don't trample each
+  // other's lifecycle.
+  useEffect(() => {
+    const map = mapRef.current;
+    const mk = (window as any).mapkit;
+    if (!map || !mk) return;
+    if (pinCenter) {
+      if (dropPinAnnotationRef.current) {
+        dropPinAnnotationRef.current.coordinate = new mk.Coordinate(pinCenter.lat, pinCenter.lng);
+      } else {
+        const drop = new mk.MarkerAnnotation(
+          new mk.Coordinate(pinCenter.lat, pinCenter.lng),
+          {
+            color: '#d92a2a',
+            glyphColor: '#ffffff',
+            glyphText: '⊙',
+            title: 'Search center',
+            subtitle: '',
+            selected: false,
+            calloutEnabled: false,
+            animates: false,
+          },
+        );
+        map.addAnnotation(drop);
+        dropPinAnnotationRef.current = drop;
+      }
+    } else if (dropPinAnnotationRef.current) {
+      try { map.removeAnnotation(dropPinAnnotationRef.current); } catch { /* silent */ }
+      dropPinAnnotationRef.current = null;
+    }
+  }, [pinCenter]);
+
+  // Long-press anywhere on the map drops a search-center pin and re-runs
+  // the radius search from that point. MapKit JS emits `long-press` with
+  // either a coordinate or a page point depending on platform; we handle
+  // both. We also wire the user-dot tap as a reset gesture.
+  useEffect(() => {
+    const map = mapRef.current;
+    const mk = (window as any).mapkit;
+    if (!map || !mk) return;
+
+    const onLongPress = (e: any) => {
+      let coord: any = e?.coordinate || null;
+      if (!coord && e?.pointOnPage && typeof map.convertPointOnPageToCoordinate === 'function') {
+        try { coord = map.convertPointOnPageToCoordinate(e.pointOnPage); } catch { /* silent */ }
+      }
+      if (!coord) return;
+      playPop();
+      setPinCenter({ lat: coord.latitude, lng: coord.longitude });
+      setSelectedSite(null);
+    };
+
+    try { map.addEventListener('long-press', onLongPress); } catch { /* silent */ }
+    return () => {
+      try { map.removeEventListener('long-press', onLongPress); } catch { /* silent */ }
+    };
+  }, []);
 
   // Render site pins whenever the nearby set changes.
   // Tapping a pin sets selectedSite (state below), which renders the
@@ -4069,9 +4181,20 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
     // keeps the card open (no toggle on pin tap — we toggle only on
     // close-X or map-background tap, which is more predictable). Plays
     // a small upward pop to match the upward slide-in motion of the card.
+    // Special cases: tapping the user dot clears any active drop-pin
+    // search center (back to real location). Tapping the drop pin itself
+    // is also a clear gesture — feels natural to "tap to remove".
     const onSelect = (e: any) => {
       const ann = e?.annotation;
       if (!ann) return;
+      if (ann === userAnnotationRef.current || ann === dropPinAnnotationRef.current) {
+        if (pinCenter) {
+          playBackSound();
+          setPinCenter(null);
+          setSelectedSite(null);
+        }
+        return;
+      }
       const matched = annToSite.get(ann);
       if (!matched) return;
       playPop();
@@ -4089,7 +4212,7 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
       try { map.removeEventListener('select', onSelect); } catch { /* silent */ }
       try { map.removeEventListener('single-tap', onMapTap); } catch { /* silent */ }
     };
-  }, [nearbySites]);
+  }, [nearbySites, pinCenter]);
 
   // Directions helper — same geo: scheme + Google Maps web fallback that
   // DetailView's Get Directions button uses. Lets the slide-up card route
@@ -4136,7 +4259,38 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
           {categoryLabel || "Locations Near Me"}
         </div>
         <div style={S.listSubtitle}>
-          {nearbySites.length} {nearbySites.length === 1 ? 'site' : 'sites'} within {NEARBY_RADIUS_MILES} mi
+          {totalInRange > NEARBY_PIN_CAP
+            ? `${nearbySites.length} of ${totalInRange} sites within ${radiusMi} mi`
+            : `${nearbySites.length} ${nearbySites.length === 1 ? 'site' : 'sites'} within ${radiusMi} mi`}
+          {pinCenter && ' · from dropped pin'}
+        </div>
+        {/* Radius chips — let the user widen or narrow the search without
+            leaving the map. Long-pressing the map drops a search-center
+            pin; the Reset chip appears next to the radius row when a drop
+            pin is active so the user can snap back to their real location. */}
+        <div style={S.radiusRow}>
+          {RADIUS_OPTIONS_MILES.map((r) => {
+            const active = r === radiusMi;
+            return (
+              <button
+                key={r}
+                style={{ ...S.radiusChip, ...(active ? S.radiusChipActive : {}) }}
+                onClick={() => { playPop(); setRadiusMi(r); }}
+                aria-pressed={active}
+              >
+                {r} mi
+              </button>
+            );
+          })}
+          {pinCenter && (
+            <button
+              style={{ ...S.radiusChip, ...S.radiusChipReset }}
+              onClick={() => { playBackSound(); setPinCenter(null); setSelectedSite(null); }}
+              aria-label="Reset search center to my location"
+            >
+              ↻ Reset
+            </button>
+          )}
         </div>
       </header>
 
@@ -4147,7 +4301,7 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
           </p>
           <p style={S.aboutPara}>
             Once the token is set, the map will load Apple Maps with your live position
-            and every site within {NEARBY_RADIUS_MILES} miles.
+            and every site within the selected radius.
           </p>
         </div>
       ) : (
@@ -4156,8 +4310,8 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
             ref={mapElRef}
             style={{
               width: '100%',
-              height: 'calc(100vh - 240px)',
-              minHeight: 360,
+              height: 'calc(100vh - 280px)',
+              minHeight: 320,
               backgroundColor: '#0a0a0a',
               position: 'relative',
               zIndex: 1,
@@ -4170,7 +4324,7 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
           )}
           {livePos && nearbySites.length === 0 && (
             <div style={{ ...S.aboutPara, padding: '12px 20px', textAlign: 'center', color: '#888' }}>
-              No sites within {NEARBY_RADIUS_MILES} miles. Submit one to be the first.
+              No sites within {radiusMi} miles{pinCenter ? ' of that spot' : ''}. Try a wider radius{pinCenter ? ' or tap Reset' : ''}.
             </div>
           )}
 
@@ -6526,6 +6680,41 @@ const S: Record<string, React.CSSProperties> = {
     fontWeight: 700,
     marginTop: 4,
     textAlign: 'center' as const,
+  },
+  // Radius selector row beneath the NearbyView header. Five chips for the
+  // available radii plus an optional Reset chip that appears when the user
+  // has long-pressed to drop a custom search center on the map.
+  radiusRow: {
+    display: 'flex',
+    flexWrap: 'wrap' as const,
+    justifyContent: 'center' as const,
+    gap: 6,
+    padding: '8px 12px 4px',
+  },
+  radiusChip: {
+    background: 'transparent',
+    border: '1px solid #2a2a2a',
+    color: '#999',
+    padding: '5px 10px',
+    fontSize: 11,
+    letterSpacing: '0.16em',
+    fontWeight: 700,
+    textTransform: 'uppercase' as const,
+    fontFamily: 'inherit',
+    cursor: 'pointer',
+    borderRadius: 3,
+  },
+  radiusChipActive: {
+    background: 'rgba(217, 42, 42, 0.18)',
+    borderColor: '#d92a2a',
+    color: '#ffffff',
+    textShadow: '0 0 6px rgba(217, 42, 42, 0.6)',
+  },
+  radiusChipReset: {
+    background: 'rgba(217, 42, 42, 0.08)',
+    borderColor: '#d92a2a',
+    color: '#d92a2a',
+    marginLeft: 6,
   },
   // In-component back bar — sits between header and search to give users
   // a visible "step back one level" affordance without forcing them to
