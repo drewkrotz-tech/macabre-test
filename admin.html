@@ -1,0 +1,1320 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sinister Locales — Admin</title>
+  <style>
+    :root {
+      --bg: #0A0A0A;
+      --panel: #141414;
+      --border: #2A2A2A;
+      --bone: #F0EBE0;
+      --gray: #888;
+      --red: #FF3B3B;
+      --green: #34D058;
+      --blue: #3FA9FF;
+      --jolly-red: #C12B2B;
+      --import-purple: #9B5BFF;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--bone);
+      font-family: -apple-system, system-ui, sans-serif;
+      min-height: 100vh;
+    }
+    header {
+      border-bottom: 1px solid var(--border);
+      padding: 18px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    h1 {
+      margin: 0;
+      font-size: 22px;
+      letter-spacing: 0.04em;
+    }
+    h1 small {
+      font-size: 11px;
+      color: var(--gray);
+      letter-spacing: 0.2em;
+      margin-left: 10px;
+      text-transform: uppercase;
+    }
+    .toolbar {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .pill {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 6px 12px;
+      font-size: 12px;
+      letter-spacing: 0.08em;
+    }
+    button {
+      background: transparent;
+      color: var(--bone);
+      border: 1.5px solid var(--border);
+      border-radius: 10px;
+      padding: 9px 14px;
+      font-size: 13px;
+      font-family: inherit;
+      cursor: pointer;
+      letter-spacing: 0.05em;
+    }
+    button:hover { border-color: var(--bone); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button.approve { border-color: var(--green); color: var(--green); }
+    button.approve:hover { background: rgba(52, 208, 88, 0.1); }
+    button.reject { border-color: var(--red); color: var(--red); }
+    button.reject:hover { background: rgba(255, 59, 59, 0.1); }
+    button.delete { border-color: var(--jolly-red); color: var(--jolly-red); }
+    button.delete:hover { background: rgba(193, 43, 43, 0.15); }
+    button.edit { border-color: #d4a017; color: #d4a017; }
+    button.edit:hover { background: rgba(212, 160, 23, 0.12); }
+    button.refresh { border-color: var(--blue); color: var(--blue); }
+    button.import-btn { border-color: var(--import-purple); color: var(--import-purple); }
+    button.import-btn:hover { background: rgba(155, 91, 255, 0.12); }
+
+    .edit-form {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      margin-top: 8px;
+    }
+    .edit-form label {
+      font-size: 11px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--gray);
+      margin-bottom: 4px;
+      display: block;
+    }
+    .edit-form input[type=text],
+    .edit-form select,
+    .edit-form textarea {
+      width: 100%;
+      font-family: inherit;
+    }
+    .edit-form textarea {
+      resize: vertical;
+      min-height: 70px;
+      line-height: 1.4;
+    }
+    .edit-form .char-count {
+      font-size: 11px;
+      color: var(--gray);
+      margin-top: -4px;
+    }
+    .edit-form .photo-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      font-size: 12px;
+      color: var(--gray);
+    }
+    .edit-form input[type=file] {
+      color: var(--bone);
+      font-size: 12px;
+      font-family: inherit;
+    }
+    .edit-form .form-actions {
+      display: flex;
+      gap: 10px;
+      margin-top: 6px;
+    }
+
+    .tabs {
+      display: flex;
+      gap: 4px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 18px;
+      padding: 0 4px;
+    }
+    .tab {
+      background: transparent;
+      color: var(--gray);
+      border: none;
+      border-bottom: 2px solid transparent;
+      border-radius: 0;
+      padding: 10px 18px;
+      font-size: 13px;
+      font-family: inherit;
+      cursor: pointer;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      margin-bottom: -1px;
+    }
+    .tab:hover { color: var(--bone); }
+    .tab.active {
+      color: var(--bone);
+      border-bottom-color: var(--bone);
+    }
+    .tab .count {
+      margin-left: 6px;
+      font-size: 11px;
+      color: var(--gray);
+    }
+    .tab.active .count { color: var(--bone); }
+
+    input[type=text], input[type=password], textarea, select {
+      background: var(--bg);
+      color: var(--bone);
+      border: 1.5px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 12px;
+      font-size: 13px;
+      font-family: inherit;
+      outline: none;
+    }
+    input[type=text]:focus, input[type=password]:focus { border-color: var(--blue); }
+
+    main {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 24px 20px 60px;
+    }
+    .empty {
+      text-align: center;
+      padding: 80px 20px;
+      color: var(--gray);
+      font-size: 14px;
+      letter-spacing: 0.05em;
+      border: 1px dashed var(--border);
+      border-radius: 14px;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 20px;
+      margin-bottom: 18px;
+      display: grid;
+      grid-template-columns: 320px 1fr;
+      gap: 24px;
+    }
+    @media (max-width: 700px) {
+      .card { grid-template-columns: 1fr; }
+    }
+    .photo {
+      width: 100%;
+      aspect-ratio: 4 / 3;
+      object-fit: cover;
+      border-radius: 10px;
+      background: #000;
+      border: 1px solid var(--border);
+    }
+    .meta {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .title {
+      font-size: 22px;
+      font-weight: 700;
+      margin: 0;
+      line-height: 1.2;
+    }
+    .badges {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin-top: 4px;
+    }
+    .badge {
+      font-size: 10px;
+      letter-spacing: 0.18em;
+      padding: 4px 8px;
+      border-radius: 999px;
+      text-transform: uppercase;
+      font-weight: 700;
+    }
+    .badge.cat { background: rgba(63, 169, 255, 0.15); color: var(--blue); }
+    .badge.verified { background: rgba(52, 208, 88, 0.15); color: var(--green); }
+    .badge.unverified { background: rgba(255, 59, 59, 0.15); color: var(--red); }
+    .badge.state { background: rgba(193, 43, 43, 0.15); color: var(--jolly-red); }
+    .badge.imported { background: rgba(155, 91, 255, 0.18); color: var(--import-purple); }
+    .desc {
+      font-size: 13px;
+      line-height: 1.5;
+      color: #CCC;
+      margin: 6px 0 0;
+      white-space: pre-wrap;
+    }
+    .row {
+      font-size: 12px;
+      color: var(--gray);
+      display: flex;
+      gap: 14px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .row a {
+      color: var(--blue);
+      text-decoration: none;
+    }
+    .row a:hover { text-decoration: underline; }
+    .actions {
+      margin-top: 12px;
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .state-edit {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--gray);
+    }
+    .state-edit input {
+      width: 140px;
+      font-size: 12px;
+      padding: 6px 10px;
+    }
+    .toast {
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 16px;
+      font-size: 13px;
+      max-width: 360px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+      z-index: 100;
+    }
+    .toast.success { border-color: var(--green); }
+    .toast.error { border-color: var(--red); }
+    .login {
+      max-width: 420px;
+      margin: 80px auto;
+      padding: 30px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+    }
+    .login h2 {
+      margin: 0 0 14px;
+      font-size: 18px;
+    }
+    .login p {
+      font-size: 12px;
+      color: var(--gray);
+      margin: 0 0 18px;
+      line-height: 1.5;
+    }
+    .login input { width: 100%; margin-bottom: 12px; }
+    .login button { width: 100%; }
+
+    /* Import tab */
+    .import-shell {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 24px;
+    }
+    .import-shell h2 {
+      margin: 0 0 6px;
+      font-size: 18px;
+    }
+    .import-shell p {
+      font-size: 13px;
+      color: var(--gray);
+      margin: 0 0 18px;
+      line-height: 1.55;
+    }
+    .import-shell label {
+      display: block;
+      font-size: 11px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--gray);
+      margin: 14px 0 6px;
+    }
+    .import-shell input[type=text] {
+      width: 100%;
+      max-width: 480px;
+    }
+    .import-shell textarea {
+      width: 100%;
+      min-height: 220px;
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.45;
+      resize: vertical;
+    }
+    .import-shell .form-actions {
+      display: flex;
+      gap: 10px;
+      margin-top: 18px;
+      flex-wrap: wrap;
+    }
+    .import-shell .file-row {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      margin-bottom: 8px;
+      flex-wrap: wrap;
+    }
+    .import-shell input[type=file] {
+      color: var(--bone);
+      font-size: 12px;
+      font-family: inherit;
+    }
+    .import-results {
+      margin-top: 22px;
+      border-top: 1px solid var(--border);
+      padding-top: 22px;
+    }
+    .import-results h3 {
+      font-size: 14px;
+      margin: 0 0 10px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+    .import-summary {
+      display: flex;
+      gap: 14px;
+      flex-wrap: wrap;
+      margin-bottom: 14px;
+    }
+    .import-summary .stat {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 14px;
+      min-width: 120px;
+    }
+    .import-summary .stat-label {
+      font-size: 10px;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--gray);
+    }
+    .import-summary .stat-value {
+      font-size: 22px;
+      font-weight: 700;
+      margin-top: 2px;
+    }
+    .stat-value.good { color: var(--green); }
+    .stat-value.bad { color: var(--red); }
+
+    .import-list {
+      max-height: 420px;
+      overflow-y: auto;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--bg);
+    }
+    .import-list .item {
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--border);
+      font-size: 12px;
+      display: flex;
+      gap: 10px;
+      align-items: flex-start;
+    }
+    .import-list .item:last-child { border-bottom: none; }
+    .item .marker {
+      flex-shrink: 0;
+      width: 18px;
+      font-weight: 700;
+      text-align: center;
+    }
+    .item .marker.ok { color: var(--green); }
+    .item .marker.skip { color: var(--red); }
+    .item .item-body { flex: 1; min-width: 0; }
+    .item .item-title { font-weight: 600; color: var(--bone); }
+    .item .item-detail { color: var(--gray); margin-top: 2px; word-break: break-word; }
+
+    /* Batches list */
+    .batch-row {
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      gap: 12px;
+      align-items: center;
+      padding: 12px 14px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      margin-bottom: 8px;
+    }
+    .batch-row .batch-id {
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 12px;
+      color: var(--bone);
+      word-break: break-all;
+    }
+    .batch-row .batch-meta {
+      font-size: 11px;
+      color: var(--gray);
+      margin-top: 2px;
+    }
+    .batch-count {
+      background: rgba(155, 91, 255, 0.18);
+      color: var(--import-purple);
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+    }
+  </style>
+</head>
+<body>
+
+<div id="root"></div>
+
+<script>
+// ============================================================================
+// Sinister Locales Admin — vanilla JS, single file, no framework.
+//
+// Three views (tabs):
+//   PENDING  — submissions awaiting moderation
+//   APPROVED — sites currently in the public catalog (with Delete)
+//   IMPORT   — bulk-import a batch of sites from a curated source
+//
+// Endpoints used:
+//   GET  /sites                           — public site catalog (no auth)
+//   GET  /sites/admin/queue               — list pending submissions
+//   POST /sites/admin/approve/:id         — approve, optional body { state: "..." }
+//   POST /sites/admin/reject/:id          — reject, optional body { reason: "..." }
+//   POST /sites/admin/delete/:id          — permanently remove an approved site
+//   POST /sites/admin/edit-submission/:id — multipart edit on pending sub
+//   POST /sites/admin/edit-site/:id       — multipart edit on approved site
+//   POST /sites/admin/bulk-import         — batch insert sites with imported=true
+//   GET  /sites/admin/import-batches      — list known batches with counts
+//   POST /sites/admin/bulk-rollback/:bid  — remove all sites in one batch
+//
+// All admin-prefixed endpoints require Bearer ADMIN_TOKEN. Token is saved to
+// localStorage after first entry so you don't have to paste it again next time.
+// ============================================================================
+
+// API base — same origin if served from the SinisterServer, otherwise hardcoded.
+const API_BASE = (location.protocol === 'http:' || location.protocol === 'https:')
+  ? '' // same-origin (when served from the Railway server at /admin)
+  : 'https://dread.sinistertrivia.com';
+
+const TOKEN_KEY = 'sinisterAdminToken';
+
+// Categories accepted by the server's ALLOWED_CATEGORIES list. Keep in sync
+// with sites.js — adding a new category here without adding it server-side
+// will fail validation on save.
+const ALLOWED_CATEGORIES = ['haunting', 'truecrime', 'serialkiller', 'cult', 'gravesite', 'film'];
+
+// Pretty labels for display. Server stores the bare strings above; UI shows
+// these.
+const CATEGORY_LABELS = {
+  haunting: 'Hauntings',
+  truecrime: 'True Crime',
+  serialkiller: 'Serial Killers',
+  cult: 'Cults',
+  gravesite: 'Grave Sites',
+  film: 'Film Locations',
+};
+
+// ---------- Utilities ----------
+function getToken() {
+  return localStorage.getItem(TOKEN_KEY) || '';
+}
+function setToken(t) {
+  if (t) localStorage.setItem(TOKEN_KEY, t);
+  else localStorage.removeItem(TOKEN_KEY);
+}
+function authHeaders(extra) {
+  const t = getToken();
+  const base = t ? { 'Authorization': `Bearer ${t}` } : {};
+  return Object.assign(base, extra || {});
+}
+function toast(msg, kind) {
+  const el = document.createElement('div');
+  el.className = 'toast ' + (kind || '');
+  el.textContent = msg;
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 3500);
+}
+function escapeHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+function formatCategory(c) {
+  return CATEGORY_LABELS[c] || (c ? c.charAt(0).toUpperCase() + c.slice(1) : '—');
+}
+
+// ---------- API calls ----------
+async function fetchQueue() {
+  const r = await fetch(`${API_BASE}/sites/admin/queue`, { headers: authHeaders() });
+  if (r.status === 401) throw new Error('UNAUTHORIZED');
+  if (!r.ok) throw new Error(`Server returned ${r.status}`);
+  return r.json();
+}
+async function approveSubmission(id, stateOverride) {
+  const body = stateOverride ? JSON.stringify({ state: stateOverride }) : '{}';
+  const r = await fetch(`${API_BASE}/sites/admin/approve/${id}`, {
+    method: 'POST',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body,
+  });
+  if (!r.ok) throw new Error(`Server returned ${r.status}`);
+  return r.json();
+}
+async function rejectSubmission(id, reason) {
+  const body = JSON.stringify({ reason: reason || null });
+  const r = await fetch(`${API_BASE}/sites/admin/reject/${id}`, {
+    method: 'POST',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body,
+  });
+  if (!r.ok) throw new Error(`Server returned ${r.status}`);
+  return r.json();
+}
+async function fetchApprovedSites() {
+  const r = await fetch(`${API_BASE}/sites`);
+  if (!r.ok) throw new Error(`Server returned ${r.status}`);
+  return r.json();
+}
+async function deleteSite(id) {
+  const r = await fetch(`${API_BASE}/sites/admin/delete/${id}`, {
+    method: 'POST',
+    headers: authHeaders(),
+  });
+  if (r.status === 401) throw new Error('UNAUTHORIZED');
+  if (!r.ok) throw new Error(`Server returned ${r.status}`);
+  return r.json();
+}
+async function editSubmission(id, formData) {
+  const r = await fetch(`${API_BASE}/sites/admin/edit-submission/${id}`, {
+    method: 'POST',
+    headers: authHeaders(), // no Content-Type — browser sets multipart boundary
+    body: formData,
+  });
+  if (r.status === 401) throw new Error('UNAUTHORIZED');
+  if (!r.ok) {
+    const detail = await r.text().catch(() => '');
+    throw new Error(`Server returned ${r.status}${detail ? ': ' + detail : ''}`);
+  }
+  return r.json();
+}
+async function editSite(id, formData) {
+  const r = await fetch(`${API_BASE}/sites/admin/edit-site/${id}`, {
+    method: 'POST',
+    headers: authHeaders(),
+    body: formData,
+  });
+  if (r.status === 401) throw new Error('UNAUTHORIZED');
+  if (!r.ok) {
+    const detail = await r.text().catch(() => '');
+    throw new Error(`Server returned ${r.status}${detail ? ': ' + detail : ''}`);
+  }
+  return r.json();
+}
+async function postBulkImport(payload) {
+  const r = await fetch(`${API_BASE}/sites/admin/bulk-import`, {
+    method: 'POST',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(payload),
+  });
+  if (r.status === 401) throw new Error('UNAUTHORIZED');
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const detail = data && (data.error || data.detail) ? ` (${data.error || data.detail})` : '';
+    throw new Error(`Server returned ${r.status}${detail}`);
+  }
+  return data;
+}
+async function fetchImportBatches() {
+  const r = await fetch(`${API_BASE}/sites/admin/import-batches`, { headers: authHeaders() });
+  if (r.status === 401) throw new Error('UNAUTHORIZED');
+  if (!r.ok) throw new Error(`Server returned ${r.status}`);
+  return r.json();
+}
+async function postBulkRollback(batchId) {
+  const r = await fetch(`${API_BASE}/sites/admin/bulk-rollback/${encodeURIComponent(batchId)}`, {
+    method: 'POST',
+    headers: authHeaders(),
+  });
+  if (r.status === 401) throw new Error('UNAUTHORIZED');
+  if (!r.ok) {
+    const detail = await r.text().catch(() => '');
+    throw new Error(`Server returned ${r.status}${detail ? ': ' + detail : ''}`);
+  }
+  return r.json();
+}
+
+// ---------- UI ----------
+const root = document.getElementById('root');
+
+function renderLogin() {
+  root.innerHTML = `
+    <div class="login">
+      <h2>Sinister Locales — Admin</h2>
+      <p>Paste your <code>ADMIN_TOKEN</code> from the Railway env. It's saved to this browser only.</p>
+      <input type="password" id="tokenInput" placeholder="ADMIN_TOKEN" />
+      <button id="saveTokenBtn">Save & Continue</button>
+    </div>
+  `;
+  document.getElementById('saveTokenBtn').onclick = () => {
+    const v = document.getElementById('tokenInput').value.trim();
+    if (!v) return toast('Token required', 'error');
+    setToken(v);
+    renderApp();
+  };
+  document.getElementById('tokenInput').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') document.getElementById('saveTokenBtn').click();
+  });
+}
+
+// Active tab — 'pending', 'approved', or 'import'.
+let currentTab = 'pending';
+
+function renderShell() {
+  root.innerHTML = `
+    <header>
+      <h1>Sinister Locales <small>Admin</small></h1>
+      <div class="toolbar">
+        <button class="refresh" id="refreshBtn">Refresh</button>
+        <button id="logoutBtn">Logout</button>
+      </div>
+    </header>
+    <main id="main">
+      <div class="tabs">
+        <button class="tab" data-tab="pending" id="tabPending">
+          Pending<span class="count" id="pendingCount"></span>
+        </button>
+        <button class="tab" data-tab="approved" id="tabApproved">
+          Approved<span class="count" id="approvedCount"></span>
+        </button>
+        <button class="tab" data-tab="import" id="tabImport">
+          Import<span class="count" id="importBatchCount"></span>
+        </button>
+      </div>
+      <div id="tabContent"><div class="empty">Loading…</div></div>
+    </main>
+  `;
+  document.getElementById('refreshBtn').onclick = loadCurrentTab;
+  document.getElementById('logoutBtn').onclick = () => {
+    setToken('');
+    renderLogin();
+  };
+  document.getElementById('tabPending').onclick = () => switchTab('pending');
+  document.getElementById('tabApproved').onclick = () => switchTab('approved');
+  document.getElementById('tabImport').onclick = () => switchTab('import');
+  highlightActiveTab();
+}
+
+function highlightActiveTab() {
+  document.querySelectorAll('.tab').forEach((t) => {
+    t.classList.toggle('active', t.dataset.tab === currentTab);
+  });
+}
+
+function switchTab(name) {
+  if (currentTab === name) return;
+  currentTab = name;
+  highlightActiveTab();
+  loadCurrentTab();
+}
+
+function loadCurrentTab() {
+  if (currentTab === 'pending') loadQueue();
+  else if (currentTab === 'approved') loadApproved();
+  else if (currentTab === 'import') renderImportTab();
+}
+
+// ---------- Pending tab ----------
+function renderQueue(data) {
+  const container = document.getElementById('tabContent');
+  document.getElementById('pendingCount').textContent = ` (${data.count})`;
+  if (!data.count) {
+    container.innerHTML = `<div class="empty">No pending submissions.<br><br>Check back later or submit one from the app.</div>`;
+    return;
+  }
+  container.innerHTML = data.pending.map(renderCard).join('');
+  data.pending.forEach((sub) => {
+    const card = document.querySelector(`[data-sub="${sub.id}"]`);
+    if (!card) return;
+    card.querySelector('.btn-approve').onclick = () => onApprove(sub);
+    card.querySelector('.btn-reject').onclick = () => onReject(sub);
+    card.querySelector('.btn-edit').onclick = () => onEdit(sub, 'submission');
+  });
+}
+
+function renderCard(sub) {
+  const cat = formatCategory(sub.category);
+  const submittedAt = new Date(sub.submittedAt).toLocaleString();
+  const mapsLink = `https://maps.google.com/?q=${sub.coords.lat},${sub.coords.lng}`;
+  const verifiedBadge = sub.verified
+    ? '<span class="badge verified">✓ On-site verified</span>'
+    : '<span class="badge unverified">⚠ Unverified</span>';
+  const stateBadge = sub.state && sub.state !== 'Unknown'
+    ? `<span class="badge state">${escapeHtml(sub.state)}</span>`
+    : '<span class="badge unverified">State unknown</span>';
+  return `
+    <div class="card" data-sub="${sub.id}">
+      <img class="photo" src="${escapeHtml(sub.photoUrl)}" alt="" />
+      <div class="meta">
+        <h2 class="title">${escapeHtml(sub.title)}</h2>
+        <div class="badges">
+          <span class="badge cat">${escapeHtml(cat)}</span>
+          ${stateBadge}
+          ${verifiedBadge}
+        </div>
+        <p class="desc"><b>Short:</b> ${escapeHtml(sub.shortDescription)}</p>
+        <p class="desc"><b>Full:</b> ${escapeHtml(sub.fullDescription)}</p>
+        <div class="row">
+          <span>📍 <a href="${mapsLink}" target="_blank" rel="noopener">${sub.coords.lat.toFixed(5)}, ${sub.coords.lng.toFixed(5)}</a></span>
+          <span>👤 ${escapeHtml(sub.submitter)}</span>
+          <span>🕒 ${submittedAt}</span>
+        </div>
+        <div class="actions">
+          <div class="state-edit">
+            State override:
+            <input type="text" class="state-input" value="${escapeHtml(sub.state || '')}" placeholder="Virginia">
+          </div>
+          <button class="approve btn-approve">Approve</button>
+          <button class="edit btn-edit">Edit</button>
+          <button class="reject btn-reject">Reject</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+async function onApprove(sub) {
+  const card = document.querySelector(`[data-sub="${sub.id}"]`);
+  const stateInput = card.querySelector('.state-input').value.trim();
+  const stateOverride = stateInput && stateInput !== sub.state ? stateInput : null;
+  if (!confirm(`Approve "${sub.title}"?${stateOverride ? `\n\nState will be set to: ${stateOverride}` : ''}`)) return;
+  const btn = card.querySelector('.btn-approve');
+  btn.disabled = true; btn.textContent = 'Approving…';
+  try {
+    await approveSubmission(sub.id, stateOverride);
+    toast(`Approved: ${sub.title}`, 'success');
+    card.style.transition = 'opacity 0.4s';
+    card.style.opacity = '0';
+    setTimeout(loadQueue, 400);
+  } catch (err) {
+    toast(`Approve failed: ${err.message}`, 'error');
+    btn.disabled = false; btn.textContent = 'Approve';
+  }
+}
+
+async function onReject(sub) {
+  const reason = prompt(`Reject "${sub.title}"?\n\nOptional reason (will be logged):`);
+  if (reason === null) return;
+  const card = document.querySelector(`[data-sub="${sub.id}"]`);
+  const btn = card.querySelector('.btn-reject');
+  btn.disabled = true; btn.textContent = 'Rejecting…';
+  try {
+    await rejectSubmission(sub.id, reason || null);
+    toast(`Rejected: ${sub.title}`, 'success');
+    card.style.transition = 'opacity 0.4s';
+    card.style.opacity = '0';
+    setTimeout(loadQueue, 400);
+  } catch (err) {
+    toast(`Reject failed: ${err.message}`, 'error');
+    btn.disabled = false; btn.textContent = 'Reject';
+  }
+}
+
+async function loadQueue() {
+  const container = document.getElementById('tabContent');
+  if (container) container.innerHTML = '<div class="empty">Loading…</div>';
+  try {
+    const data = await fetchQueue();
+    if (currentTab !== 'pending') return;
+    renderQueue(data);
+  } catch (err) {
+    if (err.message === 'UNAUTHORIZED') {
+      setToken('');
+      renderLogin();
+      toast('Token rejected — please re-enter.', 'error');
+      return;
+    }
+    if (container) container.innerHTML = `<div class="empty">Error: ${escapeHtml(err.message)}</div>`;
+  }
+}
+
+// ---------- Approved tab ----------
+function renderApprovedCard(site) {
+  const cat = formatCategory(site.category);
+  const approvedAt = site.approvedAt ? new Date(site.approvedAt).toLocaleString() : '—';
+  const mapsLink = `https://maps.google.com/?q=${site.coords.lat},${site.coords.lng}`;
+  const stateBadge = site.state && site.state !== 'Unknown'
+    ? `<span class="badge state">${escapeHtml(site.state)}</span>`
+    : '<span class="badge unverified">State unknown</span>';
+  const verifiedBadge = site.verified
+    ? '<span class="badge verified">✓ Verified</span>'
+    : '<span class="badge unverified">⚠ Unverified</span>';
+  const importedBadge = site.imported
+    ? `<span class="badge imported">⤓ ${escapeHtml(site.source || 'imported')}</span>`
+    : '';
+  const desc = site.shortDescription || site.fullDescription || '';
+  // Render placeholder background when there's no photoUrl (imports may have none).
+  const photoHtml = site.photoUrl
+    ? `<img class="photo" src="${escapeHtml(site.photoUrl)}" alt="" />`
+    : `<div class="photo" style="display:flex;align-items:center;justify-content:center;color:#444;font-size:11px;letter-spacing:0.18em;">NO PHOTO</div>`;
+  return `
+    <div class="card" data-site="${escapeHtml(site.id)}">
+      ${photoHtml}
+      <div class="meta">
+        <h2 class="title">${escapeHtml(site.title)}</h2>
+        <div class="badges">
+          <span class="badge cat">${escapeHtml(cat)}</span>
+          ${stateBadge}
+          ${verifiedBadge}
+          ${importedBadge}
+        </div>
+        <p class="desc">${escapeHtml(desc)}</p>
+        <div class="row">
+          <span>📍 <a href="${mapsLink}" target="_blank" rel="noopener">${site.coords.lat.toFixed(5)}, ${site.coords.lng.toFixed(5)}</a></span>
+          <span>👤 ${escapeHtml(site.submitter || '—')}</span>
+          <span>🕒 Approved ${approvedAt}</span>
+          ${site.sourceUrl ? `<span>🔗 <a href="${escapeHtml(site.sourceUrl)}" target="_blank" rel="noopener">source</a></span>` : ''}
+          <span style="color:#555">id: ${escapeHtml(site.id)}</span>
+        </div>
+        <div class="actions">
+          <button class="edit btn-edit">Edit</button>
+          <button class="delete btn-delete">Delete</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderApproved(data) {
+  const container = document.getElementById('tabContent');
+  const sites = data.sites || [];
+  document.getElementById('approvedCount').textContent = ` (${sites.length})`;
+  if (!sites.length) {
+    container.innerHTML = `<div class="empty">No approved sites yet.</div>`;
+    return;
+  }
+  const ordered = [...sites].sort((a, b) => {
+    const at = a.approvedAt || '';
+    const bt = b.approvedAt || '';
+    return bt.localeCompare(at);
+  });
+  container.innerHTML = ordered.map(renderApprovedCard).join('');
+  ordered.forEach((site) => {
+    const card = document.querySelector(`[data-site="${CSS.escape(site.id)}"]`);
+    if (!card) return;
+    card.querySelector('.btn-delete').onclick = () => onDelete(site);
+    card.querySelector('.btn-edit').onclick = () => onEdit(site, 'site');
+  });
+}
+
+async function loadApproved() {
+  const container = document.getElementById('tabContent');
+  if (container) container.innerHTML = '<div class="empty">Loading…</div>';
+  try {
+    const data = await fetchApprovedSites();
+    if (currentTab !== 'approved') return;
+    renderApproved(data);
+  } catch (err) {
+    if (container) container.innerHTML = `<div class="empty">Error: ${escapeHtml(err.message)}</div>`;
+  }
+}
+
+async function onDelete(site) {
+  if (!confirm(`Permanently DELETE "${site.title}" from the live catalog?\n\nThis removes it from the app immediately and cannot be undone.`)) return;
+  const card = document.querySelector(`[data-site="${CSS.escape(site.id)}"]`);
+  const btn = card && card.querySelector('.btn-delete');
+  if (btn) { btn.disabled = true; btn.textContent = 'Deleting…'; }
+  try {
+    await deleteSite(site.id);
+    toast(`Deleted: ${site.title}`, 'success');
+    if (card) {
+      card.style.transition = 'opacity 0.4s';
+      card.style.opacity = '0';
+    }
+    setTimeout(loadApproved, 400);
+  } catch (err) {
+    if (err.message === 'UNAUTHORIZED') {
+      setToken('');
+      renderLogin();
+      toast('Token rejected — please re-enter.', 'error');
+      return;
+    }
+    toast(`Delete failed: ${err.message}`, 'error');
+    if (btn) { btn.disabled = false; btn.textContent = 'Delete'; }
+  }
+}
+
+// Inline edit form, used by both Pending and Approved tabs.
+function onEdit(record, kind) {
+  const selector = kind === 'submission'
+    ? `[data-sub="${CSS.escape(record.id)}"]`
+    : `[data-site="${CSS.escape(record.id)}"]`;
+  const card = document.querySelector(selector);
+  if (!card) return;
+  const meta = card.querySelector('.meta');
+  if (!meta) return;
+
+  const categoryOptions = ALLOWED_CATEGORIES.map((c) => {
+    const sel = c === record.category ? ' selected' : '';
+    return `<option value="${c}"${sel}>${formatCategory(c)}</option>`;
+  }).join('');
+
+  meta.innerHTML = `
+    <div class="edit-form" data-form-for="${escapeHtml(record.id)}">
+      <h2 class="title" style="margin:0 0 6px;">Edit ${kind === 'submission' ? 'submission' : 'site'}</h2>
+
+      <div>
+        <label>Title</label>
+        <input type="text" class="f-title" value="${escapeHtml(record.title || '')}" maxlength="120">
+      </div>
+
+      <div>
+        <label>Category</label>
+        <select class="f-category">${categoryOptions}</select>
+      </div>
+
+      <div>
+        <label>Short description (10–200)</label>
+        <textarea class="f-short" maxlength="200" rows="3">${escapeHtml(record.shortDescription || '')}</textarea>
+        <div class="char-count"><span class="cc-short">0</span>/200</div>
+      </div>
+
+      <div>
+        <label>Full description (20–5000)</label>
+        <textarea class="f-full" maxlength="5000" rows="6">${escapeHtml(record.fullDescription || '')}</textarea>
+        <div class="char-count"><span class="cc-full">0</span>/5000</div>
+      </div>
+
+      <div>
+        <label>Replace photo (optional)</label>
+        <div class="photo-row">
+          <input type="file" class="f-photo" accept="image/*">
+          <span>Leave empty to keep current image.</span>
+        </div>
+      </div>
+
+      <div class="form-actions">
+        <button class="approve btn-save">Save</button>
+        <button class="btn-cancel">Cancel</button>
+      </div>
+    </div>
+  `;
+
+  const shortEl = meta.querySelector('.f-short');
+  const fullEl = meta.querySelector('.f-full');
+  const ccShort = meta.querySelector('.cc-short');
+  const ccFull = meta.querySelector('.cc-full');
+  const updateCounts = () => {
+    ccShort.textContent = String(shortEl.value.length);
+    ccFull.textContent = String(fullEl.value.length);
+  };
+  shortEl.addEventListener('input', updateCounts);
+  fullEl.addEventListener('input', updateCounts);
+  updateCounts();
+
+  meta.querySelector('.btn-cancel').onclick = () => {
+    if (kind === 'submission') loadQueue();
+    else loadApproved();
+  };
+  meta.querySelector('.btn-save').onclick = () => onEditSave(record, kind, meta);
+}
+
+async function onEditSave(record, kind, meta) {
+  const title = meta.querySelector('.f-title').value.trim();
+  const category = meta.querySelector('.f-category').value;
+  const shortDescription = meta.querySelector('.f-short').value.trim();
+  const fullDescription = meta.querySelector('.f-full').value.trim();
+  const photoFile = meta.querySelector('.f-photo').files[0] || null;
+
+  if (title.length < 3 || title.length > 120) return toast('Title must be 3–120 characters', 'error');
+  if (shortDescription.length < 10 || shortDescription.length > 200) return toast('Short description must be 10–200 characters', 'error');
+  if (fullDescription.length < 20 || fullDescription.length > 5000) return toast('Full description must be 20–5000 characters', 'error');
+  if (!ALLOWED_CATEGORIES.includes(category)) return toast('Invalid category', 'error');
+
+  const form = new FormData();
+  form.append('title', title);
+  form.append('category', category);
+  form.append('shortDescription', shortDescription);
+  form.append('fullDescription', fullDescription);
+  if (photoFile) form.append('photo', photoFile, photoFile.name);
+
+  const saveBtn = meta.querySelector('.btn-save');
+  const cancelBtn = meta.querySelector('.btn-cancel');
+  saveBtn.disabled = true; cancelBtn.disabled = true;
+  saveBtn.textContent = photoFile ? 'Uploading…' : 'Saving…';
+
+  try {
+    if (kind === 'submission') await editSubmission(record.id, form);
+    else await editSite(record.id, form);
+    toast(`Saved: ${title}`, 'success');
+    if (kind === 'submission') loadQueue();
+    else loadApproved();
+  } catch (err) {
+    if (err.message === 'UNAUTHORIZED') {
+      setToken('');
+      renderLogin();
+      toast('Token rejected — please re-enter.', 'error');
+      return;
+    }
+    toast(`Save failed: ${err.message}`, 'error');
+    saveBtn.disabled = false; cancelBtn.disabled = false;
+    saveBtn.textContent = 'Save';
+  }
+}
+
+// ---------- Import tab ----------
+function renderImportTab() {
+  const container = document.getElementById('tabContent');
+  container.innerHTML = `
+    <div class="import-shell">
+      <h2>Bulk import</h2>
+      <p>Paste a JSON array of sites or upload a JSON file. Each site needs <code>title</code>, <code>category</code>, and <code>coords</code>. Optional: <code>shortDescription</code>, <code>fullDescription</code>, <code>state</code>, <code>sourceUrl</code>, <code>photoUrl</code>. Categories: ${ALLOWED_CATEGORIES.join(', ')}. Max 1000 sites per batch.</p>
+
+      <label>Batch ID <span style="color:#555;text-transform:none;letter-spacing:0;">(unique, used for rollback)</span></label>
+      <input type="text" id="bImportBatchId" placeholder="wikipedia_haunted_va_2026_05_10" maxlength="80">
+
+      <label>Source <span style="color:#555;text-transform:none;letter-spacing:0;">(label, e.g. wikipedia, atlas-obscura, manual)</span></label>
+      <input type="text" id="bImportSource" placeholder="wikipedia" maxlength="80">
+
+      <label>Sites JSON</label>
+      <div class="file-row">
+        <input type="file" id="bImportFile" accept="application/json,.json">
+        <span>or paste below</span>
+      </div>
+      <textarea id="bImportJson" placeholder='[
+  {
+    "title": "Example Haunted Inn",
+    "category": "haunting",
+    "coords": { "lat": 36.85, "lng": -76.28 },
+    "fullDescription": "Long description with citations, history, lore...",
+    "sourceUrl": "https://en.wikipedia.org/wiki/Example_Haunted_Inn"
+  }
+]'></textarea>
+
+      <div class="form-actions">
+        <button class="import-btn" id="bImportPreview">Validate JSON</button>
+        <button class="approve" id="bImportSubmit">Import batch</button>
+      </div>
+
+      <div class="import-results" id="bImportResults" style="display:none;"></div>
+
+      <h3 style="margin-top:32px;">Existing batches</h3>
+      <div id="bImportBatchList"><div class="empty">Loading batches…</div></div>
+    </div>
+  `;
+
+  document.getElementById('bImportFile').onchange = onImportFileChosen;
+  document.getElementById('bImportPreview').onclick = onImportPreview;
+  document.getElementById('bImportSubmit').onclick = onImportSubmit;
+
+  loadBatchList();
+}
+
+function onImportFileChosen(ev) {
+  const file = ev.target.files && ev.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    document.getElementById('bImportJson').value = String(reader.result || '');
+    toast(`Loaded ${file.name}`, 'success');
+  };
+  reader.onerror = () => toast('Failed to read file', 'error');
+  reader.readAsText(file);
+}
+
+function parseImportJsonField() {
+  const raw = document.getElementById('bImportJson').value.trim();
+  if (!raw) throw new Error('JSON is empty');
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new Error(`Invalid JSON: ${err.message}`);
+  }
+  if (!Array.isArray(parsed)) {
+    // Allow {"sites": [...]} shape too — common from scrapers.
+    if (parsed && Array.isArray(parsed.sites)) parsed = parsed.sites;
+    else throw new Error('JSON must be an array of sites (or { "sites": [...] })');
+  }
+  return parsed;
+}
+
+function onImportPreview() {
+  const resultsBox = document.getElementById('bImportResults');
+  try {
+    const sites = parseImportJsonField();
+    const errs = [];
+    sites.forEach((s, i) => {
+      if (!s || typeof s !== 'object') return errs.push(`#${i}: not an object`);
+      if (!s.title || typeof s.title !== 'string') errs.push(`#${i}: missing title`);
+      if (!ALLOWED_CATEGORIES.includes(s.category)) errs.push(`#${i} (${s.title || ''}): bad category "${s.category}"`);
+      if (!s.coords || typeof s.coords !== 'object') errs.push(`#${i} (${s.title || ''}): missing coords`);
+      else {
+        const lat = Number(s.coords.lat), lng = Number(s.coords.lng);
+        if (!isFinite(lat) || lat < -90 || lat > 90) errs.push(`#${i} (${s.title || ''}): bad lat`);
+        if (!isFinite(lng) || lng < -180 || lng > 180) errs.push(`#${i} (${s.title || ''}): bad lng`);
+      }
+    });
+    resultsBox.style.display = '';
+    resultsBox.innerHTML = `
+      <h3>Preview</h3>
+      <div class="import-summary">
+        <div class="stat"><div class="stat-label">Total</div><div class="stat-value">${sites.length}</div></div>
+        <div class="stat"><div class="stat-label">Local errors</div><div class="stat-value ${errs.length ? 'bad' : 'good'}">${errs.length}</div></div>
+      </div>
+      ${errs.length ? `<div class="import-list">${errs.map(e => `<div class="item"><span class="marker skip">!</span><div class="item-body"><div class="item-detail">${escapeHtml(e)}</div></div></div>`).join('')}</div>` : '<div class="empty" style="padding:20px;">JSON looks valid. Server will run further checks (dedupe, batch ID conflict, etc.) on import.</div>'}
+    `;
+  } catch (err) {
+    resultsBox.style.display = '';
+    resultsBox.innerHTML = `<div class="empty" style="color:var(--red);">${escapeHtml(err.message)}</div>`;
+  }
+}
+
+async function onImportSubmit() {
+  const batchId = document.getElementById('bImportBatchId').value.trim();
+  const source = document.getElementById('bImportSource').value.trim();
+  const submitBtn = document.getElementById('bImportSubmit');
+  const resultsBox = document.getElementById('bImportResults');
+  if (!batchId) return toast('Batch ID is required', 'error');
+  if (!source) return toast('Source is required', 'error');
+
+  let sites;
+  try {
+    sites = parseImportJsonField();
+  } catch (err) {
+    return toast(err.message, 'error');
+  }
+  if (!sites.length) return toast('No sites to import', 'error');
+  if (!confirm(`Import ${sites.length} site${sites.length === 1 ? '' : 's'} as batch "${batchId}"?\n\nSites are added directly to the live catalog. Use rollback below if anything goes wrong.`)) return;
+
+  submitBtn.disabled = true;
+  submitBtn.textContent = 'Importing…';
+  resultsBox.style.display = '';
+  resultsBox.innerHTML = `<div class="empty">Importing ${sites.length} sites… (server runs reverse-geocoding for any missing states; this can take a moment)</div>`;
+
+  try {
+    const data = await postBulkImport({ batchId, source, sites });
+    renderImportResults(data);
+    toast(`Imported ${data.importedCount}, skipped ${data.skippedCount}`, 'success');
+    loadBatchList();
+  } catch (err) {
+    resultsBox.innerHTML = `<div class="empty" style="color:var(--red);">${escapeHtml(err.message)}</div>`;
+    toast(`Import failed: ${err.message}`, 'error');
+  } finally {
+    submitBtn.disabled = false;
+    submitBtn.textContent = 'Import batch';
+  }
+}
+
+function renderImportResults(data) {
+  const resultsBox = document.getElementById('bImportResults');
+  const importedItems = (data.imported || []).map((it) => `
+    <div class="item">
+      <span class="marker ok">✓</span>
+      <div class="item-body">
+        <div class="item-title">${escapeHtml(it.title)}</div>
+        <div class="item-detail">${escapeHtml(it.state || '')} · id ${escapeHtml(it.id)}</div>
+      </div>
+    </div>
+  `).join('');
+  const skippedItems = (data.skipped || []).map((it) => {
+    let detail = it.reason;
+    if (it.reason === 'duplicate' && it.existing) {
+      detail = `duplicate of "${it.existing.title}" (${it.existing.distance}m away)`;
+    } else if (it.reason === 'duplicate-in-batch' && it.existing) {
+      detail = `duplicate of "${it.existing.title}" earlier in this batch`;
+    } else if (it.reason === 'validation' && Array.isArray(it.details)) {
+      detail = 'validation: ' + it.details.join('; ');
+    }
+    return `
+      <div class="item">
+        <span class="marker skip">⊘</span>
+        <div class="item-body">
+          <div class="item-title">${escapeHtml(it.title || '(untitled)')}</div>
+          <div class="item-detail">${escapeHtml(detail)}</div>
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  resultsBox.innerHTML = `
+    <h3>Result — batch ${escapeHtml(data.batchId)}</h3>
+    <div class="import-summary">
+      <div class="stat"><div class="stat-label">Imported</div><div class="stat-value good">${data.importedCount}</div></div>
+      <div class="stat"><div class="stat-label">Skipped</div><div class="stat-value ${data.skippedCount ? 'bad' : ''}">${data.skippedCount}</div></div>
+    </div>
+    ${importedItems ? `<h3 style="font-size:12px;margin-top:14px;">Imported</h3><div class="import-list">${importedItems}</div>` : ''}
+    ${skippedItems ? `<h3 style="font-size:12px;margin-top:14px;">Skipped</h3><div class="import-list">${skippedItems}</div>` : ''}
+  `;
+}
+
+async function loadBatchList() {
+  const list = document.getElementById('bImportBatchList');
+  if (!list) return;
+  list.innerHTML = '<div class="empty">Loading batches…</div>';
+  try {
+    const data = await fetchImportBatches();
+    document.getElementById('importBatchCount').textContent = data.count ? ` (${data.count})` : '';
+    if (!data.count) {
+      list.innerHTML = `<div class="empty">No import batches yet.</div>`;
+      return;
+    }
+    list.innerHTML = data.batches.map((b) => `
+      <div class="batch-row">
+        <div>
+          <div class="batch-id">${escapeHtml(b.batchId)}</div>
+          <div class="batch-meta">source: ${escapeHtml(b.source || '—')} · last: ${b.lastApprovedAt ? new Date(b.lastApprovedAt).toLocaleString() : '—'}</div>
+        </div>
+        <span class="batch-count">${b.count} site${b.count === 1 ? '' : 's'}</span>
+        <button class="delete" data-rollback="${escapeHtml(b.batchId)}">Roll back</button>
+      </div>
+    `).join('');
+    list.querySelectorAll('button[data-rollback]').forEach((btn) => {
+      btn.onclick = () => onRollbackBatch(btn.getAttribute('data-rollback'));
+    });
+  } catch (err) {
+    if (err.message === 'UNAUTHORIZED') {
+      setToken('');
+      renderLogin();
+      toast('Token rejected — please re-enter.', 'error');
+      return;
+    }
+    list.innerHTML = `<div class="empty" style="color:var(--red);">${escapeHtml(err.message)}</div>`;
+  }
+}
+
+async function onRollbackBatch(batchId) {
+  if (!confirm(`Roll back batch "${batchId}"?\n\nThis will permanently delete every site in this batch from the live catalog.`)) return;
+  try {
+    const data = await postBulkRollback(batchId);
+    toast(`Rolled back: ${data.removedCount} sites`, 'success');
+    loadBatchList();
+  } catch (err) {
+    toast(`Rollback failed: ${err.message}`, 'error');
+  }
+}
+
+function renderApp() {
+  renderShell();
+  loadCurrentTab();
+}
+
+// ---------- Boot ----------
+if (getToken()) renderApp();
+else renderLogin();
+</script>
+</body>
+</html>
