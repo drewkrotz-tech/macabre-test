@@ -1479,7 +1479,7 @@ type View =
   | { name: 'list' }
   | { name: 'social' }
   | { name: 'userProfile'; handle: string }
-  | { name: 'post'; postId: string; postList?: string[] };
+  | { name: 'post'; postId: string; postList?: string[]; preloadedPosts?: SocialPost[] };
 
 export default function App() {
   const [view, _setViewRaw] = useState<View>({ name: 'home' });
@@ -2102,7 +2102,7 @@ export default function App() {
             onSelectSite={goDetail}
             onBack={goHome}
             onSelectHandle={(h) => setView({ name: 'userProfile', handle: h })}
-            onSelectPost={(postId, postList) => setView({ name: 'post', postId, postList })}
+            onSelectPost={(postId, postList, preloadedPosts) => setView({ name: 'post', postId, postList, preloadedPosts })}
           />
         ),
       };
@@ -2117,7 +2117,7 @@ export default function App() {
             sites={sites}
             onSelectSite={goDetail}
             onSelectBadges={(h) => setView({ name: 'badges', handle: h })}
-            onSelectPost={(postId, postList) => setView({ name: 'post', postId, postList })}
+            onSelectPost={(postId, postList, preloadedPosts) => setView({ name: 'post', postId, postList, preloadedPosts })}
             onBack={goHome}
           />
         ),
@@ -2129,12 +2129,12 @@ export default function App() {
           <PostDetailView
             postId={v.postId}
             postList={v.postList}
+            preloadedPosts={v.preloadedPosts}
             currentHandle={handle}
             deviceId={deviceId}
             sites={sites}
             onSelectSite={goDetail}
             onSelectHandle={(h) => setView({ name: 'userProfile', handle: h })}
-            onNavigatePost={(postId, postList) => setView({ name: 'post', postId, postList }, { replace: true })}
             onBack={goHome}
           />
         ),
@@ -2600,7 +2600,7 @@ function HomeBottomBar({ onSubmit, onList, onAbout, onSocial }: {
         className="sinister-icon-btn" style={S.homeBarBtn}
         onClick={() => { playSubDrop(); onList(); }}
       >
-        <img src={listIconUrl} alt="" style={S.homeBarIcon} />
+        <img src={listIconUrl} alt="" style={{ ...S.homeBarIcon, ...S.homeBarIconSmall }} />
         <span style={S.homeBarLabel}>List View</span>
       </button>
       <button
@@ -2615,7 +2615,7 @@ function HomeBottomBar({ onSubmit, onList, onAbout, onSocial }: {
         onClick={() => { playSubDrop(); onSubmit(); }}
         aria-label="Submit a Location"
       >
-        <img src={locationIconUrl} alt="" style={S.homeBarIcon} />
+        <img src={locationIconUrl} alt="" style={{ ...S.homeBarIcon, ...S.homeBarIconSmall }} />
         <span style={S.homeBarLabel}>Submit</span>
       </button>
       <button
@@ -2660,7 +2660,7 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
   onSelectSite: (site: SinisterSite) => void;
   onBack: () => void;
   onSelectHandle: (handle: string) => void;
-  onSelectPost: (postId: string, postList?: string[]) => void;
+  onSelectPost: (postId: string, postList?: string[], preloadedPosts?: SocialPost[]) => void;
 }) {
   // Sub-tab inside eXposure. The static black bottom bar switches
   // between four sub-screens: 'feed' (the post feed, eXposure home),
@@ -3564,7 +3564,7 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
   sites: SinisterSite[];
   onSelectSite: (site: SinisterSite) => void;
   onSelectBadges: (handle: string) => void;
-  onSelectPost: (postId: string, postList?: string[]) => void;
+  onSelectPost: (postId: string, postList?: string[], preloadedPosts?: SocialPost[]) => void;
   onBack: () => void;
   embedded?: boolean;
 }) {
@@ -3708,7 +3708,7 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
           {posts.map((p) => (
             <button
               key={p.id}
-              onClick={() => onSelectPost(p.id, posts.map((x) => x.id))}
+              onClick={() => onSelectPost(p.id, posts.map((x) => x.id), posts)}
               style={S.profileGridCell}
               aria-label={`Open post: ${p.caption.slice(0, 40)}`}
             >
@@ -3723,57 +3723,75 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
 
 
 // ---------- Single Post Detail ----------
-// Opened when the user taps a thumbnail in a profile grid. Renders the
-// existing SocialPostCard so likes, the site chip, the handle tap and
-// time stamp all behave exactly like the feed.
+// Opened when the user taps a thumbnail in a profile grid. Renders all
+// of the profile's posts as a native vertical scrollable feed, scrolled
+// to the tapped post on mount. Up/down navigation is just native scroll
+// — same smooth momentum scrolling as the eXposure feed. Swipe-right
+// pops back to the profile via the standard back gesture.
 //
-// IG-style vertical navigation: when the caller passes the surrounding
-// postList (the full list of post IDs in the profile grid), the user
-// can swipe up to advance to the next post and down to return to the
-// previous one. Swipe-right still triggers the standard back gesture
-// and returns to the profile (or wherever the navigation came from).
+// Why a feed instead of a single card with snap-swipe handlers?
+//   The previous implementation tried to detect vertical swipes and
+//   navigate between posts by re-mounting the view. That worked but felt
+//   "snappy" — discrete jumps instead of the continuous scroll users
+//   expect from IG. A native scrollable feed gets momentum, inertia, and
+//   rubber-banding for free, and matches the eXposure feed sub-tab.
 //
-// Why fetch by id instead of just passing the post object through view
-// state? Because views can be entered from a fresh app start (e.g. push
-// notification deep link in the future), and even from the same session
-// the cached count may be stale. One small request keeps the data
-// authoritative without slowing tap-to-open noticeably.
-function PostDetailView({ postId, postList, currentHandle, deviceId, sites, onSelectSite, onSelectHandle, onNavigatePost, onBack }: {
+// Preloaded posts arrive from the caller (UserProfileView already has
+// them). Falls back to fetching when no preload is available (e.g. deep
+// link in the future).
+function PostDetailView({ postId, postList, preloadedPosts, currentHandle, deviceId, sites, onSelectSite, onSelectHandle, onBack }: {
   postId: string;
   postList?: string[];
+  preloadedPosts?: SocialPost[];
   currentHandle: string | null;
   deviceId: string | null;
   sites: SinisterSite[];
   onSelectSite: (site: SinisterSite) => void;
   onSelectHandle: (handle: string) => void;
-  onNavigatePost: (postId: string, postList?: string[]) => void;
   onBack: () => void;
 }) {
-  const [post, setPost] = useState<SocialPost | null>(null);
-  const [loading, setLoading] = useState(true);
+  // If the caller preloaded the post objects, use them directly — no
+  // network round-trip needed. Otherwise fall back to fetching just the
+  // target post by id.
+  const [posts, setPosts] = useState<SocialPost[]>(preloadedPosts || []);
+  const [loading, setLoading] = useState(!preloadedPosts || preloadedPosts.length === 0);
 
-  // Index of the current post within the supplied list. -1 if no list
-  // (e.g. deep-linked) or if the post id isn't found. The swipe handler
-  // uses this to know which direction is available.
-  const currentIdx = useMemo(() => {
-    if (!postList || postList.length === 0) return -1;
-    return postList.indexOf(postId);
-  }, [postList, postId]);
-
-  const hasPrev = currentIdx > 0;
-  const hasNext = currentIdx >= 0 && postList ? currentIdx < postList.length - 1 : false;
+  // Refs keyed by post id so we can scroll the right card into view on
+  // mount. data-postid attribute is the lookup mechanism — simpler than
+  // managing a Map of refs.
+  const containerRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
+    if (preloadedPosts && preloadedPosts.length > 0) return;
+    // No preload — fetch just the one post.
     let cancelled = false;
     (async () => {
       setLoading(true);
       const p = await apiFetchPost(postId);
       if (cancelled) return;
-      setPost(p);
+      setPosts(p ? [p] : []);
       setLoading(false);
     })();
     return () => { cancelled = true; };
-  }, [postId]);
+  }, [postId, preloadedPosts]);
+
+  // After the feed renders, scroll the target post's card into view.
+  // 'auto' (not 'smooth') because we want it to land instantly — the
+  // user tapped a thumbnail and expects to see that post, not watch it
+  // scroll to itself.
+  useEffect(() => {
+    if (loading || posts.length === 0) return;
+    // Wait one paint so layout is settled before measuring.
+    const id = requestAnimationFrame(() => {
+      const root = containerRef.current;
+      if (!root) return;
+      const target = root.querySelector(`[data-postid="${postId}"]`) as HTMLElement | null;
+      if (target) {
+        target.scrollIntoView({ block: 'start', behavior: 'auto' });
+      }
+    });
+    return () => cancelAnimationFrame(id);
+  }, [loading, posts, postId]);
 
   const siteById = useMemo(() => {
     const m = new Map<string, SinisterSite>();
@@ -3781,74 +3799,30 @@ function PostDetailView({ postId, postList, currentHandle, deviceId, sites, onSe
     return m;
   }, [sites]);
 
-  void onBack; // back is handled by the swipe-right gesture wrapper
-
-  // ---- IG-style vertical swipe between posts ----
-  // Touch handler attached to the content wrapper. We only commit a
-  // navigation when:
-  //   - the gesture is unambiguously vertical (|dy| > |dx| by a margin)
-  //   - the gesture exceeds either a distance threshold or a flick
-  //     velocity threshold
-  //   - and a neighbor exists in the requested direction
-  // The horizontal-axis check matters because the parent app installs a
-  // global swipe-back gesture; if we don't ignore horizontal moves, we'd
-  // race the back gesture. The parent's handler aborts when it sees a
-  // vertical drag, so the two handlers cooperate cleanly.
-  const _swipeStart = useRef<{ x: number; y: number; t: number } | null>(null);
-  const SWIPE_DIST_PX = 80;       // commit if dragged this far
-  const SWIPE_VELOCITY = 0.45;    // …or this fast (px/ms)
-  const onTouchStart = (e: React.TouchEvent) => {
-    if (e.touches.length !== 1) return;
-    const t = e.touches[0];
-    _swipeStart.current = { x: t.clientX, y: t.clientY, t: Date.now() };
-  };
-  const onTouchEnd = (e: React.TouchEvent) => {
-    const start = _swipeStart.current;
-    _swipeStart.current = null;
-    if (!start) return;
-    if (!postList || postList.length <= 1) return;
-    const ch = e.changedTouches[0];
-    if (!ch) return;
-    const dx = ch.clientX - start.x;
-    const dy = ch.clientY - start.y;
-    const dt = Math.max(1, Date.now() - start.t);
-    // Vertical lock: require dy to dominate dx by ~1.4x so a roughly
-    // diagonal swipe-right (the back gesture) doesn't also trigger
-    // post navigation.
-    if (Math.abs(dy) < Math.abs(dx) * 1.4) return;
-    const velocity = Math.abs(dy) / dt;
-    if (Math.abs(dy) < SWIPE_DIST_PX && velocity < SWIPE_VELOCITY) return;
-    if (dy < 0 && hasNext && postList) {
-      // Swipe up → next post
-      const nextId = postList[currentIdx + 1];
-      if (nextId) onNavigatePost(nextId, postList);
-    } else if (dy > 0 && hasPrev && postList) {
-      // Swipe down → previous post
-      const prevId = postList[currentIdx - 1];
-      if (prevId) onNavigatePost(prevId, postList);
+  // Ensure we only render posts that are part of postList (if provided)
+  // and in postList's order. Defensive — preloadedPosts SHOULD already
+  // match, but this guarantees ordering and filters out anything weird.
+  const orderedPosts = useMemo(() => {
+    if (!postList || postList.length === 0) return posts;
+    const byId = new Map<string, SocialPost>();
+    for (const p of posts) byId.set(p.id, p);
+    const out: SocialPost[] = [];
+    for (const id of postList) {
+      const p = byId.get(id);
+      if (p) out.push(p);
     }
-  };
+    return out.length > 0 ? out : posts;
+  }, [postList, posts]);
+
+  void onBack; // swipe-right gesture handles back
 
   return (
-    <div
-      style={S.socialViewWrap}
-      onTouchStart={onTouchStart}
-      onTouchEnd={onTouchEnd}
-    >
+    <div style={S.socialViewWrap} ref={containerRef}>
       <ExposureBrandHeader />
-
-      {/* Position indicator — shows "3 / 12" when navigating within a
-          profile's grid so the user has IG-style orientation. Hidden
-          when there's no list (deep-link case). */}
-      {postList && postList.length > 1 && currentIdx >= 0 && (
-        <div style={S.postDetailIndicator}>
-          {currentIdx + 1} / {postList.length}
-        </div>
-      )}
 
       {loading ? (
         <div style={S.socialEmpty}>Loading…</div>
-      ) : !post ? (
+      ) : orderedPosts.length === 0 ? (
         <div style={S.socialEmpty}>
           Post not found.
           <br />
@@ -3857,27 +3831,21 @@ function PostDetailView({ postId, postList, currentHandle, deviceId, sites, onSe
           </span>
         </div>
       ) : (
-        <div style={S.socialFeed}>
-          <SocialPostCard
-            post={post}
-            currentHandle={currentHandle}
-            deviceId={deviceId}
-            onSiteTap={() => {
-              const s = siteById.get(post.siteId);
-              if (s) onSelectSite(s);
-            }}
-            onHandleTap={() => onSelectHandle(post.handle)}
-          />
-
-          {/* Hints — only render when a neighbor exists. Subtle text
-              chips below the card telling the user they can keep
-              swiping. Disappear once they've used the gesture. */}
-          {(hasNext || hasPrev) && (
-            <div style={S.postDetailHintRow}>
-              {hasPrev && <span style={S.postDetailHint}>↓ Swipe down for previous</span>}
-              {hasNext && <span style={S.postDetailHint}>↑ Swipe up for next</span>}
+        <div style={{ ...S.socialFeed, paddingBottom: 80 }}>
+          {orderedPosts.map((p) => (
+            <div key={p.id} data-postid={p.id}>
+              <SocialPostCard
+                post={p}
+                currentHandle={currentHandle}
+                deviceId={deviceId}
+                onSiteTap={() => {
+                  const s = siteById.get(p.siteId);
+                  if (s) onSelectSite(s);
+                }}
+                onHandleTap={() => onSelectHandle(p.handle)}
+              />
             </div>
-          )}
+          ))}
         </div>
       )}
     </div>
@@ -7999,6 +7967,17 @@ const S: Record<string, React.CSSProperties> = {
     userSelect: 'none' as const,
     pointerEvents: 'none' as const,           // taps go to the button, not the img
   },
+  // Visual-balance override for icons whose source PNG art fills more of
+  // the canvas (List View, Submit/location). Renders them slightly smaller
+  // so they appear the same VISUAL size as the more padded icons (eXposure,
+  // About). The button slot stays the same width so layout doesn't shift —
+  // only the image inside is smaller. Margin keeps the smaller icons
+  // visually centered relative to the larger ones' baseline.
+  homeBarIconSmall: {
+    width: 50,
+    height: 50,
+    margin: 4,
+  },
   homeBarLabel: {
     fontSize: 11,
     color: '#F0EBE0',
@@ -8101,6 +8080,12 @@ const S: Record<string, React.CSSProperties> = {
   // Solid black bar with a two-line treatment: large neon-purple "eXposure"
   // brand on top, small grey tagline beneath. Sticky so it pins to the
   // top of the viewport on every eXposure sub-screen.
+  //
+  // The paddingTop uses env(safe-area-inset-top) so on iOS the brand title
+  // sits BELOW the status bar (clock / wifi / battery) rather than behind
+  // it. Extra padding-top beyond the inset adds breathing room so the
+  // header doesn't feel cramped against the status bar — IG centers its
+  // brand a comfortable distance below the safe area, which this matches.
   exposureBrandHeader: {
     position: 'sticky' as const,
     top: 0,
@@ -8109,7 +8094,10 @@ const S: Record<string, React.CSSProperties> = {
     flexDirection: 'column' as const,
     alignItems: 'center',
     justifyContent: 'center',
-    padding: '12px 16px 10px 16px',
+    paddingTop: 'calc(env(safe-area-inset-top, 44px) + 16px)' as any,
+    paddingBottom: 12,
+    paddingLeft: 16,
+    paddingRight: 16,
     backgroundColor: '#000',
     borderBottom: `1px solid #BF40FF66`,
     boxShadow: '0 2px 12px rgba(0,0,0,0.6)',
