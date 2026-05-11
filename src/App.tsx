@@ -2937,14 +2937,14 @@ function ExposureBottomBar({ active, onSelect }: {
 // caption / handle. Below the input, a horizontal chip strip lets users
 // filter by category. AND'd — both filters apply. Empty results show a
 // friendly empty state.
-// Plain composer sheet opened by the ➕ Post tab on the eXposure bottom
-// bar. No GPS, no site selection, no admin queue. Pick photo, write
-// caption, post. Server auto-approves; post hits the feed immediately.
-//
-// Differs from DetailView's AddPhotoButton flow — that one is for
-// "I'm at this haunted location right now" posts, which stay GPS-
-// verified and admin-moderated. This one is the casual Instagram-style
-// share-anything path.
+// Instagram-style post composer. Full-screen overlay (not a small card),
+// two-stage flow matching IG's New Post:
+//   Stage 1 — "New post" + photo picker. ✕ left, "New post" centered,
+//             "Next" disabled until a photo is selected. Big tappable
+//             area in the middle that opens iOS's native picker.
+//   Stage 2 — Caption screen. ← back, "New post" centered. Smaller
+//             photo preview at top, "Add a caption..." field, big blue
+//             "Share" button at the bottom.
 function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
   handle: string | null;
   deviceId: string | null;
@@ -2956,11 +2956,16 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
   const [photoPreview, setPhotoPreview] = useState<string | null>(null);
   const [caption, setCaption] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  // Two-stage state: 'pick' while no photo or user is choosing one,
+  // 'caption' once a photo is selected. Tapping Next on stage 1 (only
+  // active when photoFile exists) advances; tapping back on stage 2
+  // returns to stage 1 with the photo cleared.
+  type Stage = 'pick' | 'caption';
+  const [stage, setStage] = useState<Stage>('pick');
 
   const captionTrim = caption.trim();
-  // Match the same caption bounds the server enforces. The server's
-  // CAPTION_MIN is 1; cap at 280 to match the validation in posts.js.
-  const canSubmit = !!photoFile && captionTrim.length >= 1 && captionTrim.length <= 280 && !submitting && !!handle && !!deviceId;
+  // Server enforces 1-280 char caption.
+  const canShare = !!photoFile && captionTrim.length >= 1 && captionTrim.length <= 280 && !submitting && !!handle && !!deviceId;
 
   const onPhotoChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files && e.target.files[0];
@@ -2969,8 +2974,23 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
     setPhotoPreview(URL.createObjectURL(f));
   };
 
-  const onSubmit = async () => {
-    if (!canSubmit || !photoFile || !handle || !deviceId) return;
+  const openPicker = () => {
+    if (submitting) return;
+    fileRef.current?.click();
+  };
+
+  const onNext = () => {
+    if (!photoFile) return;
+    setStage('caption');
+  };
+
+  const onBackFromCaption = () => {
+    if (submitting) return;
+    setStage('pick');
+  };
+
+  const onShare = async () => {
+    if (!canShare || !photoFile || !handle || !deviceId) return;
     setSubmitting(true);
     const result = await apiCreatePost({
       photo: photoFile,
@@ -2987,85 +3007,138 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
     }
   };
 
+  // No handle? Show a minimal error screen with the same header chrome.
+  if (!handle || !deviceId) {
+    return createPortal(
+      <div style={S.igComposerScreen}>
+        <div style={S.igComposerHeader}>
+          <button onClick={onClose} style={S.igComposerHeaderBtn} aria-label="Close">✕</button>
+          <div style={S.igComposerHeaderTitle}>New post</div>
+          <div style={{ width: 40 }} />
+        </div>
+        <div style={{ padding: '40px 24px', textAlign: 'center', color: '#BBB', fontSize: 15, fontFamily: 'system-ui, -apple-system, sans-serif' }}>
+          Claim a handle to post.<br />
+          <span style={{ fontSize: 13, opacity: 0.7, marginTop: 8, display: 'block' }}>
+            Open Submit a Location to claim one.
+          </span>
+        </div>
+      </div>,
+      document.body
+    );
+  }
+
   return createPortal(
-    <div style={S.postComposerOverlay} onClick={(e) => { if (e.target === e.currentTarget && !submitting) onClose(); }}>
-      <div style={S.postComposerCard}>
-        <div style={S.postComposerTitle}>Post to eXposure</div>
+    <div style={S.igComposerScreen}>
+      {/* Hidden file input — same trick as before. accept="image/*" plus
+          no capture attribute lets iOS show the full picker (Photo
+          Library / Take Photo / Choose File). */}
+      <input
+        ref={fileRef}
+        type="file"
+        accept="image/*"
+        style={{ display: 'none' }}
+        onChange={onPhotoChange}
+      />
 
-        {!handle || !deviceId ? (
-          <div style={{ padding: '20px 8px', textAlign: 'center', color: '#BBB', fontSize: 14 }}>
-            Claim a handle to post.<br />
-            <span style={{ fontSize: 12, opacity: 0.6 }}>Open Submit a Location to claim one.</span>
+      {stage === 'pick' && (
+        <>
+          {/* Top bar — ✕ | New post | Next (Next only active when a
+              photo is selected). */}
+          <div style={S.igComposerHeader}>
+            <button onClick={onClose} style={S.igComposerHeaderBtn} aria-label="Close">✕</button>
+            <div style={S.igComposerHeaderTitle}>New post</div>
+            <button
+              onClick={onNext}
+              disabled={!photoFile}
+              style={{
+                ...S.igComposerHeaderNext,
+                color: photoFile ? '#3B9DFF' : '#1B4F7A',
+                cursor: photoFile ? 'pointer' : 'default',
+              }}
+            >
+              Next
+            </button>
           </div>
-        ) : (
-          <>
-            {/* Hidden file input — triggered by the picker button below.
-                accept="image/*" lets the user pick from gallery or take
-                a new photo (Capacitor opens iOS camera/library sheet). */}
-            <input
-              ref={fileRef}
-              type="file"
-              accept="image/*"
-              style={{ display: 'none' }}
-              onChange={onPhotoChange}
-            />
 
-            {photoPreview ? (
-              <div style={{ position: 'relative', marginBottom: 12 }}>
-                <img src={photoPreview} alt="" style={{ width: '100%', borderRadius: 10, display: 'block' }} />
-                <button
-                  type="button"
-                  onClick={() => { setPhotoFile(null); setPhotoPreview(null); }}
-                  style={S.postComposerChangeBtn}
-                  disabled={submitting}
-                >
-                  Change photo
-                </button>
-              </div>
-            ) : (
+          {/* Big preview area — either tap-to-pick prompt or the selected
+              photo. Edge-to-edge, square aspect ratio like IG. */}
+          {photoPreview ? (
+            <div style={S.igPickPreviewWrap}>
+              <img src={photoPreview} alt="" style={S.igPickPreviewImg} />
               <button
                 type="button"
-                onClick={() => fileRef.current?.click()}
-                style={S.postComposerPicker}
+                onClick={openPicker}
+                style={S.igPickChangeBtn}
               >
-                <span style={{ fontSize: 28 }}>📷</span>
-                <span style={{ marginTop: 6, fontSize: 13 }}>Tap to add a photo</span>
+                Change photo
               </button>
-            )}
-
-            <textarea
-              value={caption}
-              onChange={(e) => setCaption(e.target.value)}
-              placeholder="Write a caption…"
-              maxLength={280}
-              rows={3}
-              style={S.postComposerCaption}
-              disabled={submitting}
-            />
-            <div style={{ fontSize: 11, color: '#888', textAlign: 'right' as const, marginTop: -8, marginBottom: 10 }}>
-              {captionTrim.length} / 280
             </div>
-
+          ) : (
             <button
               type="button"
-              onClick={onSubmit}
-              disabled={!canSubmit}
-              style={{ ...S.postComposerSubmit, opacity: canSubmit ? 1 : 0.4 }}
+              onClick={openPicker}
+              style={S.igPickPrompt}
             >
-              {submitting ? 'Posting…' : 'Post'}
+              {/* Subtle camera glyph + prompt. IG's empty state is more
+                  elaborate (gallery grid) but this captures the same
+                  intent without needing the photo library plugin. */}
+              <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#666" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" />
+                <circle cx="12" cy="13" r="4" />
+              </svg>
+              <div style={S.igPickPromptLabel}>Tap to choose a photo</div>
+              <div style={S.igPickPromptHint}>From your camera or library</div>
             </button>
-          </>
-        )}
+          )}
+        </>
+      )}
 
-        <button
-          type="button"
-          onClick={onClose}
-          disabled={submitting}
-          style={{ ...S.postComposerCancel, marginTop: 14 }}
-        >
-          Close
-        </button>
-      </div>
+      {stage === 'caption' && (
+        <>
+          {/* Top bar — ← | New post | (no right button) */}
+          <div style={S.igComposerHeader}>
+            <button onClick={onBackFromCaption} style={S.igComposerHeaderBtn} aria-label="Back">‹</button>
+            <div style={S.igComposerHeaderTitle}>New post</div>
+            <div style={{ width: 40 }} />
+          </div>
+
+          {/* Smaller centered preview + caption field below */}
+          <div style={S.igCaptionBody}>
+            <div style={S.igCaptionPreviewRow}>
+              {photoPreview && (
+                <img src={photoPreview} alt="" style={S.igCaptionPreviewImg} />
+              )}
+              <textarea
+                value={caption}
+                onChange={(e) => setCaption(e.target.value)}
+                placeholder="Write a caption..."
+                maxLength={280}
+                style={S.igCaptionField}
+                disabled={submitting}
+              />
+            </div>
+            <div style={S.igCaptionCounter}>
+              {captionTrim.length} / 280
+            </div>
+          </div>
+
+          {/* Big blue Share button at the bottom, IG-style */}
+          <div style={S.igShareWrap}>
+            <button
+              type="button"
+              onClick={onShare}
+              disabled={!canShare}
+              style={{
+                ...S.igShareBtn,
+                opacity: canShare ? 1 : 0.5,
+                cursor: canShare ? 'pointer' : 'default',
+              }}
+            >
+              {submitting ? 'Sharing...' : 'Share'}
+            </button>
+          </div>
+        </>
+      )}
     </div>,
     document.body
   );
@@ -7457,7 +7530,8 @@ const S: Record<string, React.CSSProperties> = {
     // the bottom social bar (Dread Leaders / List / About) at bottom: 14.
     // That separation makes Submit read as the primary action, since
     // submissions are how the app's catalog grows.
-    bottom: 110,
+    // Nudged +6px to 116 for a hair more breathing room above the icons.
+    bottom: 116,
     transform: 'translateX(-50%)',
     zIndex: 3,
     backgroundColor: 'transparent',
@@ -8231,6 +8305,169 @@ const S: Record<string, React.CSSProperties> = {
     outline: 'none',
     resize: 'vertical' as const,
     marginBottom: 4,
+  },
+  // ---- Instagram-style full-screen post composer ----
+  // The screen + header chrome shared by both stages.
+  igComposerScreen: {
+    position: 'fixed' as const,
+    inset: 0,
+    zIndex: 100,
+    backgroundColor: '#000000',
+    display: 'flex',
+    flexDirection: 'column' as const,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    paddingTop: 'env(safe-area-inset-top, 0px)' as any,
+    paddingBottom: 'env(safe-area-inset-bottom, 0px)' as any,
+  },
+  igComposerHeader: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: '16px 16px 12px',
+    borderBottom: '1px solid #1a1a1a',
+  },
+  igComposerHeaderBtn: {
+    width: 40,
+    height: 32,
+    backgroundColor: 'transparent',
+    border: 'none',
+    color: '#F0EBE0',
+    fontSize: 24,
+    fontWeight: 400,
+    cursor: 'pointer',
+    padding: 0,
+    textAlign: 'left' as const,
+    lineHeight: 1,
+  },
+  igComposerHeaderTitle: {
+    flex: 1,
+    textAlign: 'center' as const,
+    color: '#F0EBE0',
+    fontSize: 17,
+    fontWeight: 700,
+    letterSpacing: 0,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  igComposerHeaderNext: {
+    minWidth: 40,
+    backgroundColor: 'transparent',
+    border: 'none',
+    fontSize: 16,
+    fontWeight: 600,
+    padding: 0,
+    textAlign: 'right' as const,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  // ---- Stage 1: photo picker ----
+  igPickPrompt: {
+    flex: 1,
+    backgroundColor: '#0A0A0A',
+    border: 'none',
+    cursor: 'pointer',
+    display: 'flex',
+    flexDirection: 'column' as const,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 12,
+    color: '#888',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    WebkitTapHighlightColor: 'transparent' as any,
+  },
+  igPickPromptLabel: {
+    fontSize: 16,
+    fontWeight: 600,
+    color: '#F0EBE0',
+    marginTop: 4,
+  },
+  igPickPromptHint: {
+    fontSize: 13,
+    color: '#888',
+  },
+  igPickPreviewWrap: {
+    flex: 1,
+    position: 'relative' as const,
+    backgroundColor: '#000',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  igPickPreviewImg: {
+    maxWidth: '100%',
+    maxHeight: '100%',
+    objectFit: 'contain' as const,
+    display: 'block',
+  },
+  igPickChangeBtn: {
+    position: 'absolute' as const,
+    bottom: 20,
+    left: '50%',
+    transform: 'translateX(-50%)',
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    color: '#FFF',
+    border: '1px solid rgba(255,255,255,0.2)',
+    borderRadius: 20,
+    padding: '8px 18px',
+    fontSize: 13,
+    fontWeight: 600,
+    cursor: 'pointer',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    backdropFilter: 'blur(8px)',
+  },
+  // ---- Stage 2: caption ----
+  igCaptionBody: {
+    flex: 1,
+    overflow: 'auto' as const,
+    padding: '16px 16px 8px',
+  },
+  igCaptionPreviewRow: {
+    display: 'flex',
+    gap: 12,
+    alignItems: 'flex-start',
+  },
+  igCaptionPreviewImg: {
+    width: 64,
+    height: 64,
+    objectFit: 'cover' as const,
+    borderRadius: 6,
+    flexShrink: 0,
+  },
+  igCaptionField: {
+    flex: 1,
+    minHeight: 64,
+    backgroundColor: 'transparent',
+    border: 'none',
+    color: '#F0EBE0',
+    fontSize: 15,
+    lineHeight: 1.4,
+    padding: 4,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    boxSizing: 'border-box' as const,
+    outline: 'none',
+    resize: 'none' as const,
+  },
+  igCaptionCounter: {
+    fontSize: 11,
+    color: '#666',
+    textAlign: 'right' as const,
+    marginTop: 4,
+    paddingRight: 4,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  igShareWrap: {
+    padding: '12px 16px 16px',
+    borderTop: '1px solid #1a1a1a',
+  },
+  igShareBtn: {
+    width: '100%',
+    padding: '14px',
+    backgroundColor: '#3B5BFF',
+    border: 'none',
+    borderRadius: 8,
+    color: '#FFFFFF',
+    fontSize: 15,
+    fontWeight: 700,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    letterSpacing: 0,
   },
   postComposerSubmitDisabled: {
     flex: 1.4,
