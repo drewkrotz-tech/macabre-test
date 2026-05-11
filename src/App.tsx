@@ -19,6 +19,7 @@ import listIconUrl from './assets/list.png';
 import exposureIconUrl from './assets/exposure.png';
 import leaderIconUrl from './assets/leader.png';
 import aboutIconUrl from './assets/about.png';
+import locationIconUrl from './assets/location.png';
 
 // Register the Living Hell font face once at module load.
 if (typeof document !== 'undefined' && !document.getElementById('__livinghell-fontface')) {
@@ -1478,7 +1479,7 @@ type View =
   | { name: 'list' }
   | { name: 'social' }
   | { name: 'userProfile'; handle: string }
-  | { name: 'post'; postId: string };
+  | { name: 'post'; postId: string; postList?: string[] };
 
 export default function App() {
   const [view, _setViewRaw] = useState<View>({ name: 'home' });
@@ -1502,7 +1503,7 @@ export default function App() {
   // its own search center independently.
   type NearbyState = { pinCenter: { lat: number; lng: number } | null; radiusMi: number };
   const _nearbyStateCache = useRef<Map<string, NearbyState>>(new Map());
-  const setView = (next: View) => {
+  const setView = (next: View, opts?: { replace?: boolean }) => {
     const sy = (typeof window !== 'undefined')
       ? (window.scrollY || document.documentElement.scrollTop || 0)
       : 0;
@@ -1520,7 +1521,13 @@ export default function App() {
         const homePeers = new Set(['list', 'social', 'leaders', 'about']);
         const prevIsPeer = homePeers.has(prev.name);
         const nextIsPeer = homePeers.has(next.name);
-        if (prevIsPeer && nextIsPeer) {
+        if (opts?.replace) {
+          // Replace mode — caller is swapping the current view for
+          // another (e.g. swipe up/down between posts in the IG-style
+          // post viewer). Don't push prev onto history; swipe-back
+          // should skip the intermediate steps and return to whatever
+          // came BEFORE the replace chain started.
+        } else if (prevIsPeer && nextIsPeer) {
           // Don't push prev. The peer at the top of the stack already
           // points back to home (or further); leave it.
         } else {
@@ -2095,7 +2102,7 @@ export default function App() {
             onSelectSite={goDetail}
             onBack={goHome}
             onSelectHandle={(h) => setView({ name: 'userProfile', handle: h })}
-            onSelectPost={(postId) => setView({ name: 'post', postId })}
+            onSelectPost={(postId, postList) => setView({ name: 'post', postId, postList })}
           />
         ),
       };
@@ -2110,7 +2117,7 @@ export default function App() {
             sites={sites}
             onSelectSite={goDetail}
             onSelectBadges={(h) => setView({ name: 'badges', handle: h })}
-            onSelectPost={(postId) => setView({ name: 'post', postId })}
+            onSelectPost={(postId, postList) => setView({ name: 'post', postId, postList })}
             onBack={goHome}
           />
         ),
@@ -2121,11 +2128,13 @@ export default function App() {
         element: (
           <PostDetailView
             postId={v.postId}
+            postList={v.postList}
             currentHandle={handle}
             deviceId={deviceId}
             sites={sites}
             onSelectSite={goDetail}
             onSelectHandle={(h) => setView({ name: 'userProfile', handle: h })}
+            onNavigatePost={(postId, postList) => setView({ name: 'post', postId, postList }, { replace: true })}
             onBack={goHome}
           />
         ),
@@ -2329,7 +2338,7 @@ export default function App() {
           top makes the page feel busy and competes with those CTAs. */}
       {view.name !== 'nearby' && view.name !== 'detail' && view.name !== 'submit' && view.name !== 'social' && (
         <HomeBottomBar
-          onLeaders={goLeaders}
+          onSubmit={goSubmit}
           onList={goList}
           onAbout={goAbout}
           onSocial={goSocial}
@@ -2570,8 +2579,8 @@ function SkeletonRow({ height = 48, delay = 0 }: { height?: number; delay?: numb
 // List View (flat directory of all categories/states/locations, also
 // scaffolded), and About. Instagram and YouTube links moved to AboutView
 // where they already live, so users still have one tap to reach them.
-function HomeBottomBar({ onLeaders, onList, onAbout, onSocial }: {
-  onLeaders: () => void;
+function HomeBottomBar({ onSubmit, onList, onAbout, onSocial }: {
+  onSubmit: () => void;
   onList: () => void;
   onAbout: () => void;
   onSocial: () => void;
@@ -2579,12 +2588,11 @@ function HomeBottomBar({ onLeaders, onList, onAbout, onSocial }: {
   // Four icon buttons on the home page bottom bar. Each is one of Drew's
   // custom rounded-square app-style icons sitting above a small text
   // label. The icons carry the visual weight; the labels exist so users
-  // can identify them at a glance (especially "Dread Leaders" which
-  // isn't obvious from the trophy icon alone).
+  // can identify them at a glance.
   //
   //   List View       — full categorized list of every site
   //   eXposure        — the social photo feed (entry point to the mini-app)
-  //   Dread Leaders   — visitor / submitter leaderboards
+  //   Submit          — submit a new haunted location
   //   About           — info + credits
   return (
     <div style={S.homeBar}>
@@ -2604,10 +2612,11 @@ function HomeBottomBar({ onLeaders, onList, onAbout, onSocial }: {
       </button>
       <button
         className="sinister-icon-btn" style={S.homeBarBtn}
-        onClick={() => { playSubDrop(); onLeaders(); }}
+        onClick={() => { playSubDrop(); onSubmit(); }}
+        aria-label="Submit a Location"
       >
-        <img src={leaderIconUrl} alt="" style={S.homeBarIcon} />
-        <span style={S.homeBarLabel}>Dread Leaders</span>
+        <img src={locationIconUrl} alt="" style={S.homeBarIcon} />
+        <span style={S.homeBarLabel}>Submit</span>
       </button>
       <button
         className="sinister-icon-btn" style={S.homeBarBtn}
@@ -2633,6 +2642,16 @@ function HomeBottomBar({ onLeaders, onList, onAbout, onSocial }: {
 // Like UI uses optimistic update — tap heart, increment count locally and
 // toggle filled state, then call /posts/like/:postId in the background.
 // On server error we revert.
+// Module-level memory for the eXposure sub-tab the user was last on.
+// Lets SocialView resume in the right place when the user navigates out
+// (e.g. taps a post thumbnail to open PostDetailView) and swipes back —
+// without this, SocialView would unmount, lose its state, and remount on
+// the default 'feed' tab regardless of where the user actually left off.
+// File-level rather than a useRef inside App so it survives even if App
+// itself remounts.
+type _ExposureSubTab = 'feed' | 'search' | 'post' | 'profile';
+let _exposureSubTabMemory: _ExposureSubTab = 'feed';
+
 function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, onBack, onSelectHandle, onSelectPost }: {
   handle: string | null;
   deviceId: string | null;
@@ -2641,7 +2660,7 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
   onSelectSite: (site: SinisterSite) => void;
   onBack: () => void;
   onSelectHandle: (handle: string) => void;
-  onSelectPost: (postId: string) => void;
+  onSelectPost: (postId: string, postList?: string[]) => void;
 }) {
   // Sub-tab inside eXposure. The static black bottom bar switches
   // between four sub-screens: 'feed' (the post feed, eXposure home),
@@ -2653,7 +2672,17 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
   // navigate out via setView. Tapping the Post tab from a non-feed
   // sub-screen flips back to feed and opens the composer.
   type SubTab = 'feed' | 'search' | 'post' | 'profile';
-  const [subTab, setSubTab] = useState<SubTab>('feed');
+  // Initialize from the module-level memory so swipe-back from a
+  // PostDetailView (or any view that unmounted SocialView) restores
+  // the user to the sub-tab they were on. First-ever mount picks up
+  // the default 'feed'.
+  const [subTab, _setSubTab] = useState<SubTab>(_exposureSubTabMemory);
+  // Wrap the setter so every change also updates the module-level
+  // memory. Callers don't need to know about the memory.
+  const setSubTab = (next: SubTab) => {
+    _exposureSubTabMemory = next;
+    _setSubTab(next);
+  };
 
   // When the user taps the ➕ Post tab, we open an inline composer
   // overlay. We don't switch sub-tabs because Post is an action, not a
@@ -2778,6 +2807,13 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
         }
       }}
     >
+      {/* ====== PERMANENT eXposure BRAND HEADER ======
+          Sits at the top of every sub-tab (Feed, Search, Post, Profile).
+          Black bar with the eXposure brand on top and a short tagline
+          underneath. Sticky so it stays visible while the feed scrolls.
+          Pull-to-refresh and per-sub-tab headers render BELOW this. */}
+      <ExposureBrandHeader />
+
       {/* ====== FEED sub-tab ====== */}
       {subTab === 'feed' && (
         <>
@@ -2794,11 +2830,6 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
                   ? 'Release to refresh'
                   : 'Pull to refresh'}
             </span>
-          </div>
-
-          {/* Header */}
-          <div style={S.socialHeader}>
-            <div style={S.socialHeaderTitle}>eXposure</div>
           </div>
 
           {/* Feed body */}
@@ -3221,11 +3252,6 @@ function ExposureSearchView({ allPosts, currentHandle, deviceId, sites, onSelect
 
   return (
     <div style={{ paddingBottom: 156 }}>
-      {/* Header at top */}
-      <div style={S.socialHeader}>
-        <div style={S.socialHeaderTitle}>Search</div>
-      </div>
-
       {/* Results — render newest-first as user types. Live above the
           sticky search input. paddingBottom on the parent div leaves
           space for the input + chips + black bar (~156px) so the last
@@ -3500,6 +3526,19 @@ function formatTimeAgo(iso: string): string {
   return `${Math.floor(months / 12)}y ago`;
 }
 
+// Shared brand header for every eXposure screen (Feed, Search, Post-tab,
+// Profile, Post Detail, and other-user profiles). Sticky black bar with
+// the eXposure brand on top and a short tagline below — keeps the
+// app's identity visible no matter where you've drilled in.
+function ExposureBrandHeader() {
+  return (
+    <div style={S.exposureBrandHeader}>
+      <div style={S.exposureBrandTitle}>eXposure</div>
+      <div style={S.exposureBrandTagline}>Photos from the most haunted places</div>
+    </div>
+  );
+}
+
 // ---------- User Profile (per-handle eXposure profile) ----------
 // Instagram-style profile page. Same template for every handle — the
 // user's own profile (from the eXposure Profile tab) and any other
@@ -3525,7 +3564,7 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
   sites: SinisterSite[];
   onSelectSite: (site: SinisterSite) => void;
   onSelectBadges: (handle: string) => void;
-  onSelectPost: (postId: string) => void;
+  onSelectPost: (postId: string, postList?: string[]) => void;
   onBack: () => void;
   embedded?: boolean;
 }) {
@@ -3564,10 +3603,9 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
 
   return (
     <div style={embedded ? { paddingBottom: 80 } : S.socialViewWrap}>
-      {/* Sticky header with handle */}
-      <div style={S.socialHeader}>
-        <div style={S.socialHeaderTitle}>@{profileHandle}</div>
-      </div>
+      {/* Brand header only when standalone — when embedded inside the
+          eXposure tab, SocialView already renders it above. */}
+      {!embedded && <ExposureBrandHeader />}
 
       {/* ---- IG-style profile row: big avatar + stats ---- */}
       <div style={S.profileTopRow}>
@@ -3670,7 +3708,7 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
           {posts.map((p) => (
             <button
               key={p.id}
-              onClick={() => onSelectPost(p.id)}
+              onClick={() => onSelectPost(p.id, posts.map((x) => x.id))}
               style={S.profileGridCell}
               aria-label={`Open post: ${p.caption.slice(0, 40)}`}
             >
@@ -3685,27 +3723,45 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
 
 
 // ---------- Single Post Detail ----------
-// Opened when the user taps a thumbnail in the profile grid. Renders the
-// existing SocialPostCard solo (so likes, the site chip, the handle tap,
-// and the time stamp all behave the same as in the feed). Plus a header
-// with a back-friendly title.
+// Opened when the user taps a thumbnail in a profile grid. Renders the
+// existing SocialPostCard so likes, the site chip, the handle tap and
+// time stamp all behave exactly like the feed.
+//
+// IG-style vertical navigation: when the caller passes the surrounding
+// postList (the full list of post IDs in the profile grid), the user
+// can swipe up to advance to the next post and down to return to the
+// previous one. Swipe-right still triggers the standard back gesture
+// and returns to the profile (or wherever the navigation came from).
 //
 // Why fetch by id instead of just passing the post object through view
 // state? Because views can be entered from a fresh app start (e.g. push
 // notification deep link in the future), and even from the same session
 // the cached count may be stale. One small request keeps the data
 // authoritative without slowing tap-to-open noticeably.
-function PostDetailView({ postId, currentHandle, deviceId, sites, onSelectSite, onSelectHandle, onBack }: {
+function PostDetailView({ postId, postList, currentHandle, deviceId, sites, onSelectSite, onSelectHandle, onNavigatePost, onBack }: {
   postId: string;
+  postList?: string[];
   currentHandle: string | null;
   deviceId: string | null;
   sites: SinisterSite[];
   onSelectSite: (site: SinisterSite) => void;
   onSelectHandle: (handle: string) => void;
+  onNavigatePost: (postId: string, postList?: string[]) => void;
   onBack: () => void;
 }) {
   const [post, setPost] = useState<SocialPost | null>(null);
   const [loading, setLoading] = useState(true);
+
+  // Index of the current post within the supplied list. -1 if no list
+  // (e.g. deep-linked) or if the post id isn't found. The swipe handler
+  // uses this to know which direction is available.
+  const currentIdx = useMemo(() => {
+    if (!postList || postList.length === 0) return -1;
+    return postList.indexOf(postId);
+  }, [postList, postId]);
+
+  const hasPrev = currentIdx > 0;
+  const hasNext = currentIdx >= 0 && postList ? currentIdx < postList.length - 1 : false;
 
   useEffect(() => {
     let cancelled = false;
@@ -3727,11 +3783,69 @@ function PostDetailView({ postId, currentHandle, deviceId, sites, onSelectSite, 
 
   void onBack; // back is handled by the swipe-right gesture wrapper
 
+  // ---- IG-style vertical swipe between posts ----
+  // Touch handler attached to the content wrapper. We only commit a
+  // navigation when:
+  //   - the gesture is unambiguously vertical (|dy| > |dx| by a margin)
+  //   - the gesture exceeds either a distance threshold or a flick
+  //     velocity threshold
+  //   - and a neighbor exists in the requested direction
+  // The horizontal-axis check matters because the parent app installs a
+  // global swipe-back gesture; if we don't ignore horizontal moves, we'd
+  // race the back gesture. The parent's handler aborts when it sees a
+  // vertical drag, so the two handlers cooperate cleanly.
+  const _swipeStart = useRef<{ x: number; y: number; t: number } | null>(null);
+  const SWIPE_DIST_PX = 80;       // commit if dragged this far
+  const SWIPE_VELOCITY = 0.45;    // …or this fast (px/ms)
+  const onTouchStart = (e: React.TouchEvent) => {
+    if (e.touches.length !== 1) return;
+    const t = e.touches[0];
+    _swipeStart.current = { x: t.clientX, y: t.clientY, t: Date.now() };
+  };
+  const onTouchEnd = (e: React.TouchEvent) => {
+    const start = _swipeStart.current;
+    _swipeStart.current = null;
+    if (!start) return;
+    if (!postList || postList.length <= 1) return;
+    const ch = e.changedTouches[0];
+    if (!ch) return;
+    const dx = ch.clientX - start.x;
+    const dy = ch.clientY - start.y;
+    const dt = Math.max(1, Date.now() - start.t);
+    // Vertical lock: require dy to dominate dx by ~1.4x so a roughly
+    // diagonal swipe-right (the back gesture) doesn't also trigger
+    // post navigation.
+    if (Math.abs(dy) < Math.abs(dx) * 1.4) return;
+    const velocity = Math.abs(dy) / dt;
+    if (Math.abs(dy) < SWIPE_DIST_PX && velocity < SWIPE_VELOCITY) return;
+    if (dy < 0 && hasNext && postList) {
+      // Swipe up → next post
+      const nextId = postList[currentIdx + 1];
+      if (nextId) onNavigatePost(nextId, postList);
+    } else if (dy > 0 && hasPrev && postList) {
+      // Swipe down → previous post
+      const prevId = postList[currentIdx - 1];
+      if (prevId) onNavigatePost(prevId, postList);
+    }
+  };
+
   return (
-    <div style={S.socialViewWrap}>
-      <div style={S.socialHeader}>
-        <div style={S.socialHeaderTitle}>Post</div>
-      </div>
+    <div
+      style={S.socialViewWrap}
+      onTouchStart={onTouchStart}
+      onTouchEnd={onTouchEnd}
+    >
+      <ExposureBrandHeader />
+
+      {/* Position indicator — shows "3 / 12" when navigating within a
+          profile's grid so the user has IG-style orientation. Hidden
+          when there's no list (deep-link case). */}
+      {postList && postList.length > 1 && currentIdx >= 0 && (
+        <div style={S.postDetailIndicator}>
+          {currentIdx + 1} / {postList.length}
+        </div>
+      )}
+
       {loading ? (
         <div style={S.socialEmpty}>Loading…</div>
       ) : !post ? (
@@ -3754,6 +3868,16 @@ function PostDetailView({ postId, currentHandle, deviceId, sites, onSelectSite, 
             }}
             onHandleTap={() => onSelectHandle(post.handle)}
           />
+
+          {/* Hints — only render when a neighbor exists. Subtle text
+              chips below the card telling the user they can keep
+              swiping. Disappear once they've used the gesture. */}
+          {(hasNext || hasPrev) && (
+            <div style={S.postDetailHintRow}>
+              {hasPrev && <span style={S.postDetailHint}>↓ Swipe down for previous</span>}
+              {hasNext && <span style={S.postDetailHint}>↑ Swipe up for next</span>}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -4439,6 +4563,10 @@ function HomeView({ sites, onSelectCategory, onSelectSite, onSubmit, onAbout, on
   onLeaders: () => void;
   onList: () => void;
 }) {
+  // onSubmit + onLeaders are kept in the prop bag for back-compat with
+  // the dispatcher signature but are no longer rendered inside HomeView
+  // (Submit moved to the bottom bar; Dread Leaders was removed entirely).
+  void onSubmit; void onLeaders;
   const counts: Record<string, number> = {};
   for (const s of sites) counts[s.category] = (counts[s.category] || 0) + 1;
   const ordered = [...CATEGORIES].sort((a, b) => a.gridIndex - b.gridIndex);
@@ -4635,11 +4763,6 @@ function HomeView({ sites, onSelectCategory, onSelectSite, onSubmit, onAbout, on
             <div style={S.bySinister}><BySinister /></div>
           </div>
 
-          {/* Latest submission spotlight. Absolutely positioned in the
-              gap between the title block above and the filmstrip below,
-              so it doesn't shift either. */}
-          <LatestSubmissionSpotlight sites={sites} onSelectSite={onSelectSite} />
-
           <div style={S.homeReelCenter}>
             <div style={S.filmstripOuter}>
               <SprocketColumn ref={sprocketLeftRef} side="left" />
@@ -4673,17 +4796,14 @@ function HomeView({ sites, onSelectCategory, onSelectSite, onSubmit, onAbout, on
       </div>
     </div>
 
-      {/* Social bar pinned to viewport bottom — outside the centered group */}
-      {/* Submit a Locale button — fixed above the social bar, always visible.
-          This is the primary call-to-action for getting new locales contributed
-          so it must never be hidden by scrolling away from a cell. */}
-      <button
-        className="sinister-pressable"
-        onClick={onSubmit}
-        style={S.submitFixedButton}
-      >
-        <span style={S.submitFixedButtonText}>SUBMIT A LOCATION</span>
-      </button>
+      {/* Latest Submission spotlight — sits fixed above the home bottom
+          bar where the SUBMIT A LOCATION button used to live. Drew moved
+          submit to the bottom-bar icon, freeing this prime real estate
+          to surface the freshest community contribution. Tapping it opens
+          that location's detail page. */}
+      <div style={S.spotlightFixedWrap}>
+        <LatestSubmissionSpotlight sites={sites} onSelectSite={onSelectSite} />
+      </div>
     </div>
   );
 }
@@ -7747,6 +7867,23 @@ const S: Record<string, React.CSSProperties> = {
     animation: 'sinister-cell-title-pulse 3.5s ease-in-out infinite',
     transformOrigin: 'center center',
   },
+  // Wrapper that pins the LatestSubmissionSpotlight at the spot where the
+  // SUBMIT A LOCATION button used to live (bottom: 116, centered). The
+  // inner spotlight component sits with position: relative, so this
+  // fixed-position wrapper does the bottom-anchoring without changing the
+  // spotlight's intrinsic layout.
+  spotlightFixedWrap: {
+    position: 'fixed' as const,
+    left: '50%',
+    bottom: 116,
+    transform: 'translateX(-50%)',
+    zIndex: 3,
+    display: 'flex',
+    justifyContent: 'center',
+    pointerEvents: 'none' as const,
+    // The spotlight inside re-enables pointer events via its own style,
+    // so taps land on the chip but not on this transparent wrapper.
+  },
 
   // ---- Toast styles ----
   // Stack of small notifications above the bottom social bar. Each toast
@@ -7959,6 +8096,40 @@ const S: Record<string, React.CSSProperties> = {
     backgroundColor: 'rgba(10,10,10,0.85)',
     backdropFilter: 'blur(8px)',
     borderBottom: `1px solid #BF40FF44`,
+  },
+  // ---- Permanent eXposure brand header ----
+  // Solid black bar with a two-line treatment: large neon-purple "eXposure"
+  // brand on top, small grey tagline beneath. Sticky so it pins to the
+  // top of the viewport on every eXposure sub-screen.
+  exposureBrandHeader: {
+    position: 'sticky' as const,
+    top: 0,
+    zIndex: 6,
+    display: 'flex',
+    flexDirection: 'column' as const,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: '12px 16px 10px 16px',
+    backgroundColor: '#000',
+    borderBottom: `1px solid #BF40FF66`,
+    boxShadow: '0 2px 12px rgba(0,0,0,0.6)',
+  },
+  exposureBrandTitle: {
+    color: '#BF40FF',
+    fontSize: 28,
+    fontFamily: '"Jolly Lodger", system-ui, serif',
+    fontWeight: 400,
+    letterSpacing: '0.04em',
+    textShadow: `0 0 12px #BF40FFaa`,
+    lineHeight: 1,
+  },
+  exposureBrandTagline: {
+    color: '#888',
+    fontSize: 11,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    letterSpacing: '0.12em',
+    textTransform: 'uppercase' as const,
+    marginTop: 4,
   },
   // Pull-to-refresh indicator. Sits above the header, height grows as the
   // user drags down. Background matches the page so it visually "pulls
@@ -8212,6 +8383,34 @@ const S: Record<string, React.CSSProperties> = {
     pointerEvents: 'none' as const,
     WebkitUserSelect: 'none' as const,
     WebkitTouchCallout: 'none' as const,
+  },
+  // ---- Post detail (IG-style swipe-through viewer) ----
+  // Small chip just below the brand header showing "N / total" so the
+  // user has IG-style orientation while swiping between posts.
+  postDetailIndicator: {
+    textAlign: 'center' as const,
+    padding: '8px 12px 4px 12px',
+    color: '#BF40FF',
+    fontSize: 12,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    fontWeight: 600,
+    letterSpacing: '0.12em',
+  },
+  // Hint row at the bottom of the post card. Tells the user a vertical
+  // swipe is available — fades into the background once they get the idea.
+  postDetailHintRow: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    padding: '12px 20px 32px 20px',
+    gap: 12,
+    flexWrap: 'wrap' as const,
+  },
+  postDetailHint: {
+    color: '#666',
+    fontSize: 11,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    letterSpacing: '0.06em',
+    textTransform: 'uppercase' as const,
   },
   socialHeaderTitle: {
     color: '#BF40FF',
