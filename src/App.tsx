@@ -13,6 +13,12 @@ import {
 } from './geofencing';
 import LivingHellFontUrl from './assets/Living Hell.ttf';
 import SlideMountUrl from './assets/slide-mount.png';
+// Custom bottom-bar icons (rounded-square iOS-style app icons) for the
+// home page bar — replace the prior text labels + "More" dropdown.
+import listIconUrl from './assets/list.png';
+import exposureIconUrl from './assets/exposure.png';
+import leaderIconUrl from './assets/leader.png';
+import aboutIconUrl from './assets/about.png';
 
 // Register the Living Hell font face once at module load.
 if (typeof document !== 'undefined' && !document.getElementById('__livinghell-fontface')) {
@@ -2500,91 +2506,47 @@ function HomeBottomBar({ onLeaders, onList, onAbout, onSocial }: {
   onAbout: () => void;
   onSocial: () => void;
 }) {
-  // Three pill buttons on the home page bottom bar:
-  //   List View (left) — full categorized list of every site
-  //   Social (middle) — vertical scroll feed of visitor photo posts;
-  //                     the standout button, outlined acid green to
-  //                     signal "live" / active community content
-  //   More (right) — popup containing Dread Leaders and About
+  // Four icon buttons on the home page bottom bar. Each is one of Drew's
+  // custom rounded-square app-style icons sitting above a small text
+  // label. The icons carry the visual weight; the labels exist so users
+  // can identify them at a glance (especially "Dread Leaders" which
+  // isn't obvious from the trophy icon alone).
   //
-  // The More popup is anchored above the More button (right-aligned). It
-  // closes when:
-  //   - User taps any item in it (and navigates)
-  //   - User taps the More button again
-  //   - User taps anywhere outside (handled via a transparent overlay)
-  const [moreOpen, setMoreOpen] = useState(false);
-  const closeMore = () => setMoreOpen(false);
-
+  //   List View       — full categorized list of every site
+  //   eXposure        — the social photo feed (entry point to the mini-app)
+  //   Dread Leaders   — visitor / submitter leaderboards
+  //   About           — info + credits
   return (
-    <>
-      {/* Backdrop — captures taps outside the popup so users can dismiss
-          by tapping anywhere on the page, the same way iOS context menus
-          and action sheets behave. Transparent so it doesn't darken the
-          home view (the popup itself is what stands out). */}
-      {moreOpen && (
-        <div
-          onClick={closeMore}
-          style={{
-            position: 'fixed',
-            inset: 0,
-            zIndex: 9,
-            backgroundColor: 'transparent',
-          }}
-        />
-      )}
-
-      {/* Popup menu — anchored above the More button on the right side.
-          Animated in via a CSS class so it doesn't pop in jarringly. */}
-      {moreOpen && (
-        <div style={S.moreMenuWrap} className="sinister-more-menu">
-          <button
-            style={S.moreMenuItem}
-            onClick={() => { playSubDrop(); closeMore(); onLeaders(); }}
-          >
-            <span style={S.socialIcon}>👑</span>
-            <span style={S.moreMenuLabel}>Dread Leaders</span>
-          </button>
-          <div style={S.moreMenuDivider} />
-          <button
-            style={S.moreMenuItem}
-            onClick={() => { playSubDrop(); closeMore(); onAbout(); }}
-          >
-            <span style={S.socialIcon}>ℹ️</span>
-            <span style={S.moreMenuLabel}>About</span>
-          </button>
-        </div>
-      )}
-
-      <div style={S.socialBar}>
-        <button
-          style={S.socialBtn}
-          onClick={() => { playSubDrop(); onList(); }}
-        >
-          <span style={S.socialLabel}>List View</span>
-        </button>
-        <button
-          style={S.socialBtnHighlight}
-          onClick={() => { playBackSound(); onSocial(); }}
-        >
-          <span style={S.socialLabelHighlight}>eXposure</span>
-        </button>
-        <button
-          style={{ ...S.socialBtn, ...(moreOpen ? S.socialBtnActive : {}) }}
-          onClick={() => {
-            // OPEN plays the run-home/back sound; CLOSE plays Sub Drop
-            // (matches the rest of the bottom bar). The asymmetry gives
-            // the user an audible cue that "the menu just appeared" vs
-            // "I'm dismissing the menu."
-            if (moreOpen) playSubDrop();
-            else playBackSound();
-            setMoreOpen(v => !v);
-          }}
-        >
-          <span style={S.socialIcon}>☰</span>
-          <span style={S.socialLabel}>More</span>
-        </button>
-      </div>
-    </>
+    <div style={S.homeBar}>
+      <button
+        style={S.homeBarBtn}
+        onClick={() => { playSubDrop(); onList(); }}
+      >
+        <img src={listIconUrl} alt="" style={S.homeBarIcon} />
+        <span style={S.homeBarLabel}>List View</span>
+      </button>
+      <button
+        style={S.homeBarBtn}
+        onClick={() => { playBackSound(); onSocial(); }}
+      >
+        <img src={exposureIconUrl} alt="" style={S.homeBarIcon} />
+        <span style={S.homeBarLabel}>eXposure</span>
+      </button>
+      <button
+        style={S.homeBarBtn}
+        onClick={() => { playSubDrop(); onLeaders(); }}
+      >
+        <img src={leaderIconUrl} alt="" style={S.homeBarIcon} />
+        <span style={S.homeBarLabel}>Dread Leaders</span>
+      </button>
+      <button
+        style={S.homeBarBtn}
+        onClick={() => { playSubDrop(); onAbout(); }}
+      >
+        <img src={aboutIconUrl} alt="" style={S.homeBarIcon} />
+        <span style={S.homeBarLabel}>About</span>
+      </button>
+    </div>
   );
 }
 
@@ -7486,6 +7448,60 @@ const S: Record<string, React.CSSProperties> = {
     gap: 8,
     padding: '0 12px',
     boxSizing: 'border-box',
+  },
+  // ---- Home bottom bar (4 custom-icon buttons) ----
+  // Replaces the prior 3-pill socialBar (List View / eXposure / More).
+  // Sits at the bottom of the home screen, icons + small labels. The
+  // icons are full rounded-square iOS-style app icons so they read as
+  // a row of mini-apps rather than UI chrome.
+  homeBar: {
+    position: 'fixed' as const,
+    left: 0, right: 0,
+    bottom: 14,
+    zIndex: 10,
+    display: 'flex',
+    justifyContent: 'space-around',
+    alignItems: 'flex-end',
+    gap: 4,
+    padding: '0 12px',
+    boxSizing: 'border-box' as const,
+    paddingBottom: 'env(safe-area-inset-bottom, 0px)' as any,
+  },
+  homeBarBtn: {
+    flex: 1,
+    maxWidth: 96,
+    backgroundColor: 'transparent',
+    border: 'none',
+    cursor: 'pointer',
+    display: 'flex',
+    flexDirection: 'column' as const,
+    alignItems: 'center',
+    gap: 4,
+    padding: '4px 0',
+  },
+  homeBarIcon: {
+    width: 58,
+    height: 58,
+    borderRadius: 13,
+    display: 'block',
+    objectFit: 'cover' as const,
+    // Subtle drop shadow so the icons feel lifted off the background
+    // (matches iOS home-screen icon shadow). No outline / border —
+    // the icons already carry their own rounded-square chrome.
+    filter: 'drop-shadow(0 2px 6px rgba(0,0,0,0.6))',
+  },
+  homeBarLabel: {
+    fontSize: 11,
+    color: '#F0EBE0',
+    letterSpacing: '0.04em',
+    textAlign: 'center' as const,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    fontWeight: 600,
+    textShadow: '0 1px 3px rgba(0,0,0,0.8)',
+    maxWidth: '100%',
+    whiteSpace: 'nowrap' as const,
+    overflow: 'hidden' as const,
+    textOverflow: 'ellipsis' as const,
   },
   // Pill button used in the home bottom bar. Wider than the original 3-button
   // layout since there are now only 2 (Locations Near Me / More) sharing the
