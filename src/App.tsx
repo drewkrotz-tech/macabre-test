@@ -2021,6 +2021,7 @@ export default function App() {
             handle={handle}
             deviceId={deviceId}
             sites={sites}
+            currentLocation={currentLocation}
             onSelectSite={goDetail}
             onBack={goHome}
             onSelectHandle={(h) => setView({ name: 'userProfile', handle: h })}
@@ -2589,10 +2590,11 @@ function HomeBottomBar({ onLeaders, onList, onAbout, onSocial }: {
 // Like UI uses optimistic update — tap heart, increment count locally and
 // toggle filled state, then call /posts/like/:postId in the background.
 // On server error we revert.
-function SocialView({ handle, deviceId, sites, onSelectSite, onBack, onSelectHandle }: {
+function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, onBack, onSelectHandle }: {
   handle: string | null;
   deviceId: string | null;
   sites: SinisterSite[];
+  currentLocation: { lat: number; lng: number } | null;
   onSelectSite: (site: SinisterSite) => void;
   onBack: () => void;
   onSelectHandle: (handle: string) => void;
@@ -2608,6 +2610,13 @@ function SocialView({ handle, deviceId, sites, onSelectSite, onBack, onSelectHan
   // sub-screen flips back to feed and opens the composer.
   type SubTab = 'feed' | 'search' | 'post' | 'profile';
   const [subTab, setSubTab] = useState<SubTab>('feed');
+
+  // When the user taps the ➕ Post tab, we open an inline composer
+  // overlay. We don't switch sub-tabs because Post is an action, not a
+  // sub-screen. The overlay handles the GPS check internally — if no
+  // site is within 100m, it shows a "get closer" message; otherwise it
+  // surfaces the existing AddPhotoButton composer.
+  const [postSheetOpen, setPostSheetOpen] = useState(false);
 
   const [posts, setPosts] = useState<SocialPost[]>([]);
   const [nextBefore, setNextBefore] = useState<string | null>(null);
@@ -2834,22 +2843,35 @@ function SocialView({ handle, deviceId, sites, onSelectSite, onBack, onSelectHan
         active={subTab}
         onSelect={(tab) => {
           if (tab === 'post') {
-            // Post is an action, not a sub-screen — trigger the composer
-            // flow. Implementation: navigate to the nearby map so the
-            // user can find a site they're within 100m of. The existing
-            // DetailView "Post to eXposure" button handles the actual
-            // camera + caption + upload.
+            // Post is an action, not a sub-screen — open the composer
+            // sheet. It handles the GPS check internally.
             playSubDrop();
-            // Stay on feed visually; the action happens via the prompt
-            // we surface below.
-            setSubTab('feed');
-            showToast('To post: visit a site and tap "Post to eXposure" from its page', 'default', 4500);
+            setPostSheetOpen(true);
             return;
           }
           playSubDrop();
           setSubTab(tab);
         }}
       />
+
+      {/* Post composer sheet — opened by the ➕ tab. Finds the nearest
+          site within 100m and runs the camera flow. */}
+      {postSheetOpen && (
+        <ExposurePostSheet
+          handle={handle}
+          deviceId={deviceId}
+          sites={sites}
+          currentLocation={currentLocation}
+          onClose={() => setPostSheetOpen(false)}
+          onPosted={() => {
+            setPostSheetOpen(false);
+            showToast('Post submitted for review', 'success');
+            // Trigger a feed refresh so the (eventually approved) post
+            // shows up next time admin approves it.
+            void refreshFeed();
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -2915,6 +2937,93 @@ function ExposureBottomBar({ active, onSelect }: {
 // caption / handle. Below the input, a horizontal chip strip lets users
 // filter by category. AND'd — both filters apply. Empty results show a
 // friendly empty state.
+// Inline composer sheet opened by the ➕ Post tab on the eXposure bottom
+// bar. Finds the nearest site within 100m of the user's GPS, and reuses
+// AddPhotoButton's camera + caption + upload flow.
+//
+// States:
+//   - No GPS fix yet  -> "Locating you…"
+//   - No handle       -> "Claim a handle to post"
+//   - No site in range -> "You need to be within 100m of a haunted site to post"
+//   - Site in range    -> renders AddPhotoButton anchored to that site
+function ExposurePostSheet({ handle, deviceId, sites, currentLocation, onClose, onPosted }: {
+  handle: string | null;
+  deviceId: string | null;
+  sites: SinisterSite[];
+  currentLocation: { lat: number; lng: number } | null;
+  onClose: () => void;
+  onPosted: () => void;
+}) {
+  // Find the nearest site within 100m of the user. If none, the user
+  // has to physically move closer to a site before posting — this
+  // preserves the GPS-verified credential that defines the app.
+  const POST_RADIUS_M = 100;
+  const nearestInRange = useMemo(() => {
+    if (!currentLocation) return null;
+    let best: { site: SinisterSite; d: number } | null = null;
+    for (const s of sites) {
+      if (!s.coords) continue;
+      const d = distanceMeters(currentLocation.lat, currentLocation.lng, s.coords.lat, s.coords.lng);
+      if (d > POST_RADIUS_M) continue;
+      if (!best || d < best.d) best = { site: s, d };
+    }
+    return best;
+  }, [currentLocation, sites]);
+
+  return (
+    <div style={S.postComposerOverlay} onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <div style={S.postComposerCard}>
+        <div style={S.postComposerTitle}>Post to eXposure</div>
+        {!currentLocation ? (
+          <div style={{ padding: '20px 8px', textAlign: 'center', color: '#BBB', fontSize: 14 }}>
+            Locating you…<br />
+            <span style={{ fontSize: 12, opacity: 0.6 }}>Make sure location is enabled.</span>
+          </div>
+        ) : !handle || !deviceId ? (
+          <div style={{ padding: '20px 8px', textAlign: 'center', color: '#BBB', fontSize: 14 }}>
+            Claim a handle to post.<br />
+            <span style={{ fontSize: 12, opacity: 0.6 }}>Open Submit a Location to claim one.</span>
+          </div>
+        ) : !nearestInRange ? (
+          <div style={{ padding: '20px 8px', textAlign: 'center', color: '#BBB', fontSize: 14 }}>
+            You need to be within 100m of a haunted site to post.<br />
+            <span style={{ fontSize: 12, opacity: 0.6, marginTop: 8, display: 'block' }}>
+              Visit a site, then tap ➕ again.
+            </span>
+          </div>
+        ) : (
+          <div style={{ padding: '8px 0' }}>
+            <div style={{ fontSize: 13, color: '#BF40FF', textAlign: 'center', marginBottom: 12 }}>
+              📍 {nearestInRange.site.title}
+              <div style={{ fontSize: 11, color: '#888', marginTop: 2 }}>
+                {Math.round(nearestInRange.d)}m away — verified
+              </div>
+            </div>
+            <AddPhotoButton
+              site={nearestInRange.site}
+              handle={handle}
+              deviceId={deviceId}
+              currentLocation={currentLocation}
+              onPosted={onPosted}
+            />
+          </div>
+        )}
+        <button
+          type="button"
+          onClick={onClose}
+          style={{ ...S.postComposerCancel, marginTop: 14 }}
+        >
+          Close
+        </button>
+      </div>
+    </div>
+  );
+}
+
+
+// Search sub-screen inside eXposure. Text input filters loaded posts by
+// caption / handle. The sticky search bar lives just above the black
+// bottom bar; results scroll above it.
 function ExposureSearchView({ allPosts, currentHandle, deviceId, sites, onSelectSite, onSelectHandle }: {
   allPosts: SocialPost[];
   currentHandle: string | null;
@@ -2945,39 +3054,16 @@ function ExposureSearchView({ allPosts, currentHandle, deviceId, sites, onSelect
   });
 
   return (
-    <div>
+    <div style={{ paddingBottom: 156 }}>
+      {/* Header at top */}
       <div style={S.socialHeader}>
         <div style={S.socialHeaderTitle}>Search</div>
       </div>
-      <div style={{ padding: '12px 14px' }}>
-        <input
-          type="text"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder="Search posts, handles, sites…"
-          style={S.searchInput}
-        />
-      </div>
-      {/* Category chips — scrollable horizontal strip. Doesn't have the
-          swipe-back conflict here because the bottom bar is the primary
-          navigation; horizontal scroll on chips is just refinement. */}
-      <div style={S.filterChipBar}>
-        <button
-          onClick={() => { playSubDrop(); setCategory(null); }}
-          style={{ ...S.filterChip, ...(category === null ? S.filterChipActive : {}) }}
-        >
-          All
-        </button>
-        {CATEGORIES.map((cat) => (
-          <button
-            key={cat.key}
-            onClick={() => { playSubDrop(); setCategory(cat.key); }}
-            style={{ ...S.filterChip, ...(category === cat.key ? S.filterChipActive : {}) }}
-          >
-            {cat.label}
-          </button>
-        ))}
-      </div>
+
+      {/* Results — render newest-first as user types. Live above the
+          sticky search input. paddingBottom on the parent div leaves
+          space for the input + chips + black bar (~156px) so the last
+          result isn't hidden. */}
       {filtered.length === 0 ? (
         <div style={S.socialEmpty}>
           {q || category ? 'No matches.' : 'Start typing to search.'}<br />
@@ -2986,7 +3072,7 @@ function ExposureSearchView({ allPosts, currentHandle, deviceId, sites, onSelect
           </span>
         </div>
       ) : (
-        <div style={{ ...S.socialFeed, paddingBottom: 80 }}>
+        <div style={S.socialFeed}>
           {filtered.map((p) => (
             <SocialPostCard
               key={p.id}
@@ -3002,6 +3088,37 @@ function ExposureSearchView({ allPosts, currentHandle, deviceId, sites, onSelect
           ))}
         </div>
       )}
+
+      {/* Sticky search bar — fixed just above the black bottom bar.
+          Category chips on top, text input below. Always visible. */}
+      <div style={S.searchStickyBar}>
+        <div style={S.filterChipBar}>
+          <button
+            onClick={() => { playSubDrop(); setCategory(null); }}
+            style={{ ...S.filterChip, ...(category === null ? S.filterChipActive : {}) }}
+          >
+            All
+          </button>
+          {CATEGORIES.map((cat) => (
+            <button
+              key={cat.key}
+              onClick={() => { playSubDrop(); setCategory(cat.key); }}
+              style={{ ...S.filterChip, ...(category === cat.key ? S.filterChipActive : {}) }}
+            >
+              {cat.label}
+            </button>
+          ))}
+        </div>
+        <div style={{ padding: '8px 12px' }}>
+          <input
+            type="text"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search posts, handles, sites…"
+            style={S.searchInput}
+          />
+        </div>
+      </div>
     </div>
   );
 }
@@ -7489,6 +7606,20 @@ const S: Record<string, React.CSSProperties> = {
     fontFamily: 'system-ui, -apple-system, sans-serif',
     boxSizing: 'border-box' as const,
     outline: 'none',
+  },
+  // Sticky search controls — sits directly above the black bottom bar
+  // (which is fixed at bottom: 0, height 56). Bottom: 56 anchors this
+  // strip right above it. Z-index 19 so it sits under the bar's 20 (so
+  // any chip glow doesn't bleed onto the bar visually).
+  searchStickyBar: {
+    position: 'fixed' as const,
+    left: 0, right: 0,
+    bottom: 56,
+    zIndex: 19,
+    backgroundColor: 'rgba(10,10,10,0.95)',
+    backdropFilter: 'blur(8px)',
+    borderTop: '1px solid #1a1a1a',
+    paddingBottom: 'env(safe-area-inset-bottom, 0px)' as any,
   },
   // ---- User profile stats strip ----
   profileStatsRow: {
