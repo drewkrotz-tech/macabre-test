@@ -208,6 +208,97 @@ async function apiGetBadges(handle: string): Promise<{ badges: BadgeRow[]; submi
   } catch { return { badges: [], submitCount: 0, visitCount: 0 }; }
 }
 
+// ---------- Posts (Social feed) API ----------
+// Companion to /posts on the server. A "post" is a GPS-verified photo a
+// user submitted while standing at a site, with a caption. Posts are
+// admin-approved before they appear in the feed.
+
+type SocialPost = {
+  id: string;
+  siteId: string;
+  siteTitle: string | null;
+  siteCategory: string | null;
+  handle: string;
+  caption: string;
+  photoUrl: string;
+  createdAt: string;
+  approvedAt: string;
+  likeCount: number;
+};
+
+type FeedPage = { posts: SocialPost[]; nextBefore: string | null };
+
+async function apiFetchFeed(args: { limit?: number; before?: string | null }): Promise<FeedPage> {
+  try {
+    const params = new URLSearchParams();
+    if (args.limit) params.set('limit', String(args.limit));
+    if (args.before) params.set('before', args.before);
+    const url = `${API_BASE}/posts/feed${params.toString() ? `?${params.toString()}` : ''}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    return {
+      posts: Array.isArray(data?.posts) ? data.posts : [],
+      nextBefore: data?.nextBefore || null,
+    };
+  } catch { return { posts: [], nextBefore: null }; }
+}
+
+async function apiToggleLike(args: { postId: string; handle: string; deviceId: string }): Promise<{ ok: boolean; liked?: boolean; count?: number; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/posts/like/${encodeURIComponent(args.postId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ handle: args.handle, deviceId: args.deviceId }),
+    });
+    const data = await res.json();
+    if (!res.ok) return { ok: false, reason: data?.error || `HTTP ${res.status}` };
+    return { ok: true, liked: !!data?.liked, count: typeof data?.count === 'number' ? data.count : undefined };
+  } catch (e: any) {
+    return { ok: false, reason: e?.message || 'network error' };
+  }
+}
+
+async function apiLikeStatus(args: { postId: string; handle: string | null }): Promise<{ liked: boolean; count: number }> {
+  try {
+    const url = args.handle
+      ? `${API_BASE}/posts/likes/${encodeURIComponent(args.postId)}?handle=${encodeURIComponent(args.handle)}`
+      : `${API_BASE}/posts/likes/${encodeURIComponent(args.postId)}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    return { liked: !!data?.liked, count: typeof data?.count === 'number' ? data.count : 0 };
+  } catch { return { liked: false, count: 0 }; }
+}
+
+// Create a post via multipart/form-data. Photo must be a Blob/File from
+// the camera capture. Server verifies GPS within 100m, queues for admin
+// approval, and records the visit (idempotent — same site = no dup visit).
+async function apiCreatePost(args: {
+  photo: Blob;
+  handle: string;
+  deviceId: string;
+  siteId: string;
+  caption: string;
+  captureLat: number;
+  captureLng: number;
+}): Promise<{ ok: boolean; postId?: string; reason?: string }> {
+  try {
+    const fd = new FormData();
+    fd.append('photo', args.photo, 'post.jpg');
+    fd.append('handle', args.handle);
+    fd.append('deviceId', args.deviceId);
+    fd.append('siteId', args.siteId);
+    fd.append('caption', args.caption);
+    fd.append('captureLat', String(args.captureLat));
+    fd.append('captureLng', String(args.captureLng));
+    const res = await fetch(`${API_BASE}/posts`, { method: 'POST', body: fd });
+    const data = await res.json();
+    if (!res.ok) return { ok: false, reason: data?.error || `HTTP ${res.status}` };
+    return { ok: true, postId: data?.postId };
+  } catch (e: any) {
+    return { ok: false, reason: e?.message || 'network error' };
+  }
+}
+
 // ---------- Live site fetch ----------
 // The server's /sites endpoint returns approved locales. Each site has the
 // shape { id, title, shortDescription, fullDescription, category, state,
@@ -1332,7 +1423,8 @@ type View =
   | { name: 'leaders' }
   | { name: 'badges'; handle: string }
   | { name: 'nearby'; category?: CategoryKey }
-  | { name: 'list' };
+  | { name: 'list' }
+  | { name: 'social' };
 
 export default function App() {
   const [view, _setViewRaw] = useState<View>({ name: 'home' });
@@ -1795,6 +1887,9 @@ export default function App() {
   function goLeaders() {
     setView({ name: 'leaders' });
   }
+  function goSocial() {
+    setView({ name: 'social' });
+  }
   function goList() {
     // Opening List View fresh from the menu should always start at the
     // top (Categories) level. The module-level _listLevelMemory exists
@@ -1917,6 +2012,19 @@ export default function App() {
       };
     } else if (v.name === 'list') {
       return { key: 'list', element: <ListView sites={sites} currentLocation={currentLocation} onSelectSite={goDetail} onBack={goHome} /> };
+    } else if (v.name === 'social') {
+      return {
+        key: 'social',
+        element: (
+          <SocialView
+            handle={handle}
+            deviceId={deviceId}
+            sites={sites}
+            onSelectSite={goDetail}
+            onBack={goHome}
+          />
+        ),
+      };
     } else if (v.name === 'nearby') {
       const catEntry = v.category ? CATEGORIES.find(c => c.key === v.category) : null;
       const catLabel = catEntry?.label || (v.category ? titleCase(v.category) : null);
@@ -2114,11 +2222,12 @@ export default function App() {
           DetailView is excluded because the page already has Get Directions
           + Claim Visit as its primary actions; layering the bottom bar on
           top makes the page feel busy and competes with those CTAs. */}
-      {view.name !== 'nearby' && view.name !== 'detail' && view.name !== 'submit' && (
+      {view.name !== 'nearby' && view.name !== 'detail' && view.name !== 'submit' && view.name !== 'social' && (
         <HomeBottomBar
           onLeaders={goLeaders}
           onList={goList}
           onAbout={goAbout}
+          onSocial={goSocial}
         />
       )}
       <ToastHost />
@@ -2356,21 +2465,18 @@ function SkeletonRow({ height = 48, delay = 0 }: { height?: number; delay?: numb
 // List View (flat directory of all categories/states/locations, also
 // scaffolded), and About. Instagram and YouTube links moved to AboutView
 // where they already live, so users still have one tap to reach them.
-function HomeBottomBar({ onLeaders, onList, onAbout }: {
+function HomeBottomBar({ onLeaders, onList, onAbout, onSocial }: {
   onLeaders: () => void;
   onList: () => void;
   onAbout: () => void;
+  onSocial: () => void;
 }) {
-  // Two pill buttons on the home page bottom bar: "List View" (left)
-  // opens the full categorized list of every site, and "More" (right)
-  // opens a popup that contains Dread Leaders and About. Submit a Location
-  // stays unchanged above this bar.
-  //
-  // The List View used to live in the More popup and the left button used
-  // to be "Locations Near Me" (an all-categories map). Now that home cells
-  // route directly to category-filtered maps, the all-categories map was
-  // redundant and List View earned the prime real-estate spot — it's the
-  // "see everything" escape hatch.
+  // Three pill buttons on the home page bottom bar:
+  //   List View (left) — full categorized list of every site
+  //   Social (middle) — vertical scroll feed of visitor photo posts;
+  //                     the standout button, outlined acid green to
+  //                     signal "live" / active community content
+  //   More (right) — popup containing Dread Leaders and About
   //
   // The More popup is anchored above the More button (right-aligned). It
   // closes when:
@@ -2425,8 +2531,13 @@ function HomeBottomBar({ onLeaders, onList, onAbout }: {
           style={S.socialBtn}
           onClick={() => { playSubDrop(); onList(); }}
         >
-          <span style={S.socialIcon}>📜</span>
           <span style={S.socialLabel}>List View</span>
+        </button>
+        <button
+          style={S.socialBtnHighlight}
+          onClick={() => { playBackSound(); onSocial(); }}
+        >
+          <span style={S.socialLabelHighlight}>eXposure</span>
         </button>
         <button
           style={{ ...S.socialBtn, ...(moreOpen ? S.socialBtnActive : {}) }}
@@ -2446,6 +2557,256 @@ function HomeBottomBar({ onLeaders, onList, onAbout }: {
       </div>
     </>
   );
+}
+
+// ---------- Social (vertical photo feed) ----------
+// Vertical scroll feed of GPS-verified visitor photo posts. Instagram-
+// style card layout: photo on top, caption + handle + site link below,
+// like heart at the bottom-left.
+//
+// Posts come from GET /posts/feed (chronological, newest first, paginated
+// via nextBefore cursor). Each card carries a cached likeCount; the
+// authoritative like state for the current user is fetched on demand via
+// /posts/likes/:postId when the card mounts.
+//
+// Like UI uses optimistic update — tap heart, increment count locally and
+// toggle filled state, then call /posts/like/:postId in the background.
+// On server error we revert.
+function SocialView({ handle, deviceId, sites, onSelectSite, onBack }: {
+  handle: string | null;
+  deviceId: string | null;
+  sites: SinisterSite[];
+  onSelectSite: (site: SinisterSite) => void;
+  onBack: () => void;
+}) {
+  const [posts, setPosts] = useState<SocialPost[]>([]);
+  const [nextBefore, setNextBefore] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [fullscreenUrl, setFullscreenUrl] = useState<string | null>(null);
+
+  // Initial load
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      setError(null);
+      const page = await apiFetchFeed({ limit: 20, before: null });
+      if (cancelled) return;
+      setPosts(page.posts);
+      setNextBefore(page.nextBefore);
+      setLoading(false);
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  // Load more — called when the user scrolls near the bottom.
+  const loadMore = async () => {
+    if (loadingMore || !nextBefore) return;
+    setLoadingMore(true);
+    const page = await apiFetchFeed({ limit: 20, before: nextBefore });
+    setPosts((prev) => [...prev, ...page.posts]);
+    setNextBefore(page.nextBefore);
+    setLoadingMore(false);
+  };
+
+  // Scroll listener for infinite scroll. Trigger when user is within
+  // ~800px of the bottom of the page.
+  useEffect(() => {
+    const onScroll = () => {
+      if (!nextBefore || loadingMore) return;
+      const scrollPos = window.scrollY + window.innerHeight;
+      const docHeight = document.documentElement.scrollHeight;
+      if (docHeight - scrollPos < 800) {
+        loadMore();
+      }
+    };
+    window.addEventListener('scroll', onScroll, { passive: true });
+    return () => window.removeEventListener('scroll', onScroll);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nextBefore, loadingMore]);
+
+  // Site lookup for tap-to-DetailView. Sites are passed down from App so
+  // we don't refetch.
+  const siteById = useMemo(() => {
+    const m = new Map<string, SinisterSite>();
+    for (const s of sites) m.set(s.id, s);
+    return m;
+  }, [sites]);
+
+  return (
+    <div style={S.socialViewWrap}>
+      {/* Header with back button */}
+      <div style={S.socialHeader}>
+        <button onClick={() => { playBackSound(); onBack(); }} style={S.socialBackBtn}>
+          ‹ Back
+        </button>
+        <div style={S.socialHeaderTitle}>eXposure</div>
+        <div style={{ width: 60 }} /> {/* spacer to center title */}
+      </div>
+
+      {/* Body */}
+      {loading ? (
+        <div style={S.socialEmpty}>Loading the feed…</div>
+      ) : error ? (
+        <div style={S.socialEmpty}>⚠ {error}</div>
+      ) : posts.length === 0 ? (
+        <div style={S.socialEmpty}>
+          No posts yet.<br />
+          <span style={{ opacity: 0.7, fontSize: 13 }}>
+            Visit a site and tap "Add Photo" to be the first.
+          </span>
+        </div>
+      ) : (
+        <div style={S.socialFeed}>
+          {posts.map((p) => (
+            <SocialPostCard
+              key={p.id}
+              post={p}
+              currentHandle={handle}
+              deviceId={deviceId}
+              onPhotoTap={() => setFullscreenUrl(p.photoUrl)}
+              onSiteTap={() => {
+                const s = siteById.get(p.siteId);
+                if (s) onSelectSite(s);
+              }}
+            />
+          ))}
+          {loadingMore && <div style={S.socialEmpty}>Loading more…</div>}
+          {!nextBefore && posts.length > 0 && (
+            <div style={{ ...S.socialEmpty, paddingTop: 20, paddingBottom: 40 }}>
+              <span style={{ opacity: 0.5, fontSize: 12 }}>— end of feed —</span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Fullscreen photo viewer */}
+      {fullscreenUrl && (
+        <div
+          onClick={() => setFullscreenUrl(null)}
+          style={S.socialFullscreenOverlay}
+        >
+          <img src={fullscreenUrl} alt="" style={S.socialFullscreenImg} />
+          <div style={S.socialFullscreenHint}>tap to close</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Single post card inside the feed. Owns its own like state so toggling
+// is fast and doesn't trigger a parent re-render of the whole list.
+function SocialPostCard({ post, currentHandle, deviceId, onPhotoTap, onSiteTap }: {
+  post: SocialPost;
+  currentHandle: string | null;
+  deviceId: string | null;
+  onPhotoTap: () => void;
+  onSiteTap: () => void;
+}) {
+  const [liked, setLiked] = useState(false);
+  const [likeCount, setLikeCount] = useState(post.likeCount || 0);
+  const [likeBusy, setLikeBusy] = useState(false);
+
+  // Fetch authoritative like state on mount. Server is the source of
+  // truth — the post.likeCount cached on the feed is just a starting
+  // point that may be slightly stale.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const status = await apiLikeStatus({ postId: post.id, handle: currentHandle });
+      if (cancelled) return;
+      setLiked(status.liked);
+      setLikeCount(status.count);
+    })();
+    return () => { cancelled = true; };
+  }, [post.id, currentHandle]);
+
+  const onToggleLike = async () => {
+    if (!currentHandle || !deviceId) {
+      showToast('Claim a handle to like posts', 'error');
+      return;
+    }
+    if (likeBusy) return;
+    setLikeBusy(true);
+
+    // Optimistic update
+    const prevLiked = liked;
+    const prevCount = likeCount;
+    setLiked(!prevLiked);
+    setLikeCount(prevCount + (prevLiked ? -1 : 1));
+
+    const result = await apiToggleLike({ postId: post.id, handle: currentHandle, deviceId });
+    if (!result.ok) {
+      // Revert on failure
+      setLiked(prevLiked);
+      setLikeCount(prevCount);
+      showToast(result.reason || 'Like failed', 'error');
+    } else if (typeof result.count === 'number') {
+      // Trust the server's count
+      setLiked(!!result.liked);
+      setLikeCount(result.count);
+    }
+    setLikeBusy(false);
+  };
+
+  const timeAgo = formatTimeAgo(post.approvedAt || post.createdAt);
+
+  return (
+    <div style={S.postCard}>
+      {/* Header: handle + timestamp */}
+      <div style={S.postHeader}>
+        <span style={S.postHandle}>@{post.handle}</span>
+        <span style={S.postTime}>{timeAgo}</span>
+      </div>
+
+      {/* Photo */}
+      <button onClick={onPhotoTap} style={S.postPhotoBtn}>
+        <img src={post.photoUrl} alt="" style={S.postPhoto} />
+      </button>
+
+      {/* Actions row: heart + count */}
+      <div style={S.postActions}>
+        <button
+          onClick={onToggleLike}
+          style={{
+            ...S.postLikeBtn,
+            color: liked ? '#FF3B5C' : '#BBB',
+          }}
+        >
+          <span style={{ fontSize: 20, lineHeight: 1 }}>{liked ? '♥' : '♡'}</span>
+          <span style={{ fontSize: 14, fontWeight: 600 }}>{likeCount}</span>
+        </button>
+      </div>
+
+      {/* Caption */}
+      <div style={S.postCaption}>{post.caption}</div>
+
+      {/* Site link */}
+      <button onClick={onSiteTap} style={S.postSiteBtn}>
+        📍 {post.siteTitle || 'View site'}
+      </button>
+    </div>
+  );
+}
+
+// Compact relative-time formatter. "5m ago", "3h ago", "2d ago".
+function formatTimeAgo(iso: string): string {
+  if (!iso) return '';
+  const t = Date.parse(iso);
+  if (isNaN(t)) return '';
+  const secs = Math.max(0, (Date.now() - t) / 1000);
+  if (secs < 60) return 'just now';
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  const days = Math.floor(hrs / 24);
+  if (days < 30) return `${days}d ago`;
+  const months = Math.floor(days / 30);
+  if (months < 12) return `${months}mo ago`;
+  return `${Math.floor(months / 12)}y ago`;
 }
 
 // ---------- Leaders (Dread Leaders leaderboard) ----------
@@ -5116,6 +5477,34 @@ function DetailView({ site, currentLocation, handle, deviceId, alreadyVisited, o
             {claimError}
           </div>
         )}
+
+        {/* Add Photo (Social post) button.
+            Shown when:
+              - GPS fix available AND user is within 100m of the site
+              - User has a claimed handle (otherwise no identity to post under)
+            Hidden when:
+              - User is out of range (button just won't render)
+              - User has no handle (renders a disabled "Claim a handle to post" hint
+                instead, so they know what's missing)
+            This is the entry point to the in-app camera + caption composer that
+            creates a new feed post via POST /posts. */}
+        {currentLocation && inRange && (
+          handle && deviceId ? (
+            <AddPhotoButton
+              site={site}
+              handle={handle}
+              deviceId={deviceId}
+              currentLocation={currentLocation}
+              onPosted={() => {
+                showToast('Post submitted for review', 'success');
+              }}
+            />
+          ) : (
+            <div style={S.addPhotoBtnDisabled}>
+              Claim a handle to share photos
+            </div>
+          )
+        )}
         <button
           onClick={handleDirections}
           style={{
@@ -5131,6 +5520,169 @@ function DetailView({ site, currentLocation, handle, deviceId, alreadyVisited, o
         <div style={S.imageCredit}>Photo: {site.imageCredit}</div>
       </div>
     </div>
+  );
+}
+
+// ---------- Add Photo button + composer (Social post creation) ----------
+// Standalone component used inside DetailView when the user is in range.
+// Manages its own composer modal state — the file input, the photo preview,
+// the caption, and the "also share externally" toggle.
+//
+// Flow:
+//   1) User taps "Add Photo" → opens hidden <input type="file" capture="environment">
+//   2) Native camera opens (capture="environment" forces back camera, no gallery)
+//   3) On capture, composer modal opens with preview + caption + share toggle
+//   4) User taps "Post" → POST /posts (multipart, server verifies GPS + queues)
+//   5) On success, if "also share" was toggled, open native share sheet
+//   6) Show toast confirming submission
+//
+// This mirrors the SubmitView photo flow (same <input> + capture pattern) so
+// users get the same camera UX they already know from site submission.
+function AddPhotoButton({ site, handle, deviceId, currentLocation, onPosted }: {
+  site: SinisterSite;
+  handle: string;
+  deviceId: string;
+  currentLocation: { lat: number; lng: number };
+  onPosted: () => void;
+}) {
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [photoFile, setPhotoFile] = useState<File | null>(null);
+  const [photoPreview, setPhotoPreview] = useState<string | null>(null);
+  const [caption, setCaption] = useState('');
+  const [alsoShare, setAlsoShare] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+
+  const captionTrim = caption.trim();
+  const canSubmit = !!photoFile && captionTrim.length >= 1 && captionTrim.length <= 280 && !submitting;
+
+  const onPhotoChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    setPhotoFile(f);
+    const url = URL.createObjectURL(f);
+    setPhotoPreview(url);
+  };
+
+  const closeComposer = () => {
+    if (submitting) return;
+    if (photoPreview) URL.revokeObjectURL(photoPreview);
+    setPhotoFile(null);
+    setPhotoPreview(null);
+    setCaption('');
+    setAlsoShare(false);
+    if (fileRef.current) fileRef.current.value = '';
+  };
+
+  const onSubmit = async () => {
+    if (!canSubmit || !photoFile) return;
+    setSubmitting(true);
+    const result = await apiCreatePost({
+      photo: photoFile,
+      handle,
+      deviceId,
+      siteId: site.id,
+      caption: captionTrim,
+      captureLat: currentLocation.lat,
+      captureLng: currentLocation.lng,
+    });
+    setSubmitting(false);
+
+    if (!result.ok) {
+      showToast(result.reason || 'Post failed', 'error');
+      return;
+    }
+
+    // Optional external share. We pass the photo as a File so iOS picks
+    // image-friendly destinations (Instagram, Messages photo share, etc).
+    if (alsoShare && typeof navigator !== 'undefined' && (navigator as any).share) {
+      try {
+        const shareData: any = {
+          title: 'Dread Directory',
+          text: `${captionTrim}\n\n${site.title} — Dread Directory`,
+        };
+        // navigator.canShare with files only works in some browsers; gracefully
+        // fall back to text-only share if not supported.
+        if ((navigator as any).canShare && (navigator as any).canShare({ files: [photoFile] })) {
+          shareData.files = [photoFile];
+        }
+        await (navigator as any).share(shareData);
+      } catch {
+        // User cancelled share sheet — not an error, the post is already submitted.
+      }
+    }
+
+    onPosted();
+    closeComposer();
+  };
+
+  return (
+    <>
+      {/* Hidden file input. capture="environment" forces back camera on iOS
+          and avoids the photo picker entirely. */}
+      <input
+        ref={fileRef}
+        type="file"
+        accept="image/*"
+        capture="environment"
+        onChange={onPhotoChange}
+        style={{ display: 'none' }}
+      />
+
+      <button
+        type="button"
+        onClick={() => fileRef.current?.click()}
+        style={S.addPhotoBtn}
+      >
+        📷 Post to eXposure
+      </button>
+
+      {/* Composer modal — appears after the user captures a photo. */}
+      {photoPreview && (
+        <div style={S.postComposerOverlay} onClick={(e) => { if (e.target === e.currentTarget) closeComposer(); }}>
+          <div style={S.postComposerCard}>
+            <div style={S.postComposerTitle}>New Post</div>
+            <img src={photoPreview} alt="preview" style={S.postComposerPreview} />
+            <textarea
+              value={caption}
+              onChange={(e) => setCaption(e.target.value)}
+              placeholder="One sentence about being here..."
+              maxLength={280}
+              style={S.postCaptionInput}
+            />
+            <div style={{ color: '#666', fontSize: 11, textAlign: 'right', marginTop: -8 }}>
+              {captionTrim.length}/280
+            </div>
+            <label style={S.postShareToggleRow}>
+              <input
+                type="checkbox"
+                checked={alsoShare}
+                onChange={(e) => setAlsoShare(e.target.checked)}
+                style={{ accentColor: '#7FFF00', width: 16, height: 16 }}
+              />
+              Also share to Messages / Instagram / X
+            </label>
+            <div style={S.postComposerBtnRow}>
+              <button
+                type="button"
+                onClick={closeComposer}
+                disabled={submitting}
+                style={S.postComposerCancel}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={onSubmit}
+                disabled={!canSubmit}
+                style={canSubmit ? S.postComposerSubmit : S.postComposerSubmitDisabled}
+              >
+                {submitting ? 'Posting…' : 'Post'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
   );
 }
 
@@ -6339,8 +6891,328 @@ const S: Record<string, React.CSSProperties> = {
     boxShadow: `0 0 16px ${WHITE}88, 0 0 28px ${WHITE}33`,
     textShadow: `0 0 8px ${WHITE}aa`,
   },
+  // Acid-green variant used by the middle "Social" button on the home
+  // bottom bar. Same shape as socialBtn but with a chartreuse outline +
+  // green glow so the live community feed entry point pops against the
+  // monochrome List View / More buttons flanking it.
+  socialBtnHighlight: {
+    flex: 1,
+    maxWidth: 200,
+    backgroundColor: 'rgba(0,0,0,0.45)',
+    border: `1.5px solid #7FFF00`,
+    color: '#7FFF00',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    fontSize: 14,
+    fontWeight: 700,
+    letterSpacing: '0.18em',
+    textTransform: 'uppercase' as const,
+    padding: '10px 12px',
+    borderRadius: 14,
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    boxShadow: `0 0 14px #7FFF0066, inset 0 0 8px #7FFF0022`,
+    textShadow: `0 0 8px #7FFF00aa`,
+    backdropFilter: 'blur(2px)',
+  },
+  socialLabelHighlight: { fontSize: 14, color: '#7FFF00' },
   socialIcon: { fontSize: 16, lineHeight: 1 },
   socialLabel: { fontSize: 14 },
+
+  // ---- Social feed view ----
+  socialViewWrap: {
+    minHeight: '100vh',
+    paddingBottom: 60,
+    position: 'relative',
+    zIndex: 2,
+  },
+  socialHeader: {
+    position: 'sticky',
+    top: 0,
+    zIndex: 5,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: '14px 16px',
+    backgroundColor: 'rgba(10,10,10,0.85)',
+    backdropFilter: 'blur(8px)',
+    borderBottom: `1px solid #7FFF0044`,
+  },
+  socialBackBtn: {
+    backgroundColor: 'transparent',
+    border: 'none',
+    color: '#7FFF00',
+    fontSize: 16,
+    fontWeight: 700,
+    letterSpacing: '0.06em',
+    cursor: 'pointer',
+    padding: 4,
+    minWidth: 60,
+    textAlign: 'left' as const,
+  },
+  socialHeaderTitle: {
+    color: '#7FFF00',
+    fontSize: 18,
+    fontWeight: 800,
+    letterSpacing: '0.22em',
+    textTransform: 'uppercase' as const,
+    textShadow: `0 0 10px #7FFF00aa`,
+  },
+  socialEmpty: {
+    textAlign: 'center' as const,
+    padding: '60px 24px',
+    color: '#999',
+    fontSize: 15,
+    lineHeight: 1.6,
+  },
+  socialFeed: {
+    display: 'flex',
+    flexDirection: 'column' as const,
+    gap: 18,
+    padding: '14px 12px',
+    maxWidth: 600,
+    margin: '0 auto',
+  },
+  postCard: {
+    backgroundColor: 'rgba(20,20,20,0.85)',
+    border: `1px solid #2a2a2a`,
+    borderRadius: 14,
+    overflow: 'hidden',
+    boxShadow: `0 4px 18px rgba(0,0,0,0.5)`,
+  },
+  postHeader: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    padding: '10px 14px',
+  },
+  postHandle: {
+    color: '#F0EBE0',
+    fontSize: 14,
+    fontWeight: 700,
+    letterSpacing: '0.04em',
+  },
+  postTime: {
+    color: '#888',
+    fontSize: 12,
+  },
+  postPhotoBtn: {
+    display: 'block',
+    width: '100%',
+    padding: 0,
+    border: 'none',
+    backgroundColor: 'transparent',
+    cursor: 'pointer',
+  },
+  postPhoto: {
+    width: '100%',
+    display: 'block',
+    aspectRatio: '1 / 1',
+    objectFit: 'cover' as const,
+    backgroundColor: '#111',
+  },
+  postActions: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 14,
+    padding: '8px 14px 4px',
+  },
+  postLikeBtn: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: 'transparent',
+    border: 'none',
+    cursor: 'pointer',
+    padding: 4,
+  },
+  postCaption: {
+    padding: '4px 14px 10px',
+    color: '#E8E5DC',
+    fontSize: 14,
+    lineHeight: 1.45,
+  },
+  postSiteBtn: {
+    display: 'block',
+    width: '100%',
+    textAlign: 'left' as const,
+    padding: '10px 14px',
+    backgroundColor: 'rgba(127,255,0,0.06)',
+    borderTop: `1px solid #2a2a2a`,
+    border: 'none',
+    borderBottomLeftRadius: 14,
+    borderBottomRightRadius: 14,
+    color: '#7FFF00',
+    fontSize: 13,
+    fontWeight: 600,
+    letterSpacing: '0.04em',
+    cursor: 'pointer',
+  },
+  socialFullscreenOverlay: {
+    position: 'fixed',
+    inset: 0,
+    backgroundColor: 'rgba(0,0,0,0.95)',
+    zIndex: 50,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    cursor: 'pointer',
+    padding: 16,
+  },
+  socialFullscreenImg: {
+    maxWidth: '100%',
+    maxHeight: '90vh',
+    objectFit: 'contain' as const,
+  },
+  socialFullscreenHint: {
+    position: 'absolute',
+    bottom: 20,
+    left: 0, right: 0,
+    textAlign: 'center' as const,
+    color: '#888',
+    fontSize: 12,
+    letterSpacing: '0.2em',
+    textTransform: 'uppercase' as const,
+  },
+
+  // ---- DetailView "Add Photo" flow ----
+  addPhotoBtn: {
+    width: '100%',
+    padding: '14px 16px',
+    marginTop: 12,
+    backgroundColor: 'rgba(127,255,0,0.08)',
+    border: `2px solid #7FFF00`,
+    color: '#7FFF00',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    fontSize: 14,
+    fontWeight: 700,
+    letterSpacing: '0.18em',
+    textTransform: 'uppercase' as const,
+    borderRadius: 12,
+    cursor: 'pointer',
+    boxShadow: `0 0 14px #7FFF0055, inset 0 0 10px #7FFF0022`,
+    textShadow: `0 0 8px #7FFF00aa`,
+  },
+  addPhotoBtnDisabled: {
+    width: '100%',
+    padding: '14px 16px',
+    marginTop: 12,
+    backgroundColor: 'rgba(0,0,0,0.3)',
+    border: `1.5px solid #333`,
+    color: '#666',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    fontSize: 13,
+    fontWeight: 700,
+    letterSpacing: '0.18em',
+    textTransform: 'uppercase' as const,
+    borderRadius: 12,
+    cursor: 'not-allowed',
+  },
+  postComposerOverlay: {
+    position: 'fixed',
+    inset: 0,
+    backgroundColor: 'rgba(0,0,0,0.92)',
+    zIndex: 40,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 16,
+  },
+  postComposerCard: {
+    width: '100%',
+    maxWidth: 460,
+    backgroundColor: '#141414',
+    border: `1.5px solid #7FFF00`,
+    borderRadius: 16,
+    padding: 18,
+    boxShadow: `0 0 30px #7FFF0033`,
+    display: 'flex',
+    flexDirection: 'column' as const,
+    gap: 14,
+  },
+  postComposerTitle: {
+    color: '#7FFF00',
+    fontSize: 14,
+    fontWeight: 800,
+    letterSpacing: '0.22em',
+    textTransform: 'uppercase' as const,
+    textAlign: 'center' as const,
+  },
+  postComposerPreview: {
+    width: '100%',
+    aspectRatio: '1 / 1',
+    objectFit: 'cover' as const,
+    backgroundColor: '#000',
+    borderRadius: 10,
+  },
+  postCaptionInput: {
+    width: '100%',
+    backgroundColor: '#0a0a0a',
+    border: `1px solid #333`,
+    borderRadius: 8,
+    color: '#F0EBE0',
+    fontSize: 14,
+    padding: '10px 12px',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    resize: 'none' as const,
+    minHeight: 60,
+    boxSizing: 'border-box' as const,
+  },
+  postShareToggleRow: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 10,
+    padding: '8px 4px',
+    color: '#BBB',
+    fontSize: 13,
+    cursor: 'pointer',
+  },
+  postComposerBtnRow: {
+    display: 'flex',
+    gap: 10,
+  },
+  postComposerCancel: {
+    flex: 1,
+    padding: '12px',
+    backgroundColor: 'transparent',
+    border: `1.5px solid #555`,
+    color: '#999',
+    fontSize: 13,
+    fontWeight: 700,
+    letterSpacing: '0.18em',
+    textTransform: 'uppercase' as const,
+    borderRadius: 10,
+    cursor: 'pointer',
+  },
+  postComposerSubmit: {
+    flex: 1.4,
+    padding: '12px',
+    backgroundColor: 'rgba(127,255,0,0.1)',
+    border: `1.5px solid #7FFF00`,
+    color: '#7FFF00',
+    fontSize: 13,
+    fontWeight: 700,
+    letterSpacing: '0.18em',
+    textTransform: 'uppercase' as const,
+    borderRadius: 10,
+    cursor: 'pointer',
+    boxShadow: `0 0 12px #7FFF0044`,
+  },
+  postComposerSubmitDisabled: {
+    flex: 1.4,
+    padding: '12px',
+    backgroundColor: 'rgba(0,0,0,0.3)',
+    border: `1.5px solid #333`,
+    color: '#555',
+    fontSize: 13,
+    fontWeight: 700,
+    letterSpacing: '0.18em',
+    textTransform: 'uppercase' as const,
+    borderRadius: 10,
+    cursor: 'not-allowed',
+  },
 
   // ---- More menu popup ----
   // Anchored above the More button (right-aligned). Sits at zIndex 11 so it
