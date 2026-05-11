@@ -3,6 +3,7 @@ declare module '*.ttf' { const url: string; export default url; }
 declare module '*.png' { const url: string; export default url; }
 
 import { forwardRef, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import {
   startGeofencing,
   stopGeofencing,
@@ -272,24 +273,34 @@ async function apiLikeStatus(args: { postId: string; handle: string | null }): P
 // Create a post via multipart/form-data. Photo must be a Blob/File from
 // the camera capture. Server verifies GPS within 100m, queues for admin
 // approval, and records the visit (idempotent — same site = no dup visit).
+// Create a post. Two modes:
+//   - Site-tagged (default): pass siteId + captureLat + captureLng.
+//     Server verifies GPS within 100m, post enters pending review.
+//   - Freeform: pass freeform=true and omit siteId / GPS. Server
+//     auto-approves and the post hits the feed immediately.
 async function apiCreatePost(args: {
   photo: Blob;
   handle: string;
   deviceId: string;
-  siteId: string;
   caption: string;
-  captureLat: number;
-  captureLng: number;
+  siteId?: string;
+  captureLat?: number;
+  captureLng?: number;
+  freeform?: boolean;
 }): Promise<{ ok: boolean; postId?: string; reason?: string }> {
   try {
     const fd = new FormData();
     fd.append('photo', args.photo, 'post.jpg');
     fd.append('handle', args.handle);
     fd.append('deviceId', args.deviceId);
-    fd.append('siteId', args.siteId);
     fd.append('caption', args.caption);
-    fd.append('captureLat', String(args.captureLat));
-    fd.append('captureLng', String(args.captureLng));
+    if (args.freeform) {
+      fd.append('freeform', 'true');
+    } else {
+      if (args.siteId) fd.append('siteId', args.siteId);
+      if (args.captureLat !== undefined) fd.append('captureLat', String(args.captureLat));
+      if (args.captureLng !== undefined) fd.append('captureLng', String(args.captureLng));
+    }
     const res = await fetch(`${API_BASE}/posts`, { method: 'POST', body: fd });
     const data = await res.json();
     if (!res.ok) return { ok: false, reason: data?.error || `HTTP ${res.status}` };
@@ -2860,14 +2871,10 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
         <ExposurePostSheet
           handle={handle}
           deviceId={deviceId}
-          sites={sites}
-          currentLocation={currentLocation}
           onClose={() => setPostSheetOpen(false)}
           onPosted={() => {
             setPostSheetOpen(false);
-            showToast('Post submitted for review', 'success');
-            // Trigger a feed refresh so the (eventually approved) post
-            // shows up next time admin approves it.
+            showToast('Posted to eXposure', 'success');
             void refreshFeed();
           }}
         />
@@ -2898,7 +2905,7 @@ function ExposureBottomBar({ active, onSelect }: {
       </button>
     );
   };
-  return (
+  return createPortal(
     <div style={S.exposureBar}>
       <Item tab="feed" label="Home">
         {/* Home icon (house) */}
@@ -2929,7 +2936,8 @@ function ExposureBottomBar({ active, onSelect }: {
           <path d="M4 20c0-4 4-6 8-6s8 2 8 6" />
         </svg>
       </Item>
-    </div>
+    </div>,
+    document.body
   );
 }
 
@@ -2937,89 +2945,139 @@ function ExposureBottomBar({ active, onSelect }: {
 // caption / handle. Below the input, a horizontal chip strip lets users
 // filter by category. AND'd — both filters apply. Empty results show a
 // friendly empty state.
-// Inline composer sheet opened by the ➕ Post tab on the eXposure bottom
-// bar. Finds the nearest site within 100m of the user's GPS, and reuses
-// AddPhotoButton's camera + caption + upload flow.
+// Plain composer sheet opened by the ➕ Post tab on the eXposure bottom
+// bar. No GPS, no site selection, no admin queue. Pick photo, write
+// caption, post. Server auto-approves; post hits the feed immediately.
 //
-// States:
-//   - No GPS fix yet  -> "Locating you…"
-//   - No handle       -> "Claim a handle to post"
-//   - No site in range -> "You need to be within 100m of a haunted site to post"
-//   - Site in range    -> renders AddPhotoButton anchored to that site
-function ExposurePostSheet({ handle, deviceId, sites, currentLocation, onClose, onPosted }: {
+// Differs from DetailView's AddPhotoButton flow — that one is for
+// "I'm at this haunted location right now" posts, which stay GPS-
+// verified and admin-moderated. This one is the casual Instagram-style
+// share-anything path.
+function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
   handle: string | null;
   deviceId: string | null;
-  sites: SinisterSite[];
-  currentLocation: { lat: number; lng: number } | null;
   onClose: () => void;
   onPosted: () => void;
 }) {
-  // Find the nearest site within 100m of the user. If none, the user
-  // has to physically move closer to a site before posting — this
-  // preserves the GPS-verified credential that defines the app.
-  const POST_RADIUS_M = 100;
-  const nearestInRange = useMemo(() => {
-    if (!currentLocation) return null;
-    let best: { site: SinisterSite; d: number } | null = null;
-    for (const s of sites) {
-      if (!s.coords) continue;
-      const d = distanceMeters(currentLocation.lat, currentLocation.lng, s.coords.lat, s.coords.lng);
-      if (d > POST_RADIUS_M) continue;
-      if (!best || d < best.d) best = { site: s, d };
-    }
-    return best;
-  }, [currentLocation, sites]);
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [photoFile, setPhotoFile] = useState<File | null>(null);
+  const [photoPreview, setPhotoPreview] = useState<string | null>(null);
+  const [caption, setCaption] = useState('');
+  const [submitting, setSubmitting] = useState(false);
 
-  return (
-    <div style={S.postComposerOverlay} onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+  const captionTrim = caption.trim();
+  // Match the same caption bounds the server enforces. The server's
+  // CAPTION_MIN is 1; cap at 280 to match the validation in posts.js.
+  const canSubmit = !!photoFile && captionTrim.length >= 1 && captionTrim.length <= 280 && !submitting && !!handle && !!deviceId;
+
+  const onPhotoChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    setPhotoFile(f);
+    setPhotoPreview(URL.createObjectURL(f));
+  };
+
+  const onSubmit = async () => {
+    if (!canSubmit || !photoFile || !handle || !deviceId) return;
+    setSubmitting(true);
+    const result = await apiCreatePost({
+      photo: photoFile,
+      handle,
+      deviceId,
+      caption: captionTrim,
+      freeform: true,
+    });
+    setSubmitting(false);
+    if (result.ok) {
+      onPosted();
+    } else {
+      showToast(`Post failed: ${result.reason || 'unknown error'}`, 'error');
+    }
+  };
+
+  return createPortal(
+    <div style={S.postComposerOverlay} onClick={(e) => { if (e.target === e.currentTarget && !submitting) onClose(); }}>
       <div style={S.postComposerCard}>
         <div style={S.postComposerTitle}>Post to eXposure</div>
-        {!currentLocation ? (
-          <div style={{ padding: '20px 8px', textAlign: 'center', color: '#BBB', fontSize: 14 }}>
-            Locating you…<br />
-            <span style={{ fontSize: 12, opacity: 0.6 }}>Make sure location is enabled.</span>
-          </div>
-        ) : !handle || !deviceId ? (
+
+        {!handle || !deviceId ? (
           <div style={{ padding: '20px 8px', textAlign: 'center', color: '#BBB', fontSize: 14 }}>
             Claim a handle to post.<br />
             <span style={{ fontSize: 12, opacity: 0.6 }}>Open Submit a Location to claim one.</span>
           </div>
-        ) : !nearestInRange ? (
-          <div style={{ padding: '20px 8px', textAlign: 'center', color: '#BBB', fontSize: 14 }}>
-            You need to be within 100m of a haunted site to post.<br />
-            <span style={{ fontSize: 12, opacity: 0.6, marginTop: 8, display: 'block' }}>
-              Visit a site, then tap ➕ again.
-            </span>
-          </div>
         ) : (
-          <div style={{ padding: '8px 0' }}>
-            <div style={{ fontSize: 13, color: '#BF40FF', textAlign: 'center', marginBottom: 12 }}>
-              📍 {nearestInRange.site.title}
-              <div style={{ fontSize: 11, color: '#888', marginTop: 2 }}>
-                {Math.round(nearestInRange.d)}m away — verified
-              </div>
-            </div>
-            <AddPhotoButton
-              site={nearestInRange.site}
-              handle={handle}
-              deviceId={deviceId}
-              currentLocation={currentLocation}
-              onPosted={onPosted}
+          <>
+            {/* Hidden file input — triggered by the picker button below.
+                accept="image/*" lets the user pick from gallery or take
+                a new photo (Capacitor opens iOS camera/library sheet). */}
+            <input
+              ref={fileRef}
+              type="file"
+              accept="image/*"
+              style={{ display: 'none' }}
+              onChange={onPhotoChange}
             />
-          </div>
+
+            {photoPreview ? (
+              <div style={{ position: 'relative', marginBottom: 12 }}>
+                <img src={photoPreview} alt="" style={{ width: '100%', borderRadius: 10, display: 'block' }} />
+                <button
+                  type="button"
+                  onClick={() => { setPhotoFile(null); setPhotoPreview(null); }}
+                  style={S.postComposerChangeBtn}
+                  disabled={submitting}
+                >
+                  Change photo
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={() => fileRef.current?.click()}
+                style={S.postComposerPicker}
+              >
+                <span style={{ fontSize: 28 }}>📷</span>
+                <span style={{ marginTop: 6, fontSize: 13 }}>Tap to add a photo</span>
+              </button>
+            )}
+
+            <textarea
+              value={caption}
+              onChange={(e) => setCaption(e.target.value)}
+              placeholder="Write a caption…"
+              maxLength={280}
+              rows={3}
+              style={S.postComposerCaption}
+              disabled={submitting}
+            />
+            <div style={{ fontSize: 11, color: '#888', textAlign: 'right' as const, marginTop: -8, marginBottom: 10 }}>
+              {captionTrim.length} / 280
+            </div>
+
+            <button
+              type="button"
+              onClick={onSubmit}
+              disabled={!canSubmit}
+              style={{ ...S.postComposerSubmit, opacity: canSubmit ? 1 : 0.4 }}
+            >
+              {submitting ? 'Posting…' : 'Post'}
+            </button>
+          </>
         )}
+
         <button
           type="button"
           onClick={onClose}
+          disabled={submitting}
           style={{ ...S.postComposerCancel, marginTop: 14 }}
         >
           Close
         </button>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }
-
 
 // Search sub-screen inside eXposure. Text input filters loaded posts by
 // caption / handle. The sticky search bar lives just above the black
@@ -3090,35 +3148,39 @@ function ExposureSearchView({ allPosts, currentHandle, deviceId, sites, onSelect
       )}
 
       {/* Sticky search bar — fixed just above the black bottom bar.
-          Category chips on top, text input below. Always visible. */}
-      <div style={S.searchStickyBar}>
-        <div style={S.filterChipBar}>
-          <button
-            onClick={() => { playSubDrop(); setCategory(null); }}
-            style={{ ...S.filterChip, ...(category === null ? S.filterChipActive : {}) }}
-          >
-            All
-          </button>
-          {CATEGORIES.map((cat) => (
+          Rendered via portal to document.body so the drag wrapper's
+          transform doesn't break position:fixed. */}
+      {createPortal(
+        <div style={S.searchStickyBar}>
+          <div style={S.filterChipBar}>
             <button
-              key={cat.key}
-              onClick={() => { playSubDrop(); setCategory(cat.key); }}
-              style={{ ...S.filterChip, ...(category === cat.key ? S.filterChipActive : {}) }}
+              onClick={() => { playSubDrop(); setCategory(null); }}
+              style={{ ...S.filterChip, ...(category === null ? S.filterChipActive : {}) }}
             >
-              {cat.label}
+              All
             </button>
-          ))}
-        </div>
-        <div style={{ padding: '8px 12px' }}>
-          <input
-            type="text"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search posts, handles, sites…"
-            style={S.searchInput}
-          />
-        </div>
-      </div>
+            {CATEGORIES.map((cat) => (
+              <button
+                key={cat.key}
+                onClick={() => { playSubDrop(); setCategory(cat.key); }}
+                style={{ ...S.filterChip, ...(category === cat.key ? S.filterChipActive : {}) }}
+              >
+                {cat.label}
+              </button>
+            ))}
+          </div>
+          <div style={{ padding: '8px 12px' }}>
+            <input
+              type="text"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Search posts, handles, sites…"
+              style={S.searchInput}
+            />
+          </div>
+        </div>,
+        document.body
+      )}
     </div>
   );
 }
@@ -7874,8 +7936,8 @@ const S: Record<string, React.CSSProperties> = {
     cursor: 'pointer',
   },
   postComposerSubmit: {
-    flex: 1.4,
-    padding: '12px',
+    width: '100%',
+    padding: '14px',
     backgroundColor: 'rgba(191,64,255,0.1)',
     border: `1.5px solid #BF40FF`,
     color: '#BF40FF',
@@ -7886,6 +7948,47 @@ const S: Record<string, React.CSSProperties> = {
     borderRadius: 10,
     cursor: 'pointer',
     boxShadow: `0 0 12px #BF40FF44`,
+  },
+  // Photo picker placeholder shown before a photo is selected.
+  postComposerPicker: {
+    width: '100%',
+    minHeight: 160,
+    backgroundColor: '#1a1a1a',
+    border: `1.5px dashed #444`,
+    borderRadius: 10,
+    color: '#BBB',
+    display: 'flex',
+    flexDirection: 'column' as const,
+    alignItems: 'center',
+    justifyContent: 'center',
+    cursor: 'pointer',
+    marginBottom: 12,
+  },
+  postComposerChangeBtn: {
+    position: 'absolute' as const,
+    right: 8, top: 8,
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    color: '#FFF',
+    border: '1px solid #555',
+    borderRadius: 6,
+    padding: '4px 10px',
+    fontSize: 11,
+    fontWeight: 600,
+    cursor: 'pointer',
+  },
+  postComposerCaption: {
+    width: '100%',
+    backgroundColor: '#1a1a1a',
+    border: '1px solid #333',
+    borderRadius: 10,
+    color: '#F0EBE0',
+    fontSize: 14,
+    padding: '10px 12px',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    boxSizing: 'border-box' as const,
+    outline: 'none',
+    resize: 'vertical' as const,
+    marginBottom: 4,
   },
   postComposerSubmitDisabled: {
     flex: 1.4,
