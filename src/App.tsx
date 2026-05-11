@@ -12,6 +12,7 @@ import {
   setSites,
 } from './geofencing';
 import LivingHellFontUrl from './assets/Living Hell.ttf';
+import PunkFontUrl from './assets/punk.ttf';
 import SlideMountUrl from './assets/slide-mount.png';
 // Custom bottom-bar icons (rounded-square iOS-style app icons) for the
 // home page bar — replace the prior text labels + "More" dropdown.
@@ -26,6 +27,17 @@ if (typeof document !== 'undefined' && !document.getElementById('__livinghell-fo
   const style = document.createElement('style');
   style.id = '__livinghell-fontface';
   style.textContent = `@font-face { font-family: 'LivingHell'; src: url('${LivingHellFontUrl}') format('truetype'); font-display: block; }`;
+  document.head.appendChild(style);
+}
+
+// Register the punk ransom-note font ("Hit me, punk! 01"). Used as the
+// brand title font in the eXposure header. The internal font family name
+// inside the .ttf is "Hit me, punk! 01" — we keep that exact string here
+// and reference it in fontFamily declarations below.
+if (typeof document !== 'undefined' && !document.getElementById('__punk-fontface')) {
+  const style = document.createElement('style');
+  style.id = '__punk-fontface';
+  style.textContent = `@font-face { font-family: 'Hit me, punk! 01'; src: url('${PunkFontUrl}') format('truetype'); font-display: block; }`;
   document.head.appendChild(style);
 }
 import { SINISTER_SITES as FALLBACK_SITES, SinisterSite } from './locations';
@@ -2135,6 +2147,15 @@ export default function App() {
             sites={sites}
             onSelectSite={goDetail}
             onSelectHandle={(h) => setView({ name: 'userProfile', handle: h })}
+            onSelectExposureTab={(tab) => {
+              // Tapping a bottom-bar tab from inside post detail jumps
+              // back to eXposure on that sub-tab. Updating the module-
+              // level memory before navigating means SocialView's mount
+              // picks up the right starting tab — no flicker through
+              // 'feed' first.
+              _exposureSubTabMemory = tab;
+              setView({ name: 'social' });
+            }}
             onBack={goHome}
           />
         ),
@@ -3739,7 +3760,7 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
 // Preloaded posts arrive from the caller (UserProfileView already has
 // them). Falls back to fetching when no preload is available (e.g. deep
 // link in the future).
-function PostDetailView({ postId, postList, preloadedPosts, currentHandle, deviceId, sites, onSelectSite, onSelectHandle, onBack }: {
+function PostDetailView({ postId, postList, preloadedPosts, currentHandle, deviceId, sites, onSelectSite, onSelectHandle, onSelectExposureTab, onBack }: {
   postId: string;
   postList?: string[];
   preloadedPosts?: SocialPost[];
@@ -3748,6 +3769,7 @@ function PostDetailView({ postId, postList, preloadedPosts, currentHandle, devic
   sites: SinisterSite[];
   onSelectSite: (site: SinisterSite) => void;
   onSelectHandle: (handle: string) => void;
+  onSelectExposureTab: (tab: 'feed' | 'search' | 'post' | 'profile') => void;
   onBack: () => void;
 }) {
   // If the caller preloaded the post objects, use them directly — no
@@ -3848,6 +3870,27 @@ function PostDetailView({ postId, postList, preloadedPosts, currentHandle, devic
           ))}
         </div>
       )}
+
+      {/* Reuse the eXposure bottom bar so navigation feels continuous
+          while viewing a post. Tapping any tab returns to the eXposure
+          tab; the parent dispatcher sets the sub-tab memory first so we
+          land on the right sub-screen rather than flickering through
+          'feed'. The Post tab dispatches as 'feed' since there's no
+          composer accessible from outside SocialView — it would need
+          GPS + nearest-site logic to open. */}
+      <ExposureBottomBar
+        active="profile"
+        onSelect={(tab) => {
+          if (tab === 'post') {
+            // Post-composer isn't reachable from this view (it requires
+            // SocialView's GPS + nearest-site logic). Route to feed
+            // instead — user can hit Post again from there.
+            onSelectExposureTab('feed');
+            return;
+          }
+          onSelectExposureTab(tab);
+        }}
+      />
     </div>
   );
 }
@@ -8103,12 +8146,19 @@ const S: Record<string, React.CSSProperties> = {
     boxShadow: '0 2px 12px rgba(0,0,0,0.6)',
   },
   exposureBrandTitle: {
-    color: '#BF40FF',
-    fontSize: 28,
-    fontFamily: '"Jolly Lodger", system-ui, serif',
+    color: '#FFFFFF',
+    // Punk font reads smaller per pt than Jolly Lodger because its
+    // letterforms are tighter and more compact — bump font-size up so
+    // it has the same visual weight in the header. Letter-spacing is
+    // also looser to give the ransom-note look room to breathe.
+    fontSize: 36,
+    fontFamily: '"Hit me, punk! 01", "Jolly Lodger", system-ui, serif',
     fontWeight: 400,
-    letterSpacing: '0.04em',
-    textShadow: `0 0 12px #BF40FFaa`,
+    letterSpacing: '0.06em',
+    // White text with the existing purple glow keeps eXposure visually
+    // tied to the rest of the app's purple accents without bleeding the
+    // ransom-note letterforms into the dark header.
+    textShadow: `0 0 14px #BF40FFcc, 0 0 4px #FFFFFF88`,
     lineHeight: 1,
   },
   exposureBrandTagline: {
