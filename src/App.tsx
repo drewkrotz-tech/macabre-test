@@ -1424,7 +1424,8 @@ type View =
   | { name: 'badges'; handle: string }
   | { name: 'nearby'; category?: CategoryKey }
   | { name: 'list' }
-  | { name: 'social' };
+  | { name: 'social' }
+  | { name: 'userProfile'; handle: string };
 
 export default function App() {
   const [view, _setViewRaw] = useState<View>({ name: 'home' });
@@ -2022,6 +2023,22 @@ export default function App() {
             sites={sites}
             onSelectSite={goDetail}
             onBack={goHome}
+            onSelectHandle={(h) => setView({ name: 'userProfile', handle: h })}
+          />
+        ),
+      };
+    } else if (v.name === 'userProfile') {
+      return {
+        key: `userProfile:${v.handle}`,
+        element: (
+          <UserProfileView
+            profileHandle={v.handle}
+            currentHandle={handle}
+            deviceId={deviceId}
+            sites={sites}
+            onSelectSite={goDetail}
+            onSelectBadges={(h) => setView({ name: 'badges', handle: h })}
+            onBack={goHome}
           />
         ),
       };
@@ -2572,18 +2589,55 @@ function HomeBottomBar({ onLeaders, onList, onAbout, onSocial }: {
 // Like UI uses optimistic update — tap heart, increment count locally and
 // toggle filled state, then call /posts/like/:postId in the background.
 // On server error we revert.
-function SocialView({ handle, deviceId, sites, onSelectSite, onBack }: {
+function SocialView({ handle, deviceId, sites, onSelectSite, onBack, onSelectHandle }: {
   handle: string | null;
   deviceId: string | null;
   sites: SinisterSite[];
   onSelectSite: (site: SinisterSite) => void;
   onBack: () => void;
+  onSelectHandle: (handle: string) => void;
 }) {
   const [posts, setPosts] = useState<SocialPost[]>([]);
   const [nextBefore, setNextBefore] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Category filter — null = "All", or one of the CategoryKey values.
+  // Filtering is client-side: posts already loaded get filtered in the
+  // render, and load-more keeps loading by approval date so old posts
+  // remain reachable. If you have lots of posts in a tiny category, you
+  // may need to scroll a lot to find them — that's a future server-side
+  // endpoint improvement, not a v1 concern.
+  const [categoryFilter, setCategoryFilter] = useState<string | null>(null);
+
+  // ---- Pull-to-refresh state ----
+  // When the user is at scrollY=0 and starts dragging down, we record the
+  // initial Y in _pullStartY. As they drag, _pullDistance grows. At
+  // PULL_THRESHOLD_PX of drag, the indicator switches from "pull to refresh"
+  // to "release to refresh". Releasing past the threshold triggers a feed
+  // refetch. Released early → snap back, no-op. While refreshing is true
+  // we show a spinner and ignore further pulls.
+  const PULL_THRESHOLD_PX = 70;
+  const PULL_MAX_PX = 120;
+  const [pullDistance, setPullDistance] = useState(0);
+  const [refreshing, setRefreshing] = useState(false);
+  const _pullStartY = useRef<number | null>(null);
+
+  // Refresh = reload from the top. Called by pull-to-refresh on release
+  // past threshold. Replaces the entire feed since we're back to the
+  // newest post; resets the nextBefore cursor.
+  const refreshFeed = async () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    try {
+      const page = await apiFetchFeed({ limit: 20, before: null });
+      setPosts(page.posts);
+      setNextBefore(page.nextBefore);
+    } catch { /* silent — keep prior feed visible */ }
+    setRefreshing(false);
+    setPullDistance(0);
+  };
 
   // Initial load
   useEffect(() => {
@@ -2635,11 +2689,88 @@ function SocialView({ handle, deviceId, sites, onSelectSite, onBack }: {
   }, [sites]);
 
   return (
-    <div style={S.socialViewWrap}>
+    <div
+      style={S.socialViewWrap}
+      onTouchStart={(e) => {
+        // Only arm pull-to-refresh when the user starts a touch at the
+        // top of the page. Anywhere mid-scroll, this is a normal scroll.
+        if (window.scrollY > 0 || refreshing) return;
+        _pullStartY.current = e.touches[0].clientY;
+      }}
+      onTouchMove={(e) => {
+        if (_pullStartY.current === null || refreshing) return;
+        const dy = e.touches[0].clientY - _pullStartY.current;
+        if (dy <= 0) {
+          setPullDistance(0);
+          return;
+        }
+        // Apply rubber-banding so the pull feels resistant past threshold.
+        // 1:1 until threshold, then halved.
+        const eased = dy < PULL_THRESHOLD_PX
+          ? dy
+          : PULL_THRESHOLD_PX + (dy - PULL_THRESHOLD_PX) * 0.5;
+        setPullDistance(Math.min(eased, PULL_MAX_PX));
+      }}
+      onTouchEnd={() => {
+        if (_pullStartY.current === null) return;
+        _pullStartY.current = null;
+        if (pullDistance >= PULL_THRESHOLD_PX && !refreshing) {
+          void refreshFeed();
+        } else {
+          setPullDistance(0);
+        }
+      }}
+    >
+      {/* Pull-to-refresh indicator. Slides down from under the header as the
+          user drags. Switches "pull / release / refreshing" text based on
+          state. When refreshing finishes, the height collapses back to 0. */}
+      <div style={{
+        ...S.pullIndicator,
+        height: refreshing ? PULL_THRESHOLD_PX : pullDistance,
+        opacity: refreshing || pullDistance > 8 ? 1 : 0,
+      }}>
+        <span style={S.pullIndicatorText}>
+          {refreshing
+            ? 'Refreshing…'
+            : pullDistance >= PULL_THRESHOLD_PX
+              ? 'Release to refresh'
+              : 'Pull to refresh'}
+        </span>
+      </div>
+
       {/* Header — title only. No back button; swipe-right pops the view
           via the global gesture handler in App. */}
       <div style={S.socialHeader}>
         <div style={S.socialHeaderTitle}>eXposure</div>
+      </div>
+
+      {/* Category filter chips. Horizontally scrollable strip below the
+          header. "All" resets the filter; tapping a category shows only
+          posts from sites in that category. Filtering is client-side on
+          the loaded post set — load-more continues by date, so old posts
+          in the chosen category remain reachable by scrolling. */}
+      <div style={S.filterChipBar}>
+        <button
+          onClick={() => { playSubDrop(); setCategoryFilter(null); }}
+          style={{
+            ...S.filterChip,
+            ...(categoryFilter === null ? S.filterChipActive : {}),
+          }}
+        >
+          All
+        </button>
+        {CATEGORIES.map((cat) => (
+          <button
+            key={cat.key}
+            onClick={() => { playSubDrop(); setCategoryFilter(cat.key); }}
+            style={{
+              ...S.filterChip,
+              ...(categoryFilter === cat.key ? S.filterChipActive : {}),
+            }}
+          >
+            {cat.label}
+          </button>
+        ))}
       </div>
 
       {/* Body */}
@@ -2656,18 +2787,35 @@ function SocialView({ handle, deviceId, sites, onSelectSite, onBack }: {
         </div>
       ) : (
         <div style={S.socialFeed}>
-          {posts.map((p) => (
-            <SocialPostCard
-              key={p.id}
-              post={p}
-              currentHandle={handle}
-              deviceId={deviceId}
-              onSiteTap={() => {
-                const s = siteById.get(p.siteId);
-                if (s) onSelectSite(s);
-              }}
-            />
-          ))}
+          {(() => {
+            // Apply category filter to the loaded posts.
+            const filtered = categoryFilter
+              ? posts.filter((p) => p.siteCategory === categoryFilter)
+              : posts;
+            if (filtered.length === 0) {
+              return (
+                <div style={S.socialEmpty}>
+                  No posts in this category yet.<br />
+                  <span style={{ opacity: 0.7, fontSize: 13 }}>
+                    Try "All" or scroll for older posts.
+                  </span>
+                </div>
+              );
+            }
+            return filtered.map((p) => (
+              <SocialPostCard
+                key={p.id}
+                post={p}
+                currentHandle={handle}
+                deviceId={deviceId}
+                onSiteTap={() => {
+                  const s = siteById.get(p.siteId);
+                  if (s) onSelectSite(s);
+                }}
+                onHandleTap={() => onSelectHandle(p.handle)}
+              />
+            ));
+          })()}
           {loadingMore && <div style={S.socialEmpty}>Loading more…</div>}
           {!nextBefore && posts.length > 0 && (
             <div style={{ ...S.socialEmpty, paddingTop: 20, paddingBottom: 40 }}>
@@ -2682,11 +2830,12 @@ function SocialView({ handle, deviceId, sites, onSelectSite, onBack }: {
 
 // Single post card inside the feed. Owns its own like state so toggling
 // is fast and doesn't trigger a parent re-render of the whole list.
-function SocialPostCard({ post, currentHandle, deviceId, onSiteTap }: {
+function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap }: {
   post: SocialPost;
   currentHandle: string | null;
   deviceId: string | null;
   onSiteTap: () => void;
+  onHandleTap: () => void;
 }) {
   const [liked, setLiked] = useState(false);
   const [likeCount, setLikeCount] = useState(post.likeCount || 0);
@@ -2740,14 +2889,14 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap }: {
     <div style={S.postCard}>
       {/* Header: handle + timestamp */}
       <div style={S.postHeader}>
-        <span style={S.postHandle}>@{post.handle}</span>
+        <button onClick={onHandleTap} style={S.postHandleBtn}>@{post.handle}</button>
         <span style={S.postTime}>{timeAgo}</span>
       </div>
 
       {/* Photo */}
       <img src={post.photoUrl} alt="" style={S.postPhoto} />
 
-      {/* Actions row: heart + count */}
+      {/* Actions row: heart + count + share */}
       <div style={S.postActions}>
         <button
           onClick={onToggleLike}
@@ -2758,6 +2907,40 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap }: {
         >
           <span style={{ fontSize: 20, lineHeight: 1 }}>{liked ? '♥' : '♡'}</span>
           <span style={{ fontSize: 14, fontWeight: 600 }}>{likeCount}</span>
+        </button>
+        <button
+          onClick={async () => {
+            // Native share sheet. We fetch the photo and pass it as a File
+            // so iOS picks the right share targets (Instagram, Messages
+            // photo share, etc.). Falls back to text-only if file share
+            // isn't supported by the browser/webview.
+            try {
+              const nav: any = navigator;
+              if (!nav.share) {
+                showToast('Sharing not available', 'error');
+                return;
+              }
+              const shareData: any = {
+                title: 'The Dread Directory',
+                text: `${post.caption}\n\n${post.siteTitle || ''} — Dread Directory`,
+              };
+              try {
+                const res = await fetch(post.photoUrl);
+                const blob = await res.blob();
+                const file = new File([blob], 'post.jpg', { type: blob.type || 'image/jpeg' });
+                if (nav.canShare && nav.canShare({ files: [file] })) {
+                  shareData.files = [file];
+                }
+              } catch { /* fall through to text-only share */ }
+              await nav.share(shareData);
+            } catch {
+              // User cancelled or share threw — silent
+            }
+          }}
+          style={S.postShareBtn}
+          aria-label="Share post"
+        >
+          <span style={{ fontSize: 18, lineHeight: 1 }}>↗</span>
         </button>
       </div>
 
@@ -2790,7 +2973,117 @@ function formatTimeAgo(iso: string): string {
   return `${Math.floor(months / 12)}y ago`;
 }
 
-// ---------- Leaders (Dread Leaders leaderboard) ----------
+// ---------- User Profile (per-handle eXposure profile) ----------
+// Tapping any @handle on a post card opens this view. Shows the user's
+// stats (badge count, visit count) and their full feed of approved posts.
+//
+// Data sources:
+//   - GET /badges/:handle for visit + submit counts
+//   - GET /posts/feed for posts (filtered client-side by handle since
+//     there's no by-handle endpoint yet — small dataset, fine for now)
+function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSelectSite, onSelectBadges, onBack }: {
+  profileHandle: string;
+  currentHandle: string | null;
+  deviceId: string | null;
+  sites: SinisterSite[];
+  onSelectSite: (site: SinisterSite) => void;
+  onSelectBadges: (handle: string) => void;
+  onBack: () => void;
+}) {
+  const [stats, setStats] = useState<{ visitCount: number; submitCount: number; badgeCount: number } | null>(null);
+  const [posts, setPosts] = useState<SocialPost[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  const isMe = !!currentHandle && currentHandle.toLowerCase() === profileHandle.toLowerCase();
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      // Fetch badge data + posts in parallel.
+      const [badgeData, feedPage] = await Promise.all([
+        apiGetBadges(profileHandle),
+        apiFetchFeed({ limit: 50, before: null }),
+      ]);
+      if (cancelled) return;
+      setStats({
+        visitCount: badgeData.visitCount,
+        submitCount: badgeData.submitCount,
+        badgeCount: badgeData.badges.length,
+      });
+      const mine = feedPage.posts.filter(
+        (p) => p.handle.toLowerCase() === profileHandle.toLowerCase()
+      );
+      setPosts(mine);
+      setLoading(false);
+    })();
+    return () => { cancelled = true; };
+  }, [profileHandle]);
+
+  const siteById = useMemo(() => {
+    const m = new Map<string, SinisterSite>();
+    for (const s of sites) m.set(s.id, s);
+    return m;
+  }, [sites]);
+
+  return (
+    <div style={S.socialViewWrap}>
+      <div style={S.socialHeader}>
+        <div style={S.socialHeaderTitle}>@{profileHandle}</div>
+      </div>
+
+      {/* Stats strip */}
+      <div style={S.profileStatsRow}>
+        <div style={S.profileStat}>
+          <div style={S.profileStatNum}>{stats?.visitCount ?? '—'}</div>
+          <div style={S.profileStatLabel}>Visits</div>
+        </div>
+        <div style={S.profileStat}>
+          <div style={S.profileStatNum}>{stats?.submitCount ?? '—'}</div>
+          <div style={S.profileStatLabel}>Submitted</div>
+        </div>
+        <button
+          onClick={() => { playSubDrop(); onSelectBadges(profileHandle); }}
+          style={{ ...S.profileStat, cursor: 'pointer', background: 'transparent', border: 'none' }}
+        >
+          <div style={S.profileStatNum}>{stats?.badgeCount ?? '—'}</div>
+          <div style={{ ...S.profileStatLabel, color: '#BF40FF' }}>Badges ›</div>
+        </button>
+      </div>
+
+      {/* Posts feed */}
+      {loading ? (
+        <div style={S.socialEmpty}>Loading…</div>
+      ) : posts.length === 0 ? (
+        <div style={S.socialEmpty}>
+          {isMe ? 'You haven\u2019t posted to eXposure yet.' : 'No posts yet.'}
+          <br />
+          <span style={{ opacity: 0.7, fontSize: 13 }}>
+            {isMe ? 'Visit a site and tap "Post to eXposure" to share.' : 'Check back later.'}
+          </span>
+        </div>
+      ) : (
+        <div style={S.socialFeed}>
+          {posts.map((p) => (
+            <SocialPostCard
+              key={p.id}
+              post={p}
+              currentHandle={currentHandle}
+              deviceId={deviceId}
+              onSiteTap={() => {
+                const s = siteById.get(p.siteId);
+                if (s) onSelectSite(s);
+              }}
+              onHandleTap={() => { /* already on this profile */ }}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
 // Two-tab leaderboard: Submitters (handles ranked by approved site count)
 // and Visitors (handles ranked by verified visit count). Tapping any row
 // drills into that handle's badge collection.
@@ -6921,6 +7214,88 @@ const S: Record<string, React.CSSProperties> = {
     backdropFilter: 'blur(8px)',
     borderBottom: `1px solid #BF40FF44`,
   },
+  // Pull-to-refresh indicator. Sits above the header, height grows as the
+  // user drags down. Background matches the page so it visually "pulls
+  // out" from behind the header. Transitions smoothly back to 0 on
+  // release or refresh completion.
+  pullIndicator: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    width: '100%',
+    overflow: 'hidden',
+    backgroundColor: 'transparent',
+    color: '#BF40FF',
+    fontFamily: '"Jolly Lodger", system-ui, serif',
+    fontSize: 16,
+    letterSpacing: '0.04em',
+    transition: 'height 200ms ease, opacity 150ms ease',
+    textShadow: `0 0 6px #BF40FFaa`,
+  },
+  pullIndicatorText: {
+    padding: '8px 12px',
+  },
+  // Category filter chip strip. Horizontally scrollable row of pill
+  // buttons; the active one is filled purple, others are outlined.
+  filterChipBar: {
+    display: 'flex',
+    gap: 8,
+    padding: '10px 12px',
+    overflowX: 'auto' as const,
+    overflowY: 'hidden' as const,
+    whiteSpace: 'nowrap' as const,
+    backgroundColor: 'rgba(10,10,10,0.5)',
+    borderBottom: `1px solid #2a2a2a`,
+    scrollbarWidth: 'none' as const,
+    WebkitOverflowScrolling: 'touch' as const,
+  },
+  filterChip: {
+    flex: '0 0 auto',
+    padding: '6px 14px',
+    borderRadius: 999,
+    border: `1px solid #444`,
+    backgroundColor: 'rgba(0,0,0,0.4)',
+    color: '#BBB',
+    fontFamily: '"Jolly Lodger", system-ui, serif',
+    fontSize: 16,
+    letterSpacing: '0.04em',
+    cursor: 'pointer',
+  },
+  filterChipActive: {
+    border: `1.5px solid #BF40FF`,
+    backgroundColor: 'rgba(191,64,255,0.15)',
+    color: '#BF40FF',
+    textShadow: `0 0 6px #BF40FF88`,
+    boxShadow: `0 0 10px #BF40FF44`,
+  },
+  // ---- User profile stats strip ----
+  profileStatsRow: {
+    display: 'flex',
+    justifyContent: 'space-around',
+    alignItems: 'center',
+    padding: '16px 12px',
+    backgroundColor: 'rgba(10,10,10,0.5)',
+    borderBottom: `1px solid #2a2a2a`,
+  },
+  profileStat: {
+    flex: 1,
+    textAlign: 'center' as const,
+    padding: 0,
+  },
+  profileStatNum: {
+    fontFamily: '"Jolly Lodger", system-ui, serif',
+    fontSize: 28,
+    color: '#F0EBE0',
+    letterSpacing: '0.04em',
+    lineHeight: 1.1,
+  },
+  profileStatLabel: {
+    fontSize: 11,
+    color: '#888',
+    letterSpacing: '0.18em',
+    textTransform: 'uppercase' as const,
+    marginTop: 4,
+  },
   socialHeaderTitle: {
     color: '#BF40FF',
     fontSize: 22,
@@ -6963,6 +7338,17 @@ const S: Record<string, React.CSSProperties> = {
     fontWeight: 700,
     letterSpacing: '0.04em',
   },
+  postHandleBtn: {
+    color: '#BF40FF',
+    fontSize: 14,
+    fontWeight: 700,
+    letterSpacing: '0.04em',
+    backgroundColor: 'transparent',
+    border: 'none',
+    padding: 0,
+    cursor: 'pointer',
+    textShadow: `0 0 6px #BF40FF55`,
+  },
   postTime: {
     color: '#888',
     fontSize: 12,
@@ -6988,6 +7374,19 @@ const S: Record<string, React.CSSProperties> = {
     border: 'none',
     cursor: 'pointer',
     padding: 4,
+  },
+  postShareBtn: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    width: 32,
+    height: 32,
+    backgroundColor: 'transparent',
+    border: 'none',
+    cursor: 'pointer',
+    padding: 0,
+    color: '#BBB',
+    marginLeft: 'auto' as const,
   },
   postCaption: {
     padding: '4px 14px 10px',
