@@ -172,6 +172,106 @@ let _siteList: SinisterSite[] = [];
 let _activeFenceIds: Set<string> = new Set();
 let _lastAnchor: { lat: number; lng: number } | null = null;
 let _lastNotifiedAt: Map<string, number> = new Map();
+// Per-site presence tracking. A site id lives in this set from the moment
+// we get a confirmed ENTER until we get a debounced EXIT. While a site is
+// in the set, additional ENTER events are ignored as GPS jitter — that
+// stops the hotel-stay repeat-notification bug. The 30-min cooldown above
+// stays in place as defense-in-depth in case we ever miss an EXIT.
+//
+// CRITICAL: this set + _lastNotifiedAt MUST be persisted to disk via
+// savePresenceState() because iOS aggressively terminates the app between
+// geofence events to save battery. When iOS wakes the app back up for
+// the next event, the entire JS module reloads from scratch with empty
+// state — without persistence, every ENTER looks like a first-time entry
+// and fires a duplicate notification. See loadPresenceState() below for
+// the cold-start rehydration.
+let _currentlyInside: Set<string> = new Set();
+// In-flight EXIT debounce timers keyed by site id. We don't trust the very
+// first EXIT event because GPS at the radius boundary flickers; we wait
+// EXIT_DEBOUNCE_MS for the device to stay outside before treating exit as
+// real. If we get an ENTER for the same site before the timer fires, we
+// cancel — that was just jitter.
+const EXIT_DEBOUNCE_MS = 60 * 1000;
+let _pendingExitTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
+
+// ---------- Persistence (survives iOS app termination between events) ----------
+// Storage key for the {currentlyInside, lastNotifiedAt} blob. Stored as a
+// single JSON value to make the save atomic — one Preferences.set call
+// per state change instead of two.
+const PRESENCE_STORAGE_KEY = 'sinister.geofencePresence.v1';
+let _presenceLoaded = false;
+
+async function readPersistent(key: string): Promise<string | null> {
+  try {
+    const cap = (window as any).Capacitor;
+    if (cap?.isNativePlatform?.() && cap?.Plugins?.Preferences) {
+      const { value } = await cap.Plugins.Preferences.get({ key });
+      return value || null;
+    }
+  } catch { /* fall through to web */ }
+  try { return typeof localStorage !== 'undefined' ? localStorage.getItem(key) : null; }
+  catch { return null; }
+}
+
+async function writePersistent(key: string, value: string): Promise<void> {
+  try {
+    const cap = (window as any).Capacitor;
+    if (cap?.isNativePlatform?.() && cap?.Plugins?.Preferences) {
+      await cap.Plugins.Preferences.set({ key, value });
+      return;
+    }
+  } catch { /* fall through to web */ }
+  try { if (typeof localStorage !== 'undefined') localStorage.setItem(key, value); }
+  catch { /* silent */ }
+}
+
+// Load _currentlyInside and _lastNotifiedAt from disk. Called once at
+// module init before any geofence event can be processed. If the load
+// fails or the stored data is malformed, we start with empty state —
+// worst case is one duplicate notification, not a crash.
+async function loadPresenceState(): Promise<void> {
+  if (_presenceLoaded) return;
+  try {
+    const raw = await readPersistent(PRESENCE_STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && Array.isArray(parsed.currentlyInside)) {
+        _currentlyInside = new Set(parsed.currentlyInside);
+      }
+      if (parsed && parsed.lastNotifiedAt && typeof parsed.lastNotifiedAt === 'object') {
+        _lastNotifiedAt = new Map(Object.entries(parsed.lastNotifiedAt));
+      }
+      dlog('loadPresenceState: restored ' + _currentlyInside.size + ' inside, ' + _lastNotifiedAt.size + ' cooldowns');
+    } else {
+      dlog('loadPresenceState: no prior state');
+    }
+  } catch (err: any) {
+    dlog('loadPresenceState failed: ' + (err?.message || err));
+  }
+  _presenceLoaded = true;
+}
+
+// Serialize current state to disk. Called after every mutation. Fire-
+// and-forget — we don't await it from the geofence event handler because
+// blocking on Preferences.set could lose the event if the JS engine is
+// torn down mid-write. If a write loses, the worst case is the in-memory
+// state being one step ahead of disk — next time the app cold-starts
+// it'll think the user is still inside (or has a stale cooldown) which
+// is the SAFE direction to fail (no duplicate notifications).
+function savePresenceState(): void {
+  const payload = JSON.stringify({
+    currentlyInside: Array.from(_currentlyInside),
+    lastNotifiedAt: Object.fromEntries(_lastNotifiedAt),
+    savedAt: Date.now(),
+  });
+  void writePersistent(PRESENCE_STORAGE_KEY, payload);
+}
+
+// Kick off persistence load at module init. Doesn't block module load —
+// the load completes in the background, and geofence events that arrive
+// before it finishes will see empty state (worst case: one extra
+// notification on the very first cold-start after install).
+void loadPresenceState();
 let _onPosition: ((lat: number, lng: number) => void) | null = null;
 let _notifListenersAttached = false;
 let _bgListenersAttached = false;
@@ -255,20 +355,69 @@ async function attachBgListeners(BG: any): Promise<void> {
       const id = event?.identifier;
       const action = event?.action;
       dlog(`onGeofence: ${action} ${id}`);
-      if (action !== 'ENTER') return;
+
       const site = _siteList.find(s => s.id === id);
       if (!site) {
         dlog('onGeofence: site not found for id=' + id);
         return;
       }
-      const now = Date.now();
-      const lastAt = _lastNotifiedAt.get(site.id) || 0;
-      if (now - lastAt < NOTIFICATION_COOLDOWN_MS) {
-        dlog('onGeofence: cooldown active for ' + site.title);
+
+      if (action === 'ENTER') {
+        // Cancel any pending exit debounce for this site — we entered again
+        // before the exit was confirmed, so the prior "exit" was just GPS
+        // jitter at the boundary.
+        const pending = _pendingExitTimers.get(site.id);
+        if (pending) {
+          clearTimeout(pending);
+          _pendingExitTimers.delete(site.id);
+          dlog('onGeofence: cancelled pending exit for ' + site.title);
+        }
+        // If we already think the user is inside this site, this ENTER is
+        // a duplicate (GPS reacquisition, signal regain, etc.). Suppress —
+        // this is the core of the hotel-stay fix. Works across iOS app
+        // termination because _currentlyInside is hydrated from disk by
+        // loadPresenceState() before any geofence event is processed.
+        if (_currentlyInside.has(site.id)) {
+          dlog('onGeofence: already inside ' + site.title + ', ignoring duplicate ENTER');
+          return;
+        }
+        // Defense-in-depth time cooldown: still respected so a misbehaving
+        // exit-handling path can't spam notifications.
+        const now = Date.now();
+        const lastAt = _lastNotifiedAt.get(site.id) || 0;
+        if (now - lastAt < NOTIFICATION_COOLDOWN_MS) {
+          dlog('onGeofence: cooldown active for ' + site.title);
+          // Still mark as inside so subsequent jitter ENTERs are deduped.
+          _currentlyInside.add(site.id);
+          savePresenceState();
+          return;
+        }
+        _currentlyInside.add(site.id);
+        _lastNotifiedAt.set(site.id, now);
+        savePresenceState();
+        void fireNotification(site);
         return;
       }
-      _lastNotifiedAt.set(site.id, now);
-      void fireNotification(site);
+
+      if (action === 'EXIT') {
+        // Don't trust the first EXIT — wait EXIT_DEBOUNCE_MS to confirm
+        // the user really left and isn't just dancing on the boundary.
+        if (_pendingExitTimers.has(site.id)) {
+          // Already a pending confirmation — let it run.
+          return;
+        }
+        const timer = setTimeout(() => {
+          _currentlyInside.delete(site.id);
+          _pendingExitTimers.delete(site.id);
+          savePresenceState();
+          dlog('onGeofence: confirmed exit from ' + site.title);
+        }, EXIT_DEBOUNCE_MS);
+        _pendingExitTimers.set(site.id, timer);
+        dlog('onGeofence: pending exit from ' + site.title + ' (debouncing)');
+        return;
+      }
+
+      // DWELL or anything else — ignore for now.
     });
 
     BG.onMotionChange((event: any) => {
@@ -482,6 +631,7 @@ export function simulateLocation(lat: number, lng: number) {
       const lastAt = _lastNotifiedAt.get(site.id) || 0;
       if (now - lastAt < NOTIFICATION_COOLDOWN_MS) continue;
       _lastNotifiedAt.set(site.id, now);
+      savePresenceState();
       dlog(`SIM TRIGGER: ${site.title} at ${Math.round(d)}m`);
       void fireNotification(site);
     }
@@ -522,7 +672,7 @@ async function recomputeFences(lat: number, lng: number): Promise<void> {
     latitude: r.site.coords.lat,
     longitude: r.site.coords.lng,
     notifyOnEntry: true,
-    notifyOnExit: false,
+    notifyOnExit: true,
     notifyOnDwell: false,
     extras: {
       siteId: r.site.id,
