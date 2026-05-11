@@ -1348,6 +1348,14 @@ export default function App() {
   // scroll inside goBack itself because the new view's content isn't in
   // the DOM yet at that moment.
   const _pendingScrollRestore = useRef<number | null>(null);
+  // Cache of NearbyView state per category (and `__all` for the no-filter
+  // map). Persists pinCenter + radius across navigations away from the
+  // map and back — e.g. tap a pin → Detail → swipe back should return
+  // the user to the spot where they were searching, not snap them back
+  // to their real location. Keyed by category so each category remembers
+  // its own search center independently.
+  type NearbyState = { pinCenter: { lat: number; lng: number } | null; radiusMi: number };
+  const _nearbyStateCache = useRef<Map<string, NearbyState>>(new Map());
   const setView = (next: View) => {
     const sy = (typeof window !== 'undefined')
       ? (window.scrollY || document.documentElement.scrollTop || 0)
@@ -1912,7 +1920,27 @@ export default function App() {
     } else if (v.name === 'nearby') {
       const catEntry = v.category ? CATEGORIES.find(c => c.key === v.category) : null;
       const catLabel = catEntry?.label || (v.category ? titleCase(v.category) : null);
-      return { key: v.category ? `nearby-${v.category}` : 'nearby', element: <NearbyView sites={sites} currentLocation={currentLocation} onSelectSite={goDetail} onBack={goHome} categoryFilter={v.category} categoryLabel={catLabel || undefined} /> };
+      const cacheKey = v.category || '__all';
+      const cached = _nearbyStateCache.current.get(cacheKey);
+      const persistState = (s: NearbyState) => {
+        _nearbyStateCache.current.set(cacheKey, s);
+      };
+      return {
+        key: v.category ? `nearby-${v.category}` : 'nearby',
+        element: (
+          <NearbyView
+            sites={sites}
+            currentLocation={currentLocation}
+            onSelectSite={goDetail}
+            onBack={goHome}
+            categoryFilter={v.category}
+            categoryLabel={catLabel || undefined}
+            initialPinCenter={cached?.pinCenter ?? null}
+            initialRadiusMi={cached?.radiusMi ?? DEFAULT_RADIUS_MILES}
+            onStateChange={persistState}
+          />
+        ),
+      };
     } else {
       return {
         key: 'home',
@@ -3872,7 +3900,7 @@ function loadMapKitJS(token: string): Promise<any> {
   return _mapkitLoadPromise;
 }
 
-function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilter, categoryLabel }: {
+function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilter, categoryLabel, initialPinCenter, initialRadiusMi, onStateChange }: {
   sites: SinisterSite[];
   currentLocation: { lat: number; lng: number } | null;
   onSelectSite: (site: SinisterSite) => void;
@@ -3886,6 +3914,13 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
   // header so the user sees what they're looking at; falls back to the
   // generic "Locations Near Me" when no filter is set.
   categoryLabel?: string;
+  // Restored state from the previous time this category's map was open.
+  // Lets the view pick up where the user left off after a Detail → swipe
+  // back round trip (instead of resetting the search center to their
+  // real location every time).
+  initialPinCenter?: { lat: number; lng: number } | null;
+  initialRadiusMi?: number;
+  onStateChange?: (state: { pinCenter: { lat: number; lng: number } | null; radiusMi: number }) => void;
 }) {
   const mapElRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<any>(null);
@@ -3898,14 +3933,21 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
   // background, the card's × button, or another pin updates this.
   const [selectedSite, setSelectedSite] = useState<{ site: SinisterSite; distMi: number } | null>(null);
   // Search radius in miles — user picks from RADIUS_OPTIONS_MILES via chips
-  // above the map. Survives the lifetime of this view (resets when user
-  // backs out and comes back).
-  const [radiusMi, setRadiusMi] = useState<number>(DEFAULT_RADIUS_MILES);
-  // Optional drop-pin location. When the user long-presses anywhere on the
-  // map, we drop a marker there and re-center the radius search on that
-  // point instead of their real location. Tap Reset (or the user dot) to
-  // clear and snap back to real location.
-  const [pinCenter, setPinCenter] = useState<{ lat: number; lng: number } | null>(null);
+  // above the map. Initial value comes from the parent's per-category
+  // cache so swipe-back from Detail restores what the user had set.
+  const [radiusMi, setRadiusMi] = useState<number>(initialRadiusMi ?? DEFAULT_RADIUS_MILES);
+  // Optional drag-pin location. When the user drags their dot, we set
+  // this to the new coordinate and the radius search re-centers on it.
+  // Tap Reset (or the dot itself) to clear and snap back to real location.
+  // Initial value also restored from the parent's cache.
+  const [pinCenter, setPinCenter] = useState<{ lat: number; lng: number } | null>(initialPinCenter ?? null);
+
+  // Sync state changes back to the parent so it can restore them on
+  // re-entry (e.g. user taps a pin → Detail → swipes back, the parent
+  // re-mounts this component and reads pinCenter/radiusMi from the cache).
+  useEffect(() => {
+    if (onStateChange) onStateChange({ pinCenter, radiusMi });
+  }, [pinCenter, radiusMi, onStateChange]);
 
   // The effective search center is the drop-pin if one is set, otherwise
   // the user's real location.
@@ -4024,8 +4066,12 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
     if (!map || !mk || !livePos) return;
 
     // First fix — center the map and set the visible region to the radius.
+    // If pinCenter was restored from the cache (returning from a Detail
+    // round trip), center on that instead of the user's real location so
+    // they pick up exactly where they left off.
     if (!didInitialCenterRef.current) {
-      const center = new mk.Coordinate(livePos.lat, livePos.lng);
+      const initCenter = pinCenter || livePos;
+      const center = new mk.Coordinate(initCenter.lat, initCenter.lng);
       // Convert miles to meters for span. CoordinateRegion uses degrees,
       // so we approximate: 1 deg lat ~= 111km. Span = 2 * radius.
       const spanDeg = (radiusMi * 2 * METERS_PER_MILE) / 111000;
@@ -4111,27 +4157,35 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
     }
   }, [pinCenter, livePos]);
 
-  // Re-zoom the visible region whenever the user changes radius or drops/
-  // clears the drop pin. We pan-and-zoom to keep the radius circle filling
-  // the viewport so users see the area their search covers.
+  // Re-zoom the visible region only when the USER changes something —
+  // a radius chip tap, or a drag-end on the user dot (which updates
+  // pinCenter). We deliberately exclude effectiveCenter from this
+  // effect's dep array because effectiveCenter is recomputed whenever
+  // livePos ticks via GPS; including it would forcibly re-center the
+  // map every few seconds and fight the user's manual pan/zoom.
   useEffect(() => {
     const map = mapRef.current;
     const mk = (window as any).mapkit;
-    if (!map || !mk || !effectiveCenter) return;
+    if (!map || !mk) return;
     // Skip the very first frame — the initial-center effect already set
     // the region; running this immediately afterward would double-set it.
     if (!didInitialCenterRef.current) return;
-    const center = new mk.Coordinate(effectiveCenter.lat, effectiveCenter.lng);
+    // Use the freshest center available at the moment of the user action,
+    // but read it imperatively so changes to it later don't re-trigger us.
+    const center = pinCenter || livePos;
+    if (!center) return;
+    const mkCenter = new mk.Coordinate(center.lat, center.lng);
     const spanDeg = (radiusMi * 2 * METERS_PER_MILE) / 111000;
     try {
       map.setRegionAnimated(
-        new mk.CoordinateRegion(center, new mk.CoordinateSpan(spanDeg, spanDeg)),
+        new mk.CoordinateRegion(mkCenter, new mk.CoordinateSpan(spanDeg, spanDeg)),
         true,
       );
     } catch {
-      map.region = new mk.CoordinateRegion(center, new mk.CoordinateSpan(spanDeg, spanDeg));
+      map.region = new mk.CoordinateRegion(mkCenter, new mk.CoordinateSpan(spanDeg, spanDeg));
     }
-  }, [radiusMi, pinCenter, effectiveCenter]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [radiusMi, pinCenter]);
 
   // Drop-pin and long-press code used to live here. Both are now obsolete:
   // the user dot is draggable, so dragging it serves the same purpose as a
