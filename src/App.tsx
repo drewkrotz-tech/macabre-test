@@ -250,6 +250,29 @@ async function apiFetchFeed(args: { limit?: number; before?: string | null }): P
   } catch { return { posts: [], nextBefore: null }; }
 }
 
+// Approved posts by one handle (newest first). Powers the IG-style grid
+// on UserProfileView. Server-side filter keeps the client from pulling
+// the full feed and discarding 95% of it.
+async function apiFetchPostsByHandle(handle: string): Promise<SocialPost[]> {
+  try {
+    const res = await fetch(`${API_BASE}/posts/handle/${encodeURIComponent(handle)}`);
+    const data = await res.json();
+    return Array.isArray(data?.posts) ? data.posts : [];
+  } catch { return []; }
+}
+
+// Single approved post by id. Used when the user taps a thumbnail in
+// the profile grid and we navigate to the post-detail view.
+async function apiFetchPost(postId: string): Promise<SocialPost | null> {
+  try {
+    const res = await fetch(`${API_BASE}/posts/id/${encodeURIComponent(postId)}`);
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (!data || !data.id) return null;
+    return data as SocialPost;
+  } catch { return null; }
+}
+
 async function apiToggleLike(args: { postId: string; handle: string; deviceId: string }): Promise<{ ok: boolean; liked?: boolean; count?: number; reason?: string }> {
   try {
     const res = await fetch(`${API_BASE}/posts/like/${encodeURIComponent(args.postId)}`, {
@@ -1454,7 +1477,8 @@ type View =
   | { name: 'nearby'; category?: CategoryKey }
   | { name: 'list' }
   | { name: 'social' }
-  | { name: 'userProfile'; handle: string };
+  | { name: 'userProfile'; handle: string }
+  | { name: 'post'; postId: string };
 
 export default function App() {
   const [view, _setViewRaw] = useState<View>({ name: 'home' });
@@ -2071,6 +2095,7 @@ export default function App() {
             onSelectSite={goDetail}
             onBack={goHome}
             onSelectHandle={(h) => setView({ name: 'userProfile', handle: h })}
+            onSelectPost={(postId) => setView({ name: 'post', postId })}
           />
         ),
       };
@@ -2085,6 +2110,22 @@ export default function App() {
             sites={sites}
             onSelectSite={goDetail}
             onSelectBadges={(h) => setView({ name: 'badges', handle: h })}
+            onSelectPost={(postId) => setView({ name: 'post', postId })}
+            onBack={goHome}
+          />
+        ),
+      };
+    } else if (v.name === 'post') {
+      return {
+        key: `post:${v.postId}`,
+        element: (
+          <PostDetailView
+            postId={v.postId}
+            currentHandle={handle}
+            deviceId={deviceId}
+            sites={sites}
+            onSelectSite={goDetail}
+            onSelectHandle={(h) => setView({ name: 'userProfile', handle: h })}
             onBack={goHome}
           />
         ),
@@ -2592,7 +2633,7 @@ function HomeBottomBar({ onLeaders, onList, onAbout, onSocial }: {
 // Like UI uses optimistic update — tap heart, increment count locally and
 // toggle filled state, then call /posts/like/:postId in the background.
 // On server error we revert.
-function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, onBack, onSelectHandle }: {
+function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, onBack, onSelectHandle, onSelectPost }: {
   handle: string | null;
   deviceId: string | null;
   sites: SinisterSite[];
@@ -2600,6 +2641,7 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
   onSelectSite: (site: SinisterSite) => void;
   onBack: () => void;
   onSelectHandle: (handle: string) => void;
+  onSelectPost: (postId: string) => void;
 }) {
   // Sub-tab inside eXposure. The static black bottom bar switches
   // between four sub-screens: 'feed' (the post feed, eXposure home),
@@ -2819,6 +2861,7 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
             sites={sites}
             onSelectSite={onSelectSite}
             onSelectBadges={(h) => { /* tab-bound; ignore deep link */ void h; }}
+            onSelectPost={onSelectPost}
             onBack={() => setSubTab('feed')}
             embedded
           />
@@ -3458,20 +3501,31 @@ function formatTimeAgo(iso: string): string {
 }
 
 // ---------- User Profile (per-handle eXposure profile) ----------
-// Tapping any @handle on a post card opens this view. Shows the user's
-// stats (badge count, visit count) and their full feed of approved posts.
+// Instagram-style profile page. Same template for every handle — the
+// user's own profile (from the eXposure Profile tab) and any other
+// handle tapped from a post card both render this view.
+//
+// Layout (top to bottom):
+//   1. Header bar — @handle centered, neon purple in Jolly Lodger
+//   2. Profile row — large avatar on left, Posts/Visits counts on right
+//   3. Bio line (currently just a placeholder — no bio field yet)
+//   4. Action row — "View Badges" button (and a Share button placeholder)
+//   5. Tab strip — single grid icon for now (active)
+//   6. 3-column square grid of approved post thumbnails
+//   7. Tap a thumbnail → opens single-post detail view
 //
 // Data sources:
-//   - GET /badges/:handle for visit + submit counts
-//   - GET /posts/feed for posts (filtered client-side by handle since
-//     there's no by-handle endpoint yet — small dataset, fine for now)
-function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSelectSite, onSelectBadges, onBack, embedded }: {
+//   - GET /badges/:handle for visit count
+//   - GET /posts/handle/:handle for the grid (new server endpoint —
+//     replaces the old "fetch full feed and filter client-side" trick)
+function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSelectSite, onSelectBadges, onSelectPost, onBack, embedded }: {
   profileHandle: string;
   currentHandle: string | null;
   deviceId: string | null;
   sites: SinisterSite[];
   onSelectSite: (site: SinisterSite) => void;
   onSelectBadges: (handle: string) => void;
+  onSelectPost: (postId: string) => void;
   onBack: () => void;
   embedded?: boolean;
 }) {
@@ -3485,10 +3539,10 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
     let cancelled = false;
     (async () => {
       setLoading(true);
-      // Fetch badge data + posts in parallel.
-      const [badgeData, feedPage] = await Promise.all([
+      // Fetch badge stats + this handle's posts in parallel.
+      const [badgeData, handlePosts] = await Promise.all([
         apiGetBadges(profileHandle),
-        apiFetchFeed({ limit: 50, before: null }),
+        apiFetchPostsByHandle(profileHandle),
       ]);
       if (cancelled) return;
       setStats({
@@ -3496,47 +3550,111 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
         submitCount: badgeData.submitCount,
         badgeCount: badgeData.badges.length,
       });
-      const mine = feedPage.posts.filter(
-        (p) => p.handle.toLowerCase() === profileHandle.toLowerCase()
-      );
-      setPosts(mine);
+      setPosts(handlePosts);
       setLoading(false);
     })();
     return () => { cancelled = true; };
   }, [profileHandle]);
 
-  const siteById = useMemo(() => {
-    const m = new Map<string, SinisterSite>();
-    for (const s of sites) m.set(s.id, s);
-    return m;
-  }, [sites]);
+  // Mark variables as intentionally unused — they're part of the
+  // standard profile prop bag but this layout doesn't surface them.
+  // (sites is used indirectly via onSelectSite; deviceId is reserved
+  // for future actions like "Edit profile" or following.)
+  void sites; void onSelectSite; void deviceId;
 
   return (
     <div style={embedded ? { paddingBottom: 80 } : S.socialViewWrap}>
+      {/* Sticky header with handle */}
       <div style={S.socialHeader}>
         <div style={S.socialHeaderTitle}>@{profileHandle}</div>
       </div>
 
-      {/* Stats strip */}
-      <div style={S.profileStatsRow}>
-        <div style={S.profileStat}>
-          <div style={S.profileStatNum}>{stats?.visitCount ?? '—'}</div>
-          <div style={S.profileStatLabel}>Visits</div>
+      {/* ---- IG-style profile row: big avatar + stats ---- */}
+      <div style={S.profileTopRow}>
+        <div style={S.profileAvatarWrap}>
+          <img src={exposureIconUrl} alt="" style={S.profileAvatarImg} />
         </div>
-        <div style={S.profileStat}>
-          <div style={S.profileStatNum}>{stats?.submitCount ?? '—'}</div>
-          <div style={S.profileStatLabel}>Submitted</div>
+        <div style={S.profileStatsCluster}>
+          <div style={S.profileStatItem}>
+            <div style={S.profileStatNum}>{posts.length}</div>
+            <div style={S.profileStatLabel}>Posts</div>
+          </div>
+          <div style={S.profileStatItem}>
+            <div style={S.profileStatNum}>{stats?.visitCount ?? '—'}</div>
+            <div style={S.profileStatLabel}>Visits</div>
+          </div>
+          <button
+            onClick={() => { playSubDrop(); onSelectBadges(profileHandle); }}
+            style={{ ...S.profileStatItem, cursor: 'pointer', background: 'transparent', border: 'none' }}
+            aria-label="View badges"
+          >
+            <div style={{ ...S.profileStatNum, color: '#BF40FF' }}>
+              {stats?.badgeCount ?? '—'}
+            </div>
+            <div style={{ ...S.profileStatLabel, color: '#BF40FF' }}>Badges</div>
+          </button>
         </div>
-        <button
-          onClick={() => { playSubDrop(); onSelectBadges(profileHandle); }}
-          style={{ ...S.profileStat, cursor: 'pointer', background: 'transparent', border: 'none' }}
-        >
-          <div style={S.profileStatNum}>{stats?.badgeCount ?? '—'}</div>
-          <div style={{ ...S.profileStatLabel, color: '#BF40FF' }}>Badges ›</div>
-        </button>
       </div>
 
-      {/* Posts feed */}
+      {/* ---- Display name / bio (placeholder until handles get bios) ---- */}
+      <div style={S.profileBioWrap}>
+        <div style={S.profileDisplayName}>{profileHandle}</div>
+        {/* Future: bio text goes here. Empty for now. */}
+      </div>
+
+      {/* ---- Action button row (IG-style) ---- */}
+      <div style={S.profileActionsRow}>
+        {isMe ? (
+          <>
+            <button
+              onClick={() => { playSubDrop(); onSelectBadges(profileHandle); }}
+              style={S.profileActionBtn}
+            >
+              View Badges
+            </button>
+            <button
+              onClick={() => {
+                // Lightweight share: copy a "view my profile" line. No
+                // deep-link scheme yet, so just put the handle on the
+                // clipboard. Good enough as a v1 — wire to a proper share
+                // sheet once profile URLs exist.
+                try {
+                  navigator.clipboard.writeText(`@${profileHandle} on The Dread Directory`);
+                  showToast('Copied to clipboard', 'success');
+                } catch {
+                  showToast('Could not copy', 'error');
+                }
+              }}
+              style={S.profileActionBtn}
+            >
+              Share Profile
+            </button>
+          </>
+        ) : (
+          <button
+            onClick={() => { playSubDrop(); onSelectBadges(profileHandle); }}
+            style={{ ...S.profileActionBtn, flex: 1 }}
+          >
+            View Badges
+          </button>
+        )}
+      </div>
+
+      {/* ---- Tab strip (only grid for now, but kept for IG familiarity) ---- */}
+      <div style={S.profileTabStrip}>
+        <div style={S.profileTabActive}>
+          {/* 3x3 grid icon */}
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+            <rect x="3" y="3" width="6" height="6" />
+            <rect x="11" y="3" width="6" height="6" />
+            <rect x="3" y="11" width="6" height="6" />
+            <rect x="11" y="11" width="6" height="6" />
+            <rect x="3" y="19" width="0.1" height="0.1" />
+          </svg>
+        </div>
+      </div>
+
+      {/* ---- The grid itself ---- */}
       {loading ? (
         <div style={S.socialEmpty}>Loading…</div>
       ) : posts.length === 0 ? (
@@ -3548,20 +3666,94 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
           </span>
         </div>
       ) : (
-        <div style={S.socialFeed}>
+        <div style={S.profileGrid}>
           {posts.map((p) => (
-            <SocialPostCard
+            <button
               key={p.id}
-              post={p}
-              currentHandle={currentHandle}
-              deviceId={deviceId}
-              onSiteTap={() => {
-                const s = siteById.get(p.siteId);
-                if (s) onSelectSite(s);
-              }}
-              onHandleTap={() => { /* already on this profile */ }}
-            />
+              onClick={() => onSelectPost(p.id)}
+              style={S.profileGridCell}
+              aria-label={`Open post: ${p.caption.slice(0, 40)}`}
+            >
+              <img src={p.photoUrl} alt="" style={S.profileGridImg} loading="lazy" />
+            </button>
           ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+// ---------- Single Post Detail ----------
+// Opened when the user taps a thumbnail in the profile grid. Renders the
+// existing SocialPostCard solo (so likes, the site chip, the handle tap,
+// and the time stamp all behave the same as in the feed). Plus a header
+// with a back-friendly title.
+//
+// Why fetch by id instead of just passing the post object through view
+// state? Because views can be entered from a fresh app start (e.g. push
+// notification deep link in the future), and even from the same session
+// the cached count may be stale. One small request keeps the data
+// authoritative without slowing tap-to-open noticeably.
+function PostDetailView({ postId, currentHandle, deviceId, sites, onSelectSite, onSelectHandle, onBack }: {
+  postId: string;
+  currentHandle: string | null;
+  deviceId: string | null;
+  sites: SinisterSite[];
+  onSelectSite: (site: SinisterSite) => void;
+  onSelectHandle: (handle: string) => void;
+  onBack: () => void;
+}) {
+  const [post, setPost] = useState<SocialPost | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      const p = await apiFetchPost(postId);
+      if (cancelled) return;
+      setPost(p);
+      setLoading(false);
+    })();
+    return () => { cancelled = true; };
+  }, [postId]);
+
+  const siteById = useMemo(() => {
+    const m = new Map<string, SinisterSite>();
+    for (const s of sites) m.set(s.id, s);
+    return m;
+  }, [sites]);
+
+  void onBack; // back is handled by the swipe-right gesture wrapper
+
+  return (
+    <div style={S.socialViewWrap}>
+      <div style={S.socialHeader}>
+        <div style={S.socialHeaderTitle}>Post</div>
+      </div>
+      {loading ? (
+        <div style={S.socialEmpty}>Loading…</div>
+      ) : !post ? (
+        <div style={S.socialEmpty}>
+          Post not found.
+          <br />
+          <span style={{ opacity: 0.7, fontSize: 13 }}>
+            It may have been removed.
+          </span>
+        </div>
+      ) : (
+        <div style={S.socialFeed}>
+          <SocialPostCard
+            post={post}
+            currentHandle={currentHandle}
+            deviceId={deviceId}
+            onSiteTap={() => {
+              const s = siteById.get(post.siteId);
+              if (s) onSelectSite(s);
+            }}
+            onHandleTap={() => onSelectHandle(post.handle)}
+          />
         </div>
       )}
     </div>
@@ -7879,33 +8071,147 @@ const S: Record<string, React.CSSProperties> = {
     borderTop: '1px solid #1a1a1a',
     paddingBottom: 'env(safe-area-inset-bottom, 0px)' as any,
   },
-  // ---- User profile stats strip ----
-  profileStatsRow: {
+  // ---- User profile (IG-style layout) ----
+  // Top row: big avatar circle on left, posts/visits/badges stats on right.
+  // Matches Instagram's profile header rhythm — avatar size ~86px, stats
+  // distributed across the remaining width with center-aligned numbers
+  // stacked above small caps labels.
+  profileTopRow: {
+    display: 'flex',
+    alignItems: 'center',
+    padding: '18px 16px 10px 16px',
+    gap: 16,
+    backgroundColor: 'rgba(10,10,10,0.5)',
+  },
+  profileAvatarWrap: {
+    width: 86,
+    height: 86,
+    minWidth: 86,
+    borderRadius: '50%',
+    overflow: 'hidden',
+    border: `2px solid #BF40FF`,
+    boxShadow: `0 0 14px #BF40FF55`,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#0a0a0a',
+  },
+  profileAvatarImg: {
+    width: '100%',
+    height: '100%',
+    objectFit: 'cover' as const,
+    display: 'block',
+    pointerEvents: 'none' as const,
+    WebkitUserSelect: 'none' as const,
+    WebkitTouchCallout: 'none' as const,
+  },
+  profileStatsCluster: {
+    flex: 1,
     display: 'flex',
     justifyContent: 'space-around',
     alignItems: 'center',
-    padding: '16px 12px',
-    backgroundColor: 'rgba(10,10,10,0.5)',
-    borderBottom: `1px solid #2a2a2a`,
   },
-  profileStat: {
+  profileStatItem: {
     flex: 1,
     textAlign: 'center' as const,
     padding: 0,
+    display: 'flex',
+    flexDirection: 'column' as const,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   profileStatNum: {
     fontFamily: '"Jolly Lodger", system-ui, serif',
-    fontSize: 28,
+    fontSize: 26,
     color: '#F0EBE0',
     letterSpacing: '0.04em',
     lineHeight: 1.1,
   },
   profileStatLabel: {
-    fontSize: 11,
+    fontSize: 10,
     color: '#888',
     letterSpacing: '0.18em',
     textTransform: 'uppercase' as const,
     marginTop: 4,
+  },
+  // ---- Display-name / bio strip ----
+  profileBioWrap: {
+    padding: '0 16px 12px 16px',
+    backgroundColor: 'rgba(10,10,10,0.5)',
+  },
+  profileDisplayName: {
+    color: '#F0EBE0',
+    fontSize: 15,
+    fontWeight: 600,
+    letterSpacing: '0.02em',
+  },
+  // ---- IG-style action button row ----
+  profileActionsRow: {
+    display: 'flex',
+    gap: 8,
+    padding: '4px 16px 14px 16px',
+    backgroundColor: 'rgba(10,10,10,0.5)',
+    borderBottom: `1px solid #2a2a2a`,
+  },
+  profileActionBtn: {
+    flex: 1,
+    padding: '8px 12px',
+    backgroundColor: '#1a1a1a',
+    color: '#F0EBE0',
+    border: '1px solid #333',
+    borderRadius: 8,
+    fontSize: 13,
+    fontWeight: 600,
+    letterSpacing: '0.02em',
+    cursor: 'pointer',
+    fontFamily: 'inherit',
+  },
+  // ---- Tab strip above the grid ----
+  profileTabStrip: {
+    display: 'flex',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: '10px 0 8px 0',
+    backgroundColor: 'rgba(10,10,10,0.5)',
+    borderBottom: `1px solid #2a2a2a`,
+  },
+  profileTabActive: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    color: '#BF40FF',
+    padding: '4px 18px',
+    borderBottom: `2px solid #BF40FF`,
+  },
+  // ---- 3-column thumbnail grid (IG-style) ----
+  // 2px gaps to give the unmistakable IG-grid look without the bright
+  // white separators IG itself uses. Each cell is a perfect square via
+  // aspect-ratio so the grid stays tidy even before the images load.
+  profileGrid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(3, 1fr)',
+    gap: 2,
+    padding: 0,
+    backgroundColor: '#000',
+  },
+  profileGridCell: {
+    aspectRatio: '1 / 1',
+    background: '#0a0a0a',
+    border: 'none',
+    padding: 0,
+    margin: 0,
+    overflow: 'hidden',
+    cursor: 'pointer',
+    position: 'relative' as const,
+  },
+  profileGridImg: {
+    width: '100%',
+    height: '100%',
+    objectFit: 'cover' as const,
+    display: 'block',
+    pointerEvents: 'none' as const,
+    WebkitUserSelect: 'none' as const,
+    WebkitTouchCallout: 'none' as const,
   },
   socialHeaderTitle: {
     color: '#BF40FF',
