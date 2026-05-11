@@ -3232,37 +3232,71 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap 
     setLikeBusy(false);
   };
 
-  const timeAgo = formatTimeAgo(post.approvedAt || post.createdAt);
+  const timeAgoShort = formatTimeAgoShort(post.approvedAt || post.createdAt);
 
   return (
     <div style={S.postCard}>
-      {/* Header: handle + timestamp */}
+      {/* Top row: avatar | handle · time | location chip | menu */}
       <div style={S.postHeader}>
-        <button onClick={onHandleTap} style={S.postHandleBtn}>@{post.handle}</button>
-        <span style={S.postTime}>{timeAgo}</span>
+        <button onClick={onHandleTap} style={S.postAvatarBtn} aria-label={`${post.handle} profile`}>
+          {/* Skull placeholder avatar — until users can upload their own.
+              Wrapped in a circular div with a thin neon-purple ring so
+              the eXposure identity reads on the otherwise IG-neutral
+              card. Same icon for everyone for now. */}
+          <img src={exposureIconUrl} alt="" style={S.postAvatarImg} />
+        </button>
+        <div style={S.postHeaderTextCol}>
+          <div style={S.postHeaderLine1}>
+            <button onClick={onHandleTap} style={S.postHandleBtn}>{post.handle}</button>
+            <span style={S.postHeaderDot}>·</span>
+            <span style={S.postTime}>{timeAgoShort}</span>
+          </div>
+          {/* Site location chip — only for site-tagged posts. Freeform
+              posts (siteTitle === null) just show handle + time. */}
+          {post.siteTitle && (
+            <button onClick={onSiteTap} style={S.postLocationBtn}>
+              {post.siteTitle}
+            </button>
+          )}
+        </div>
+        <button style={S.postMenuBtn} aria-label="More" disabled>⋯</button>
       </div>
 
-      {/* Photo */}
+      {/* Photo — edge-to-edge with slightly rounded corners (per request).
+          objectFit cover keeps aspect ratio without letterboxing. */}
       <img src={post.photoUrl} alt="" style={S.postPhoto} />
 
-      {/* Actions row: heart + count + share */}
+      {/* Actions row — Instagram-style line icons: heart, comment (disabled
+          for now, real comments later), share. All outlined SVGs at equal
+          weight. */}
       <div style={S.postActions}>
         <button
           onClick={onToggleLike}
-          style={{
-            ...S.postLikeBtn,
-            color: liked ? '#FF3B5C' : '#BBB',
-          }}
+          style={S.postIconBtn}
+          aria-label={liked ? 'Unlike' : 'Like'}
         >
-          <span style={{ fontSize: 20, lineHeight: 1 }}>{liked ? '♥' : '♡'}</span>
-          <span style={{ fontSize: 14, fontWeight: 600 }}>{likeCount}</span>
+          {liked ? (
+            <svg width="26" height="26" viewBox="0 0 24 24" fill="#FF3B5C" stroke="#FF3B5C" strokeWidth="1.8" strokeLinejoin="round">
+              <path d="M12 21s-7.5-4.6-9.5-9.5C1 7.5 4 4 7.5 4c2 0 3.4 1 4.5 2.5C13.1 5 14.5 4 16.5 4 20 4 23 7.5 21.5 11.5 19.5 16.4 12 21 12 21Z" />
+            </svg>
+          ) : (
+            <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#F0EBE0" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 21s-7.5-4.6-9.5-9.5C1 7.5 4 4 7.5 4c2 0 3.4 1 4.5 2.5C13.1 5 14.5 4 16.5 4 20 4 23 7.5 21.5 11.5 19.5 16.4 12 21 12 21Z" />
+            </svg>
+          )}
+        </button>
+        <button
+          style={{ ...S.postIconBtn, opacity: 0.4 }}
+          aria-label="Comment (coming soon)"
+          disabled
+        >
+          {/* Comment bubble — disabled placeholder until comments ship */}
+          <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#F0EBE0" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M21 11.5a8.38 8.38 0 0 1-8.5 8.5 8.5 8.5 0 0 1-3.8-.9L3 21l1.9-5.7A8.38 8.38 0 0 1 4 11.5 8.5 8.5 0 0 1 12.5 3a8.38 8.38 0 0 1 8.5 8.5z" />
+          </svg>
         </button>
         <button
           onClick={async () => {
-            // Native share sheet. We fetch the photo and pass it as a File
-            // so iOS picks the right share targets (Instagram, Messages
-            // photo share, etc.). Falls back to text-only if file share
-            // isn't supported by the browser/webview.
             try {
               const nav: any = navigator;
               if (!nav.share) {
@@ -3286,22 +3320,50 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap 
               // User cancelled or share threw — silent
             }
           }}
-          style={S.postShareBtn}
+          style={S.postIconBtn}
           aria-label="Share post"
         >
-          <span style={{ fontSize: 18, lineHeight: 1 }}>↗</span>
+          {/* Paper-airplane share icon, IG-style */}
+          <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#F0EBE0" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+            <line x1="22" y1="2" x2="11" y2="13" />
+            <polygon points="22 2 15 22 11 13 2 9 22 2" />
+          </svg>
         </button>
       </div>
 
-      {/* Caption */}
-      <div style={S.postCaption}>{post.caption}</div>
+      {/* Like count — Instagram-style bold "1,234 likes" line */}
+      {likeCount > 0 && (
+        <div style={S.postLikeCount}>
+          {likeCount === 1 ? '1 like' : `${likeCount.toLocaleString()} likes`}
+        </div>
+      )}
 
-      {/* Site link */}
-      <button onClick={onSiteTap} style={S.postSiteBtn}>
-        📍 {post.siteTitle || 'View site'}
-      </button>
+      {/* Caption — handle in bold inline with caption text, like IG */}
+      <div style={S.postCaptionLine}>
+        <button onClick={onHandleTap} style={S.postCaptionHandle}>{post.handle}</button>
+        <span style={S.postCaptionText}> {post.caption}</span>
+      </div>
     </div>
   );
+}
+
+// Instagram-style compact relative-time formatter. "5m" / "3h" / "1d" /
+// "2w". No "ago" suffix, no spelling out — just unit-letter pairs.
+function formatTimeAgoShort(iso: string): string {
+  if (!iso) return '';
+  const t = Date.parse(iso);
+  if (isNaN(t)) return '';
+  const secs = Math.max(0, (Date.now() - t) / 1000);
+  if (secs < 60) return 'now';
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return `${mins}m`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h`;
+  const days = Math.floor(hrs / 24);
+  if (days < 7) return `${days}d`;
+  const weeks = Math.floor(days / 7);
+  if (weeks < 52) return `${weeks}w`;
+  return `${Math.floor(weeks / 52)}y`;
 }
 
 // Compact relative-time formatter. "5m ago", "3h ago", "2d ago".
@@ -7794,53 +7856,175 @@ const S: Record<string, React.CSSProperties> = {
     maxWidth: 600,
     margin: '0 auto',
   },
+  // ---- Instagram-style post card ----
+  // No card border or background — cards bleed into the black page so
+  // photos look edge-to-edge like Instagram. Only the photo itself has
+  // a small corner radius (per Drew's request for slightly rounded edges).
   postCard: {
-    backgroundColor: 'rgba(20,20,20,0.85)',
-    border: `1px solid #2a2a2a`,
-    borderRadius: 14,
-    overflow: 'hidden',
-    boxShadow: `0 4px 18px rgba(0,0,0,0.5)`,
+    backgroundColor: 'transparent',
+    border: 'none',
+    borderRadius: 0,
+    overflow: 'visible',
+    marginBottom: 20,
   },
   postHeader: {
     display: 'flex',
-    justifyContent: 'space-between',
     alignItems: 'center',
-    padding: '10px 14px',
+    gap: 10,
+    padding: '8px 12px',
+  },
+  // Avatar — 36px circle with a thin neon-purple ring to keep the
+  // eXposure identity visible on the otherwise IG-neutral card.
+  postAvatarBtn: {
+    width: 36,
+    height: 36,
+    minWidth: 36,
+    borderRadius: '50%',
+    padding: 0,
+    background: 'linear-gradient(45deg, #BF40FF, #FF3B5C)',
+    border: 'none',
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    overflow: 'hidden' as const,
+  },
+  postAvatarImg: {
+    width: 32,
+    height: 32,
+    borderRadius: '50%',
+    objectFit: 'cover' as const,
+    backgroundColor: '#000',
+    border: '2px solid #000',
+    pointerEvents: 'none' as const,
+  },
+  postHeaderTextCol: {
+    flex: 1,
+    display: 'flex',
+    flexDirection: 'column' as const,
+    minWidth: 0,
+  },
+  postHeaderLine1: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 6,
+  },
+  postHeaderDot: {
+    color: '#888',
+    fontSize: 13,
   },
   postHandle: {
     color: '#F0EBE0',
-    fontSize: 18,
-    fontWeight: 700,
-    letterSpacing: '0.04em',
-  },
-  postHandleBtn: {
-    color: '#BF40FF',
     fontSize: 14,
     fontWeight: 700,
-    letterSpacing: '0.04em',
+  },
+  // Inline tappable handle — looks like text, behaves like a link.
+  // No purple glow on the post card (different visual context than the
+  // bottom bar); pure white IG-style.
+  postHandleBtn: {
+    color: '#F0EBE0',
+    fontSize: 14,
+    fontWeight: 700,
+    letterSpacing: 0,
     backgroundColor: 'transparent',
     border: 'none',
     padding: 0,
     cursor: 'pointer',
-    textShadow: `0 0 6px #BF40FF55`,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
   },
   postTime: {
     color: '#888',
-    fontSize: 12,
+    fontSize: 13,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
   },
+  // Location chip below the handle — Instagram-style small location text.
+  // Tappable; opens the site detail page. Only rendered for site-tagged
+  // posts (freeform posts don't have a siteTitle).
+  postLocationBtn: {
+    alignSelf: 'flex-start' as const,
+    color: '#F0EBE0',
+    fontSize: 12,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    backgroundColor: 'transparent',
+    border: 'none',
+    padding: '1px 0 0 0',
+    cursor: 'pointer',
+    textAlign: 'left' as const,
+  },
+  postMenuBtn: {
+    color: '#F0EBE0',
+    fontSize: 22,
+    backgroundColor: 'transparent',
+    border: 'none',
+    padding: '0 4px',
+    cursor: 'pointer',
+    lineHeight: 1,
+    opacity: 0.6,
+  },
+  // Photo — slightly rounded corners (8px) per request. Edge-to-edge
+  // otherwise. aspectRatio 1:1 keeps cards predictable on a vertical feed.
   postPhoto: {
     width: '100%',
     display: 'block',
     aspectRatio: '1 / 1',
     objectFit: 'cover' as const,
     backgroundColor: '#111',
+    borderRadius: 8,
   },
+  // Actions row — Instagram-style outlined icons, left-aligned with
+  // share pushed to the right via the spacer between buttons.
   postActions: {
     display: 'flex',
     alignItems: 'center',
-    gap: 14,
-    padding: '8px 14px 4px',
+    gap: 12,
+    padding: '8px 12px 2px',
   },
+  postIconBtn: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    width: 32,
+    height: 32,
+    backgroundColor: 'transparent',
+    border: 'none',
+    cursor: 'pointer',
+    padding: 0,
+    WebkitTapHighlightColor: 'transparent' as any,
+  },
+  // Bold "1,234 likes" line above the caption. Matches IG.
+  postLikeCount: {
+    padding: '2px 14px',
+    color: '#F0EBE0',
+    fontSize: 14,
+    fontWeight: 700,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  // Caption line — handle in bold inline, then caption text. IG-style
+  // wrapping where the handle and caption flow as one paragraph.
+  postCaptionLine: {
+    padding: '4px 14px 8px',
+    color: '#F0EBE0',
+    fontSize: 14,
+    lineHeight: 1.4,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  postCaptionHandle: {
+    color: '#F0EBE0',
+    fontSize: 14,
+    fontWeight: 700,
+    backgroundColor: 'transparent',
+    border: 'none',
+    padding: 0,
+    cursor: 'pointer',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  postCaptionText: {
+    color: '#F0EBE0',
+    fontSize: 14,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  // ---- Deprecated post styles (kept for backwards compat in case other
+  // code references them; not used by the current SocialPostCard) ----
   postLikeBtn: {
     display: 'flex',
     alignItems: 'center',
@@ -7866,7 +8050,7 @@ const S: Record<string, React.CSSProperties> = {
   postCaption: {
     padding: '4px 14px 10px',
     color: '#E8E5DC',
-    fontSize: 18,
+    fontSize: 14,
     lineHeight: 1.45,
   },
   postSiteBtn: {
@@ -7877,8 +8061,6 @@ const S: Record<string, React.CSSProperties> = {
     backgroundColor: 'rgba(191,64,255,0.06)',
     borderTop: `1px solid #2a2a2a`,
     border: 'none',
-    borderBottomLeftRadius: 14,
-    borderBottomRightRadius: 14,
     color: '#BF40FF',
     fontSize: 13,
     fontWeight: 600,
