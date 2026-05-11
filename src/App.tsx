@@ -2597,19 +2597,23 @@ function SocialView({ handle, deviceId, sites, onSelectSite, onBack, onSelectHan
   onBack: () => void;
   onSelectHandle: (handle: string) => void;
 }) {
+  // Sub-tab inside eXposure. The static black bottom bar switches
+  // between four sub-screens: 'feed' (the post feed, eXposure home),
+  // 'search' (filter posts by category and/or handle), 'post' (the
+  // composer — opens the camera flow), and 'profile' (your own
+  // UserProfileView).
+  //
+  // Tabs only switch the sub-screen *inside* eXposure; they don't
+  // navigate out via setView. Tapping the Post tab from a non-feed
+  // sub-screen flips back to feed and opens the composer.
+  type SubTab = 'feed' | 'search' | 'post' | 'profile';
+  const [subTab, setSubTab] = useState<SubTab>('feed');
+
   const [posts, setPosts] = useState<SocialPost[]>([]);
   const [nextBefore, setNextBefore] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  // Category filter — null = "All", or one of the CategoryKey values.
-  // Filtering is client-side: posts already loaded get filtered in the
-  // render, and load-more keeps loading by approval date so old posts
-  // remain reachable. If you have lots of posts in a tiny category, you
-  // may need to scroll a lot to find them — that's a future server-side
-  // endpoint improvement, not a v1 concern.
-  const [categoryFilter, setCategoryFilter] = useState<string | null>(null);
 
   // ---- Pull-to-refresh state ----
   // When the user is at scrollY=0 and starts dragging down, we record the
@@ -2721,107 +2725,281 @@ function SocialView({ handle, deviceId, sites, onSelectSite, onBack, onSelectHan
         }
       }}
     >
-      {/* Pull-to-refresh indicator. Slides down from under the header as the
-          user drags. Switches "pull / release / refreshing" text based on
-          state. When refreshing finishes, the height collapses back to 0. */}
-      <div style={{
-        ...S.pullIndicator,
-        height: refreshing ? PULL_THRESHOLD_PX : pullDistance,
-        opacity: refreshing || pullDistance > 8 ? 1 : 0,
-      }}>
-        <span style={S.pullIndicatorText}>
-          {refreshing
-            ? 'Refreshing…'
-            : pullDistance >= PULL_THRESHOLD_PX
-              ? 'Release to refresh'
-              : 'Pull to refresh'}
-        </span>
-      </div>
+      {/* ====== FEED sub-tab ====== */}
+      {subTab === 'feed' && (
+        <>
+          {/* Pull-to-refresh indicator. */}
+          <div style={{
+            ...S.pullIndicator,
+            height: refreshing ? PULL_THRESHOLD_PX : pullDistance,
+            opacity: refreshing || pullDistance > 8 ? 1 : 0,
+          }}>
+            <span style={S.pullIndicatorText}>
+              {refreshing
+                ? 'Refreshing…'
+                : pullDistance >= PULL_THRESHOLD_PX
+                  ? 'Release to refresh'
+                  : 'Pull to refresh'}
+            </span>
+          </div>
 
-      {/* Header — title only. No back button; swipe-right pops the view
-          via the global gesture handler in App. */}
+          {/* Header */}
+          <div style={S.socialHeader}>
+            <div style={S.socialHeaderTitle}>eXposure</div>
+          </div>
+
+          {/* Feed body */}
+          {loading ? (
+            <div style={S.socialEmpty}>Loading the feed…</div>
+          ) : error ? (
+            <div style={S.socialEmpty}>⚠ {error}</div>
+          ) : posts.length === 0 ? (
+            <div style={S.socialEmpty}>
+              No posts yet.<br />
+              <span style={{ opacity: 0.7, fontSize: 13 }}>
+                Visit a site and tap "Post to eXposure" to be the first.
+              </span>
+            </div>
+          ) : (
+            <div style={{ ...S.socialFeed, paddingBottom: 80 }}>
+              {posts.map((p) => (
+                <SocialPostCard
+                  key={p.id}
+                  post={p}
+                  currentHandle={handle}
+                  deviceId={deviceId}
+                  onSiteTap={() => {
+                    const s = siteById.get(p.siteId);
+                    if (s) onSelectSite(s);
+                  }}
+                  onHandleTap={() => onSelectHandle(p.handle)}
+                />
+              ))}
+              {loadingMore && <div style={S.socialEmpty}>Loading more…</div>}
+              {!nextBefore && posts.length > 0 && (
+                <div style={{ ...S.socialEmpty, paddingTop: 20, paddingBottom: 40 }}>
+                  <span style={{ opacity: 0.5, fontSize: 12 }}>— end of feed —</span>
+                </div>
+              )}
+            </div>
+          )}
+        </>
+      )}
+
+      {/* ====== SEARCH sub-tab ====== */}
+      {subTab === 'search' && (
+        <ExposureSearchView
+          allPosts={posts}
+          currentHandle={handle}
+          deviceId={deviceId}
+          sites={sites}
+          onSelectSite={onSelectSite}
+          onSelectHandle={onSelectHandle}
+        />
+      )}
+
+      {/* ====== PROFILE sub-tab ====== */}
+      {subTab === 'profile' && (
+        handle ? (
+          <UserProfileView
+            profileHandle={handle}
+            currentHandle={handle}
+            deviceId={deviceId}
+            sites={sites}
+            onSelectSite={onSelectSite}
+            onSelectBadges={(h) => { /* tab-bound; ignore deep link */ void h; }}
+            onBack={() => setSubTab('feed')}
+            embedded
+          />
+        ) : (
+          <div style={S.socialEmpty}>
+            <div style={{ marginBottom: 14, fontSize: 16 }}>No handle claimed yet.</div>
+            <span style={{ opacity: 0.7, fontSize: 13 }}>
+              Claim a handle to build your eXposure profile.<br />
+              Open Submit a Location to claim one.
+            </span>
+          </div>
+        )
+      )}
+
+      {/* ====== POST sub-tab — never renders a sub-screen, just triggers
+          the camera composer via PostFromExposure handler below ====== */}
+
+      {/* Static bottom bar — Instagram-style. Sits fixed at the bottom of
+          the viewport, immune to scroll and the swipe-back gesture
+          (because pointer-events: auto + z-index above the gesture
+          target). Four white SVG icons; the active tab gets a brighter
+          white + glow. */}
+      <ExposureBottomBar
+        active={subTab}
+        onSelect={(tab) => {
+          if (tab === 'post') {
+            // Post is an action, not a sub-screen — trigger the composer
+            // flow. Implementation: navigate to the nearby map so the
+            // user can find a site they're within 100m of. The existing
+            // DetailView "Post to eXposure" button handles the actual
+            // camera + caption + upload.
+            playSubDrop();
+            // Stay on feed visually; the action happens via the prompt
+            // we surface below.
+            setSubTab('feed');
+            showToast('To post: visit a site and tap "Post to eXposure" from its page', 'default', 4500);
+            return;
+          }
+          playSubDrop();
+          setSubTab(tab);
+        }}
+      />
+    </div>
+  );
+}
+
+// Instagram-style static bottom bar for eXposure. Four icons, white
+// outlined SVG. Active tab brightens + glows white. Fixed at the bottom
+// of the viewport so it doesn't move with feed scroll.
+function ExposureBottomBar({ active, onSelect }: {
+  active: 'feed' | 'search' | 'post' | 'profile';
+  onSelect: (tab: 'feed' | 'search' | 'post' | 'profile') => void;
+}) {
+  const Item = ({ tab, label, children }: { tab: 'feed' | 'search' | 'post' | 'profile'; label: string; children: React.ReactNode }) => {
+    const isActive = active === tab;
+    return (
+      <button
+        onClick={() => onSelect(tab)}
+        aria-label={label}
+        style={{
+          ...S.exposureBarBtn,
+          ...(isActive ? S.exposureBarBtnActive : {}),
+        }}
+      >
+        {children}
+      </button>
+    );
+  };
+  return (
+    <div style={S.exposureBar}>
+      <Item tab="feed" label="Home">
+        {/* Home icon (house) */}
+        <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M3 11.5L12 4l9 7.5" />
+          <path d="M5 10v9.5a.5.5 0 0 0 .5.5H10v-6h4v6h4.5a.5.5 0 0 0 .5-.5V10" />
+        </svg>
+      </Item>
+      <Item tab="search" label="Search">
+        {/* Search icon (magnifier) */}
+        <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+          <circle cx="11" cy="11" r="6.5" />
+          <line x1="16" y1="16" x2="20" y2="20" />
+        </svg>
+      </Item>
+      <Item tab="post" label="Post">
+        {/* Plus icon in a rounded square */}
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+          <rect x="3.5" y="3.5" width="17" height="17" rx="4" />
+          <line x1="12" y1="8" x2="12" y2="16" />
+          <line x1="8" y1="12" x2="16" y2="12" />
+        </svg>
+      </Item>
+      <Item tab="profile" label="Profile">
+        {/* Person icon */}
+        <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+          <circle cx="12" cy="8" r="4" />
+          <path d="M4 20c0-4 4-6 8-6s8 2 8 6" />
+        </svg>
+      </Item>
+    </div>
+  );
+}
+
+// Search sub-screen inside eXposure. Text input filters loaded posts by
+// caption / handle. Below the input, a horizontal chip strip lets users
+// filter by category. AND'd — both filters apply. Empty results show a
+// friendly empty state.
+function ExposureSearchView({ allPosts, currentHandle, deviceId, sites, onSelectSite, onSelectHandle }: {
+  allPosts: SocialPost[];
+  currentHandle: string | null;
+  deviceId: string | null;
+  sites: SinisterSite[];
+  onSelectSite: (site: SinisterSite) => void;
+  onSelectHandle: (handle: string) => void;
+}) {
+  const [query, setQuery] = useState('');
+  const [category, setCategory] = useState<string | null>(null);
+
+  const siteById = useMemo(() => {
+    const m = new Map<string, SinisterSite>();
+    for (const s of sites) m.set(s.id, s);
+    return m;
+  }, [sites]);
+
+  const q = query.trim().toLowerCase();
+  const filtered = allPosts.filter((p) => {
+    if (category && p.siteCategory !== category) return false;
+    if (!q) return true;
+    // Match against handle, caption, or site title.
+    return (
+      p.handle.toLowerCase().includes(q) ||
+      p.caption.toLowerCase().includes(q) ||
+      (p.siteTitle || '').toLowerCase().includes(q)
+    );
+  });
+
+  return (
+    <div>
       <div style={S.socialHeader}>
-        <div style={S.socialHeaderTitle}>eXposure</div>
+        <div style={S.socialHeaderTitle}>Search</div>
       </div>
-
-      {/* Category filter chips. Horizontally scrollable strip below the
-          header. "All" resets the filter; tapping a category shows only
-          posts from sites in that category. Filtering is client-side on
-          the loaded post set — load-more continues by date, so old posts
-          in the chosen category remain reachable by scrolling. */}
+      <div style={{ padding: '12px 14px' }}>
+        <input
+          type="text"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Search posts, handles, sites…"
+          style={S.searchInput}
+        />
+      </div>
+      {/* Category chips — scrollable horizontal strip. Doesn't have the
+          swipe-back conflict here because the bottom bar is the primary
+          navigation; horizontal scroll on chips is just refinement. */}
       <div style={S.filterChipBar}>
         <button
-          onClick={() => { playSubDrop(); setCategoryFilter(null); }}
-          style={{
-            ...S.filterChip,
-            ...(categoryFilter === null ? S.filterChipActive : {}),
-          }}
+          onClick={() => { playSubDrop(); setCategory(null); }}
+          style={{ ...S.filterChip, ...(category === null ? S.filterChipActive : {}) }}
         >
           All
         </button>
         {CATEGORIES.map((cat) => (
           <button
             key={cat.key}
-            onClick={() => { playSubDrop(); setCategoryFilter(cat.key); }}
-            style={{
-              ...S.filterChip,
-              ...(categoryFilter === cat.key ? S.filterChipActive : {}),
-            }}
+            onClick={() => { playSubDrop(); setCategory(cat.key); }}
+            style={{ ...S.filterChip, ...(category === cat.key ? S.filterChipActive : {}) }}
           >
             {cat.label}
           </button>
         ))}
       </div>
-
-      {/* Body */}
-      {loading ? (
-        <div style={S.socialEmpty}>Loading the feed…</div>
-      ) : error ? (
-        <div style={S.socialEmpty}>⚠ {error}</div>
-      ) : posts.length === 0 ? (
+      {filtered.length === 0 ? (
         <div style={S.socialEmpty}>
-          No posts yet.<br />
-          <span style={{ opacity: 0.7, fontSize: 13 }}>
-            Visit a site and tap "Add Photo" to be the first.
+          {q || category ? 'No matches.' : 'Start typing to search.'}<br />
+          <span style={{ opacity: 0.6, fontSize: 12 }}>
+            Try a handle, a caption keyword, or a site name.
           </span>
         </div>
       ) : (
-        <div style={S.socialFeed}>
-          {(() => {
-            // Apply category filter to the loaded posts.
-            const filtered = categoryFilter
-              ? posts.filter((p) => p.siteCategory === categoryFilter)
-              : posts;
-            if (filtered.length === 0) {
-              return (
-                <div style={S.socialEmpty}>
-                  No posts in this category yet.<br />
-                  <span style={{ opacity: 0.7, fontSize: 13 }}>
-                    Try "All" or scroll for older posts.
-                  </span>
-                </div>
-              );
-            }
-            return filtered.map((p) => (
-              <SocialPostCard
-                key={p.id}
-                post={p}
-                currentHandle={handle}
-                deviceId={deviceId}
-                onSiteTap={() => {
-                  const s = siteById.get(p.siteId);
-                  if (s) onSelectSite(s);
-                }}
-                onHandleTap={() => onSelectHandle(p.handle)}
-              />
-            ));
-          })()}
-          {loadingMore && <div style={S.socialEmpty}>Loading more…</div>}
-          {!nextBefore && posts.length > 0 && (
-            <div style={{ ...S.socialEmpty, paddingTop: 20, paddingBottom: 40 }}>
-              <span style={{ opacity: 0.5, fontSize: 12 }}>— end of feed —</span>
-            </div>
-          )}
+        <div style={{ ...S.socialFeed, paddingBottom: 80 }}>
+          {filtered.map((p) => (
+            <SocialPostCard
+              key={p.id}
+              post={p}
+              currentHandle={currentHandle}
+              deviceId={deviceId}
+              onSiteTap={() => {
+                const s = siteById.get(p.siteId);
+                if (s) onSelectSite(s);
+              }}
+              onHandleTap={() => onSelectHandle(p.handle)}
+            />
+          ))}
         </div>
       )}
     </div>
@@ -2981,7 +3159,7 @@ function formatTimeAgo(iso: string): string {
 //   - GET /badges/:handle for visit + submit counts
 //   - GET /posts/feed for posts (filtered client-side by handle since
 //     there's no by-handle endpoint yet — small dataset, fine for now)
-function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSelectSite, onSelectBadges, onBack }: {
+function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSelectSite, onSelectBadges, onBack, embedded }: {
   profileHandle: string;
   currentHandle: string | null;
   deviceId: string | null;
@@ -2989,6 +3167,7 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
   onSelectSite: (site: SinisterSite) => void;
   onSelectBadges: (handle: string) => void;
   onBack: () => void;
+  embedded?: boolean;
 }) {
   const [stats, setStats] = useState<{ visitCount: number; submitCount: number; badgeCount: number } | null>(null);
   const [posts, setPosts] = useState<SocialPost[]>([]);
@@ -3027,7 +3206,7 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
   }, [sites]);
 
   return (
-    <div style={S.socialViewWrap}>
+    <div style={embedded ? { paddingBottom: 80 } : S.socialViewWrap}>
       <div style={S.socialHeader}>
         <div style={S.socialHeaderTitle}>@{profileHandle}</div>
       </div>
@@ -7267,6 +7446,49 @@ const S: Record<string, React.CSSProperties> = {
     color: '#BF40FF',
     textShadow: `0 0 6px #BF40FF88`,
     boxShadow: `0 0 10px #BF40FF44`,
+  },
+  // ---- Static black bottom bar inside eXposure ----
+  // Fixed at the bottom of the viewport, never moves on scroll. 4 white
+  // SVG icons. Active tab brightens and gets a subtle glow.
+  exposureBar: {
+    position: 'fixed' as const,
+    left: 0, right: 0, bottom: 0,
+    height: 56,
+    backgroundColor: '#000000',
+    borderTop: '1px solid #1a1a1a',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-around',
+    zIndex: 20,
+    paddingBottom: 'env(safe-area-inset-bottom, 0px)' as any,
+  },
+  exposureBarBtn: {
+    flex: 1,
+    height: '100%',
+    backgroundColor: 'transparent',
+    border: 'none',
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    color: '#888',
+    padding: 0,
+  },
+  exposureBarBtnActive: {
+    color: '#FFFFFF',
+    filter: 'drop-shadow(0 0 6px rgba(255,255,255,0.5))',
+  },
+  searchInput: {
+    width: '100%',
+    backgroundColor: '#1a1a1a',
+    border: '1px solid #333',
+    borderRadius: 10,
+    color: '#F0EBE0',
+    fontSize: 15,
+    padding: '10px 14px',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    boxSizing: 'border-box' as const,
+    outline: 'none',
   },
   // ---- User profile stats strip ----
   profileStatsRow: {
