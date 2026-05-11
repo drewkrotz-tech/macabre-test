@@ -6853,11 +6853,10 @@ const S: Record<string, React.CSSProperties> = {
     backgroundColor: 'rgba(0,0,0,0.45)',
     border: `1.5px solid ${WHITE}`,
     color: WHITE,
-    fontFamily: 'system-ui, -apple-system, sans-serif',
+    fontFamily: '"Jolly Lodger", system-ui, serif',
     fontSize: 14,
-    fontWeight: 700,
-    letterSpacing: '0.18em',
-    textTransform: 'uppercase' as const,
+    fontWeight: 400,
+    letterSpacing: '0.04em',
     padding: '10px 12px',
     borderRadius: 14,
     cursor: 'pointer',
@@ -6875,21 +6874,22 @@ const S: Record<string, React.CSSProperties> = {
     boxShadow: `0 0 16px ${WHITE}88, 0 0 28px ${WHITE}33`,
     textShadow: `0 0 8px ${WHITE}aa`,
   },
-  // Acid-green variant used by the middle "Social" button on the home
+  // Acid-green variant used by the middle "eXposure" button on the home
   // bottom bar. Same shape as socialBtn but with a chartreuse outline +
   // green glow so the live community feed entry point pops against the
-  // monochrome List View / More buttons flanking it.
+  // monochrome List View / More buttons flanking it. Jolly Lodger font
+  // (vs system-ui) lets the lowercase-e / capital-X treatment of
+  // "eXposure" render properly — no textTransform uppercase mangling.
   socialBtnHighlight: {
     flex: 1,
     maxWidth: 200,
     backgroundColor: 'rgba(0,0,0,0.45)',
     border: `1.5px solid #7FFF00`,
     color: '#7FFF00',
-    fontFamily: 'system-ui, -apple-system, sans-serif',
+    fontFamily: '"Jolly Lodger", system-ui, serif',
     fontSize: 14,
-    fontWeight: 700,
-    letterSpacing: '0.18em',
-    textTransform: 'uppercase' as const,
+    fontWeight: 400,
+    letterSpacing: '0.04em',
     padding: '10px 12px',
     borderRadius: 14,
     cursor: 'pointer',
