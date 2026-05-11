@@ -1163,6 +1163,18 @@ function buildStyleCss() {
      behind them can drop frames mid-animation. */
   will-change: opacity, transform, filter;
 }
+
+/* iOS-style press feedback for icon buttons (home bottom bar icons,
+   eXposure bottom bar icons). Scale-down + dim on :active. Snappy
+   transition: fast on press, slightly slower on release. */
+.sinister-icon-btn {
+  transition: transform 80ms ease-out, opacity 80ms ease-out;
+}
+.sinister-icon-btn:active {
+  transform: scale(0.88);
+  opacity: 0.7;
+  transition: transform 50ms ease-in, opacity 50ms ease-in;
+}
 `;
 
   // ---- Projector / slide-mount visual effects ----
@@ -1472,8 +1484,25 @@ export default function App() {
       : 0;
     _setViewRaw((prev) => {
       if (JSON.stringify(prev) !== JSON.stringify(next)) {
-        _navHistory.current.push({ view: prev, scrollY: sy });
-        if (_navHistory.current.length > 50) _navHistory.current.shift();
+        // Home-bar destinations are peer pages reachable directly from
+        // home. If the user is hopping between peers (List View →
+        // eXposure → Dread Leaders → About), swipe-back should bring
+        // them straight back to home, not retrace every peer. To do
+        // that, when both the previous view AND the new view are home
+        // peers, we collapse them: pop any peer that's at the top of
+        // the stack BEFORE pushing the new one. The first peer push
+        // (from home) still records home below it, so swipe-back from
+        // any peer always lands on home.
+        const homePeers = new Set(['list', 'social', 'leaders', 'about']);
+        const prevIsPeer = homePeers.has(prev.name);
+        const nextIsPeer = homePeers.has(next.name);
+        if (prevIsPeer && nextIsPeer) {
+          // Don't push prev. The peer at the top of the stack already
+          // points back to home (or further); leave it.
+        } else {
+          _navHistory.current.push({ view: prev, scrollY: sy });
+          if (_navHistory.current.length > 50) _navHistory.current.shift();
+        }
       }
       return next;
     });
@@ -2519,28 +2548,28 @@ function HomeBottomBar({ onLeaders, onList, onAbout, onSocial }: {
   return (
     <div style={S.homeBar}>
       <button
-        style={S.homeBarBtn}
+        className="sinister-icon-btn" style={S.homeBarBtn}
         onClick={() => { playSubDrop(); onList(); }}
       >
         <img src={listIconUrl} alt="" style={S.homeBarIcon} />
         <span style={S.homeBarLabel}>List View</span>
       </button>
       <button
-        style={S.homeBarBtn}
+        className="sinister-icon-btn" style={S.homeBarBtn}
         onClick={() => { playBackSound(); onSocial(); }}
       >
         <img src={exposureIconUrl} alt="" style={S.homeBarIcon} />
         <span style={S.homeBarLabel}>eXposure</span>
       </button>
       <button
-        style={S.homeBarBtn}
+        className="sinister-icon-btn" style={S.homeBarBtn}
         onClick={() => { playSubDrop(); onLeaders(); }}
       >
         <img src={leaderIconUrl} alt="" style={S.homeBarIcon} />
         <span style={S.homeBarLabel}>Dread Leaders</span>
       </button>
       <button
-        style={S.homeBarBtn}
+        className="sinister-icon-btn" style={S.homeBarBtn}
         onClick={() => { playSubDrop(); onAbout(); }}
       >
         <img src={aboutIconUrl} alt="" style={S.homeBarIcon} />
@@ -2858,6 +2887,7 @@ function ExposureBottomBar({ active, onSelect }: {
       <button
         onClick={() => onSelect(tab)}
         aria-label={label}
+        className="sinister-icon-btn"
         style={{
           ...S.exposureBarBtn,
           ...(isActive ? S.exposureBarBtnActive : {}),
@@ -7457,13 +7487,17 @@ const S: Record<string, React.CSSProperties> = {
   homeBar: {
     position: 'fixed' as const,
     left: 0, right: 0,
-    bottom: 14,
+    // Anchor at the very bottom edge (with safe-area padding handling
+    // the home-indicator clearance via paddingBottom below). This
+    // pulls the icons down significantly vs the old bottom: 14 which
+    // was pushing them up into the Submit button's space.
+    bottom: 0,
     zIndex: 10,
     display: 'flex',
     justifyContent: 'space-around',
     alignItems: 'flex-end',
     gap: 4,
-    padding: '0 12px',
+    padding: '0 12px 2px 12px',
     boxSizing: 'border-box' as const,
     paddingBottom: 'env(safe-area-inset-bottom, 0px)' as any,
   },
@@ -7476,8 +7510,15 @@ const S: Record<string, React.CSSProperties> = {
     display: 'flex',
     flexDirection: 'column' as const,
     alignItems: 'center',
-    gap: 4,
-    padding: '4px 0',
+    gap: 2,
+    padding: '2px 0 0 0',
+    // iOS-style press feedback: scale-down + dim on tap. Uses CSS class
+    // "sinister-icon-btn" defined in the global stylesheet so :active
+    // pseudo-state can drive the animation (inline styles can't).
+    WebkitTapHighlightColor: 'transparent' as any,
+    WebkitTouchCallout: 'none' as any,        // disables iOS long-press "Save Image"
+    WebkitUserSelect: 'none' as any,
+    userSelect: 'none' as const,
   },
   homeBarIcon: {
     width: 58,
@@ -7485,10 +7526,13 @@ const S: Record<string, React.CSSProperties> = {
     borderRadius: 13,
     display: 'block',
     objectFit: 'cover' as const,
-    // Subtle drop shadow so the icons feel lifted off the background
-    // (matches iOS home-screen icon shadow). No outline / border —
-    // the icons already carry their own rounded-square chrome.
     filter: 'drop-shadow(0 2px 6px rgba(0,0,0,0.6))',
+    // Belt-and-suspenders: disable iOS long-press / drag on the
+    // image itself, not just its parent button.
+    WebkitTouchCallout: 'none' as any,
+    WebkitUserSelect: 'none' as any,
+    userSelect: 'none' as const,
+    pointerEvents: 'none' as const,           // taps go to the button, not the img
   },
   homeBarLabel: {
     fontSize: 11,
