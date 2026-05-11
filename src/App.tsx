@@ -2636,13 +2636,10 @@ function SocialView({ handle, deviceId, sites, onSelectSite, onBack }: {
 
   return (
     <div style={S.socialViewWrap}>
-      {/* Header with back button */}
+      {/* Header — title only. No back button; swipe-right pops the view
+          via the global gesture handler in App. */}
       <div style={S.socialHeader}>
-        <button onClick={() => { playBackSound(); onBack(); }} style={S.socialBackBtn}>
-          ‹ Back
-        </button>
         <div style={S.socialHeaderTitle}>eXposure</div>
-        <div style={{ width: 60 }} /> {/* spacer to center title */}
       </div>
 
       {/* Body */}
@@ -3919,7 +3916,7 @@ function StateListView({ sites, category, categoryLabel, color, onSelectState, o
                     display: 'flex',
                     alignItems: 'center',
                     justifyContent: 'center',
-                    fontSize: 14,
+                    fontSize: 18,
                     fontWeight: 700,
                     letterSpacing: '0.14em',
                     fontFamily: 'Georgia, "Times New Roman", serif',
@@ -5449,7 +5446,7 @@ function DetailView({ site, currentLocation, handle, deviceId, alreadyVisited, o
                 boxShadow: 'none',
                 cursor: 'not-allowed',
                 marginBottom: 12,
-                fontSize: 14,
+                fontSize: 18,
               }}
             >
               {distM != null ? 'Get within 100m to claim location' : 'Locating…'}
@@ -5641,7 +5638,7 @@ function AddPhotoButton({ site, handle, deviceId, currentLocation, onPosted }: {
                 type="checkbox"
                 checked={alsoShare}
                 onChange={(e) => setAlsoShare(e.target.checked)}
-                style={{ accentColor: '#7FFF00', width: 16, height: 16 }}
+                style={{ accentColor: '#BF40FF', width: 16, height: 16 }}
               />
               Also share to Messages / Instagram / X
             </label>
@@ -6289,7 +6286,7 @@ const S: Record<string, React.CSSProperties> = {
   },
   latestSpotlightTitle: {
     fontFamily: 'system-ui, -apple-system, sans-serif',
-    fontSize: 14,
+    fontSize: 18,
     fontWeight: 700,
     letterSpacing: '0.06em',
     color: WHITE,
@@ -6675,7 +6672,7 @@ const S: Record<string, React.CSSProperties> = {
     minHeight: 60,
   },
   stateRowName: {
-    fontSize: 14,
+    fontSize: 18,
     fontWeight: 600,
     letterSpacing: '0.03em',
     color: '#FFFFFF',
@@ -6854,7 +6851,7 @@ const S: Record<string, React.CSSProperties> = {
     border: `1.5px solid ${WHITE}`,
     color: WHITE,
     fontFamily: '"Jolly Lodger", system-ui, serif',
-    fontSize: 14,
+    fontSize: 18,
     fontWeight: 400,
     letterSpacing: '0.04em',
     padding: '10px 12px',
@@ -6874,9 +6871,9 @@ const S: Record<string, React.CSSProperties> = {
     boxShadow: `0 0 16px ${WHITE}88, 0 0 28px ${WHITE}33`,
     textShadow: `0 0 8px ${WHITE}aa`,
   },
-  // Acid-green variant used by the middle "eXposure" button on the home
-  // bottom bar. Same shape as socialBtn but with a chartreuse outline +
-  // green glow so the live community feed entry point pops against the
+  // Neon-purple variant used by the middle "eXposure" button on the home
+  // bottom bar. Same shape as socialBtn but with a magenta-purple outline +
+  // glow so the live community feed entry point pops against the
   // monochrome List View / More buttons flanking it. Jolly Lodger font
   // (vs system-ui) lets the lowercase-e / capital-X treatment of
   // "eXposure" render properly — no textTransform uppercase mangling.
@@ -6884,10 +6881,10 @@ const S: Record<string, React.CSSProperties> = {
     flex: 1,
     maxWidth: 200,
     backgroundColor: 'rgba(0,0,0,0.45)',
-    border: `1.5px solid #7FFF00`,
-    color: '#7FFF00',
+    border: `1.5px solid #BF40FF`,
+    color: '#BF40FF',
     fontFamily: '"Jolly Lodger", system-ui, serif',
-    fontSize: 14,
+    fontSize: 18,
     fontWeight: 400,
     letterSpacing: '0.04em',
     padding: '10px 12px',
@@ -6897,13 +6894,13 @@ const S: Record<string, React.CSSProperties> = {
     alignItems: 'center',
     justifyContent: 'center',
     gap: 6,
-    boxShadow: `0 0 14px #7FFF0066, inset 0 0 8px #7FFF0022`,
-    textShadow: `0 0 8px #7FFF00aa`,
+    boxShadow: `0 0 14px #BF40FF66, inset 0 0 8px #BF40FF22`,
+    textShadow: `0 0 8px #BF40FFaa`,
     backdropFilter: 'blur(2px)',
   },
-  socialLabelHighlight: { fontSize: 14, color: '#7FFF00' },
+  socialLabelHighlight: { fontSize: 18, color: '#BF40FF' },
   socialIcon: { fontSize: 16, lineHeight: 1 },
-  socialLabel: { fontSize: 14 },
+  socialLabel: { fontSize: 18 },
 
   // ---- Social feed view ----
   socialViewWrap: {
@@ -6918,31 +6915,19 @@ const S: Record<string, React.CSSProperties> = {
     zIndex: 5,
     display: 'flex',
     alignItems: 'center',
-    justifyContent: 'space-between',
+    justifyContent: 'center',
     padding: '14px 16px',
     backgroundColor: 'rgba(10,10,10,0.85)',
     backdropFilter: 'blur(8px)',
-    borderBottom: `1px solid #7FFF0044`,
-  },
-  socialBackBtn: {
-    backgroundColor: 'transparent',
-    border: 'none',
-    color: '#7FFF00',
-    fontSize: 16,
-    fontWeight: 700,
-    letterSpacing: '0.06em',
-    cursor: 'pointer',
-    padding: 4,
-    minWidth: 60,
-    textAlign: 'left' as const,
+    borderBottom: `1px solid #BF40FF44`,
   },
   socialHeaderTitle: {
-    color: '#7FFF00',
-    fontSize: 18,
-    fontWeight: 800,
-    letterSpacing: '0.22em',
-    textTransform: 'uppercase' as const,
-    textShadow: `0 0 10px #7FFF00aa`,
+    color: '#BF40FF',
+    fontSize: 22,
+    fontFamily: '"Jolly Lodger", system-ui, serif',
+    fontWeight: 400,
+    letterSpacing: '0.04em',
+    textShadow: `0 0 10px #BF40FFaa`,
   },
   socialEmpty: {
     textAlign: 'center' as const,
@@ -6974,7 +6959,7 @@ const S: Record<string, React.CSSProperties> = {
   },
   postHandle: {
     color: '#F0EBE0',
-    fontSize: 14,
+    fontSize: 18,
     fontWeight: 700,
     letterSpacing: '0.04em',
   },
@@ -7007,7 +6992,7 @@ const S: Record<string, React.CSSProperties> = {
   postCaption: {
     padding: '4px 14px 10px',
     color: '#E8E5DC',
-    fontSize: 14,
+    fontSize: 18,
     lineHeight: 1.45,
   },
   postSiteBtn: {
@@ -7015,12 +7000,12 @@ const S: Record<string, React.CSSProperties> = {
     width: '100%',
     textAlign: 'left' as const,
     padding: '10px 14px',
-    backgroundColor: 'rgba(127,255,0,0.06)',
+    backgroundColor: 'rgba(191,64,255,0.06)',
     borderTop: `1px solid #2a2a2a`,
     border: 'none',
     borderBottomLeftRadius: 14,
     borderBottomRightRadius: 14,
-    color: '#7FFF00',
+    color: '#BF40FF',
     fontSize: 13,
     fontWeight: 600,
     letterSpacing: '0.04em',
@@ -7032,18 +7017,18 @@ const S: Record<string, React.CSSProperties> = {
     width: '100%',
     padding: '14px 16px',
     marginTop: 12,
-    backgroundColor: 'rgba(127,255,0,0.08)',
-    border: `2px solid #7FFF00`,
-    color: '#7FFF00',
+    backgroundColor: 'rgba(191,64,255,0.08)',
+    border: `2px solid #BF40FF`,
+    color: '#BF40FF',
     fontFamily: 'system-ui, -apple-system, sans-serif',
-    fontSize: 14,
+    fontSize: 18,
     fontWeight: 700,
     letterSpacing: '0.18em',
     textTransform: 'uppercase' as const,
     borderRadius: 12,
     cursor: 'pointer',
-    boxShadow: `0 0 14px #7FFF0055, inset 0 0 10px #7FFF0022`,
-    textShadow: `0 0 8px #7FFF00aa`,
+    boxShadow: `0 0 14px #BF40FF55, inset 0 0 10px #BF40FF22`,
+    textShadow: `0 0 8px #BF40FFaa`,
   },
   addPhotoBtnDisabled: {
     width: '100%',
@@ -7074,17 +7059,17 @@ const S: Record<string, React.CSSProperties> = {
     width: '100%',
     maxWidth: 460,
     backgroundColor: '#141414',
-    border: `1.5px solid #7FFF00`,
+    border: `1.5px solid #BF40FF`,
     borderRadius: 16,
     padding: 18,
-    boxShadow: `0 0 30px #7FFF0033`,
+    boxShadow: `0 0 30px #BF40FF33`,
     display: 'flex',
     flexDirection: 'column' as const,
     gap: 14,
   },
   postComposerTitle: {
-    color: '#7FFF00',
-    fontSize: 14,
+    color: '#BF40FF',
+    fontSize: 18,
     fontWeight: 800,
     letterSpacing: '0.22em',
     textTransform: 'uppercase' as const,
@@ -7103,7 +7088,7 @@ const S: Record<string, React.CSSProperties> = {
     border: `1px solid #333`,
     borderRadius: 8,
     color: '#F0EBE0',
-    fontSize: 14,
+    fontSize: 18,
     padding: '10px 12px',
     fontFamily: 'system-ui, -apple-system, sans-serif',
     resize: 'none' as const,
@@ -7139,16 +7124,16 @@ const S: Record<string, React.CSSProperties> = {
   postComposerSubmit: {
     flex: 1.4,
     padding: '12px',
-    backgroundColor: 'rgba(127,255,0,0.1)',
-    border: `1.5px solid #7FFF00`,
-    color: '#7FFF00',
+    backgroundColor: 'rgba(191,64,255,0.1)',
+    border: `1.5px solid #BF40FF`,
+    color: '#BF40FF',
     fontSize: 13,
     fontWeight: 700,
     letterSpacing: '0.18em',
     textTransform: 'uppercase' as const,
     borderRadius: 10,
     cursor: 'pointer',
-    boxShadow: `0 0 12px #7FFF0044`,
+    boxShadow: `0 0 12px #BF40FF44`,
   },
   postComposerSubmitDisabled: {
     flex: 1.4,
@@ -7494,7 +7479,7 @@ const S: Record<string, React.CSSProperties> = {
     background: '#150808',
   },
   leaderRank: {
-    fontSize: 14,
+    fontSize: 18,
     fontWeight: 900,
     color: '#666',
     minWidth: 24,
@@ -7502,7 +7487,7 @@ const S: Record<string, React.CSSProperties> = {
   },
   leaderHandle: {
     flex: 1,
-    fontSize: 14,
+    fontSize: 18,
     fontWeight: 700,
     letterSpacing: '0.05em',
     overflow: 'hidden' as const,
@@ -7713,7 +7698,7 @@ const S: Record<string, React.CSSProperties> = {
   },
   listRowTitle: {
     flex: 1,
-    fontSize: 14,
+    fontSize: 18,
     fontWeight: 700,
     letterSpacing: '0.04em',
     overflow: 'hidden' as const,
@@ -7773,7 +7758,7 @@ const S: Record<string, React.CSSProperties> = {
     border: `1.5px solid ${BLUE}`,
     borderRadius: 14,
     padding: '12px 40px 12px 16px',
-    fontSize: 14,
+    fontSize: 18,
     fontFamily: 'inherit',
     outline: 'none',
     boxShadow: `0 0 12px ${BLUE}33`,
@@ -7868,7 +7853,7 @@ const S: Record<string, React.CSSProperties> = {
     border: `1.5px solid ${GRAY_MID}`,
     borderRadius: 12,
     padding: '12px 14px',
-    fontSize: 14,
+    fontSize: 18,
     fontFamily: 'inherit',
     outline: 'none',
     width: '100%',
@@ -7924,7 +7909,7 @@ const S: Record<string, React.CSSProperties> = {
     width: '100%',
     padding: '16px',
     backgroundColor: BLACK,
-    fontSize: 14,
+    fontSize: 18,
     fontWeight: 900,
     letterSpacing: '0.2em',
     fontFamily: 'inherit',
