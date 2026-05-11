@@ -2584,7 +2584,6 @@ function SocialView({ handle, deviceId, sites, onSelectSite, onBack }: {
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [fullscreenUrl, setFullscreenUrl] = useState<string | null>(null);
 
   // Initial load
   useEffect(() => {
@@ -2666,7 +2665,6 @@ function SocialView({ handle, deviceId, sites, onSelectSite, onBack }: {
               post={p}
               currentHandle={handle}
               deviceId={deviceId}
-              onPhotoTap={() => setFullscreenUrl(p.photoUrl)}
               onSiteTap={() => {
                 const s = siteById.get(p.siteId);
                 if (s) onSelectSite(s);
@@ -2681,28 +2679,16 @@ function SocialView({ handle, deviceId, sites, onSelectSite, onBack }: {
           )}
         </div>
       )}
-
-      {/* Fullscreen photo viewer */}
-      {fullscreenUrl && (
-        <div
-          onClick={() => setFullscreenUrl(null)}
-          style={S.socialFullscreenOverlay}
-        >
-          <img src={fullscreenUrl} alt="" style={S.socialFullscreenImg} />
-          <div style={S.socialFullscreenHint}>tap to close</div>
-        </div>
-      )}
     </div>
   );
 }
 
 // Single post card inside the feed. Owns its own like state so toggling
 // is fast and doesn't trigger a parent re-render of the whole list.
-function SocialPostCard({ post, currentHandle, deviceId, onPhotoTap, onSiteTap }: {
+function SocialPostCard({ post, currentHandle, deviceId, onSiteTap }: {
   post: SocialPost;
   currentHandle: string | null;
   deviceId: string | null;
-  onPhotoTap: () => void;
   onSiteTap: () => void;
 }) {
   const [liked, setLiked] = useState(false);
@@ -2762,9 +2748,7 @@ function SocialPostCard({ post, currentHandle, deviceId, onPhotoTap, onSiteTap }
       </div>
 
       {/* Photo */}
-      <button onClick={onPhotoTap} style={S.postPhotoBtn}>
-        <img src={post.photoUrl} alt="" style={S.postPhoto} />
-      </button>
+      <img src={post.photoUrl} alt="" style={S.postPhoto} />
 
       {/* Actions row: heart + count */}
       <div style={S.postActions}>
@@ -6998,14 +6982,6 @@ const S: Record<string, React.CSSProperties> = {
     color: '#888',
     fontSize: 12,
   },
-  postPhotoBtn: {
-    display: 'block',
-    width: '100%',
-    padding: 0,
-    border: 'none',
-    backgroundColor: 'transparent',
-    cursor: 'pointer',
-  },
   postPhoto: {
     width: '100%',
     display: 'block',
@@ -7049,32 +7025,6 @@ const S: Record<string, React.CSSProperties> = {
     fontWeight: 600,
     letterSpacing: '0.04em',
     cursor: 'pointer',
-  },
-  socialFullscreenOverlay: {
-    position: 'fixed',
-    inset: 0,
-    backgroundColor: 'rgba(0,0,0,0.95)',
-    zIndex: 50,
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    cursor: 'pointer',
-    padding: 16,
-  },
-  socialFullscreenImg: {
-    maxWidth: '100%',
-    maxHeight: '90vh',
-    objectFit: 'contain' as const,
-  },
-  socialFullscreenHint: {
-    position: 'absolute',
-    bottom: 20,
-    left: 0, right: 0,
-    textAlign: 'center' as const,
-    color: '#888',
-    fontSize: 12,
-    letterSpacing: '0.2em',
-    textTransform: 'uppercase' as const,
   },
 
   // ---- DetailView "Add Photo" flow ----
