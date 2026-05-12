@@ -4,9 +4,9 @@
 # Injects iOS Info.plist permission strings (location + camera) automatically
 # after Capacitor scaffolds the iOS project, before the build runs.
 # Also writes the App.entitlements file with Sign in with Apple capability
-# and patches project.pbxproj to point at it via CODE_SIGN_ENTITLEMENTS.
-# Uses sed targeted at the bundle-ID line so it only matches the real App
-# target configs (Debug + Release), never Pods or test targets.
+# and patches project.pbxproj using a python one-liner to point each App
+# target config at the entitlements file. The python approach avoids the
+# YAML/sed tab-character mess and is more reliable across pbxproj layouts.
 # =============================================================================
 workflows:
   ios-unsigned-build:
@@ -64,18 +64,25 @@ workflows:
           plutil -p "$ENT"
       - name: Patch Xcode project to use entitlements file
         script: |
-          PROJ="ios/App/App.xcodeproj/project.pbxproj"
-          echo "--- BEFORE: count of CODE_SIGN_ENTITLEMENTS ---"
-          grep -c "CODE_SIGN_ENTITLEMENTS" "$PROJ" || echo "0"
-          # Use sed to add CODE_SIGN_ENTITLEMENTS after every PRODUCT_BUNDLE_IDENTIFIER
-          # line for our specific bundle ID. This hits only the App target configs.
-          sed -i '' '/PRODUCT_BUNDLE_IDENTIFIER = com\.sinistertrivia\.macabretest;/a\
-\				CODE_SIGN_ENTITLEMENTS = App/App.entitlements;
-' "$PROJ"
-          echo "--- AFTER: count of CODE_SIGN_ENTITLEMENTS ---"
-          grep -c "CODE_SIGN_ENTITLEMENTS" "$PROJ" || echo "0"
-          echo "--- CONFIRM (should show CODE_SIGN_ENTITLEMENTS lines) ---"
-          grep -B1 -A1 "CODE_SIGN_ENTITLEMENTS = App/App.entitlements" "$PROJ" | head -30
+          python3 <<'PYEOF'
+          import re
+          path = "ios/App/App.xcodeproj/project.pbxproj"
+          with open(path, "r") as f:
+              content = f.read()
+          before = content.count("CODE_SIGN_ENTITLEMENTS")
+          print("BEFORE: CODE_SIGN_ENTITLEMENTS count =", before)
+          bundle_line = "PRODUCT_BUNDLE_IDENTIFIER = com.sinistertrivia.macabretest;"
+          insert_line = "CODE_SIGN_ENTITLEMENTS = App/App.entitlements;"
+          new_content = content.replace(
+              bundle_line,
+              bundle_line + "\n\t\t\t\t" + insert_line
+          )
+          with open(path, "w") as f:
+              f.write(new_content)
+          after = new_content.count("CODE_SIGN_ENTITLEMENTS")
+          print("AFTER: CODE_SIGN_ENTITLEMENTS count =", after)
+          print("Bundle ID occurrences patched:", new_content.count(bundle_line))
+          PYEOF
       - name: Sync Capacitor to iOS
         script: |
           npx cap sync ios
@@ -168,18 +175,25 @@ workflows:
           plutil -p "$ENT"
       - name: Patch Xcode project to use entitlements file
         script: |
-          PROJ="ios/App/App.xcodeproj/project.pbxproj"
-          echo "--- BEFORE: count of CODE_SIGN_ENTITLEMENTS ---"
-          grep -c "CODE_SIGN_ENTITLEMENTS" "$PROJ" || echo "0"
-          # Use sed to add CODE_SIGN_ENTITLEMENTS after every PRODUCT_BUNDLE_IDENTIFIER
-          # line for our specific bundle ID. This hits only the App target configs.
-          sed -i '' '/PRODUCT_BUNDLE_IDENTIFIER = com\.sinistertrivia\.macabretest;/a\
-\				CODE_SIGN_ENTITLEMENTS = App/App.entitlements;
-' "$PROJ"
-          echo "--- AFTER: count of CODE_SIGN_ENTITLEMENTS ---"
-          grep -c "CODE_SIGN_ENTITLEMENTS" "$PROJ" || echo "0"
-          echo "--- CONFIRM (should show CODE_SIGN_ENTITLEMENTS lines) ---"
-          grep -B1 -A1 "CODE_SIGN_ENTITLEMENTS = App/App.entitlements" "$PROJ" | head -30
+          python3 <<'PYEOF'
+          import re
+          path = "ios/App/App.xcodeproj/project.pbxproj"
+          with open(path, "r") as f:
+              content = f.read()
+          before = content.count("CODE_SIGN_ENTITLEMENTS")
+          print("BEFORE: CODE_SIGN_ENTITLEMENTS count =", before)
+          bundle_line = "PRODUCT_BUNDLE_IDENTIFIER = com.sinistertrivia.macabretest;"
+          insert_line = "CODE_SIGN_ENTITLEMENTS = App/App.entitlements;"
+          new_content = content.replace(
+              bundle_line,
+              bundle_line + "\n\t\t\t\t" + insert_line
+          )
+          with open(path, "w") as f:
+              f.write(new_content)
+          after = new_content.count("CODE_SIGN_ENTITLEMENTS")
+          print("AFTER: CODE_SIGN_ENTITLEMENTS count =", after)
+          print("Bundle ID occurrences patched:", new_content.count(bundle_line))
+          PYEOF
       - name: Sync Capacitor to iOS
         script: |
           npx cap sync ios
