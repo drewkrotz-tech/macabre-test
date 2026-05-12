@@ -4831,6 +4831,28 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
     return m;
   }, [sites]);
 
+  // ====== ACCOUNT GATE ======
+  // DreadFeed is a social mini-app — feed, posts, likes, comments,
+  // follows, profiles all require an identity. Rather than letting
+  // anonymous users browse and hit "sign up to react" on every tap,
+  // we gate the entire mini-app: the very first thing a no-account
+  // user sees inside DreadFeed is the signup screen. They either
+  // complete signup (Apple ID or email) and land in the feed, or
+  // swipe back to exit DreadFeed entirely.
+  //
+  // No bottom bar, no brand header — just the signup screen full-
+  // bleed so it reads as a gate, not a sub-tab.
+  if (!handle) {
+    return (
+      <div style={S.socialViewWrap}>
+        <DreadFeedClaimScreen
+          deviceId={deviceId}
+          onClaimed={onHandleClaimed}
+        />
+      </div>
+    );
+  }
+
   return (
     <div
       style={S.socialViewWrap}
@@ -4963,27 +4985,23 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
         />
       )}
 
-      {/* ====== PROFILE sub-tab ====== */}
+      {/* ====== PROFILE sub-tab ======
+          handle is guaranteed non-null here because the account gate
+          at the top of SocialView short-circuits when there's no
+          handle, rendering the signup screen instead. */}
       {subTab === 'profile' && (
-        handle ? (
-          <UserProfileView
-            profileHandle={handle}
-            currentHandle={handle}
-            deviceId={deviceId}
-            sites={sites}
-            onSelectSite={onSelectSite}
-            onSelectBadges={(h) => { /* tab-bound; ignore deep link */ void h; }}
-            onSelectPost={onSelectPost}
-            onSelectSettings={onSelectSettings}
-            onBack={() => setSubTab('feed')}
-            embedded
-          />
-        ) : (
-          <DreadFeedClaimScreen
-            deviceId={deviceId}
-            onClaimed={onHandleClaimed}
-          />
-        )
+        <UserProfileView
+          profileHandle={handle}
+          currentHandle={handle}
+          deviceId={deviceId}
+          sites={sites}
+          onSelectSite={onSelectSite}
+          onSelectBadges={(h) => { /* tab-bound; ignore deep link */ void h; }}
+          onSelectPost={onSelectPost}
+          onSelectSettings={onSelectSettings}
+          onBack={() => setSubTab('feed')}
+          embedded
+        />
       )}
 
       {/* ====== POST sub-tab — never renders a sub-screen, just triggers
