@@ -3554,7 +3554,17 @@ function formatTimeAgo(iso: string): string {
 function ExposureBrandHeader() {
   return (
     <div style={S.exposureBrandHeader}>
-      <div style={S.exposureBrandTitle}>DreadFeed</div>
+      {/* Same VHS-glitch effect as the home page "Dread Directory" title —
+          red and cyan channel ghosts animate over the white text in
+          rare bursts. Class + data-text are both required (the CSS
+          pseudo-elements read data-text to render the ghost layers). */}
+      <div
+        style={S.exposureBrandTitle}
+        className="sinister-glitch"
+        data-text="DreadFeed"
+      >
+        DreadFeed
+      </div>
     </div>
   );
 }
@@ -5393,9 +5403,34 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
 
   // The effective search center is the drop-pin if one is set, otherwise
   // the user's real location.
+  //
+  // CRITICAL: this memo must be stable against GPS jitter. livePos updates
+  // every few seconds even when the user is stationary (the underlying
+  // Geolocation watcher emits a fresh object on each fix). If we memoized
+  // on the object identity of livePos, every tick would invalidate
+  // `effectiveCenter`, then `nearbySites`, then the annotation rebuild
+  // effect — causing pins to be removed and re-added several times per
+  // second. MapKit's cluster engine sees the churn as "many new
+  // annotations" each cycle and visibly thrashes between expanded
+  // individual pins and the collapsed cluster circle. That's the
+  // "flickering pin glitch" the user sees on the Hauntings map.
+  //
+  // Fix: read lat/lng primitives, round to ~10m precision, and only emit
+  // a new effectiveCenter when those rounded values actually change.
+  // Pinned mode is exact (no rounding) because dragging needs precision.
+  const livePosLatRounded = livePos ? Math.round(livePos.lat * 10000) / 10000 : null;
+  const livePosLngRounded = livePos ? Math.round(livePos.lng * 10000) / 10000 : null;
   const effectiveCenter = useMemo(
-    () => pinCenter || livePos,
-    [pinCenter, livePos],
+    () => {
+      if (pinCenter) return pinCenter;
+      if (livePosLatRounded === null || livePosLngRounded === null) return null;
+      return { lat: livePosLatRounded, lng: livePosLngRounded };
+    },
+    // Depend on the ROUNDED primitives, not the livePos object. A GPS
+    // tick that doesn't move the rounded coords keeps the same memoized
+    // reference, which keeps nearbySites stable, which keeps the
+    // annotation rebuild effect from firing in a loop.
+    [pinCenter, livePosLatRounded, livePosLngRounded],
   );
 
   // Compute nearby sites with the current radius and effective center.
@@ -7878,14 +7913,18 @@ const S: Record<string, React.CSSProperties> = {
     transformOrigin: 'center center',
   },
   // Wrapper that pins the LatestSubmissionSpotlight at the spot where the
-  // SUBMIT A LOCATION button used to live (bottom: 116, centered). The
-  // inner spotlight component sits with position: relative, so this
+  // SUBMIT A LOCATION button used to live, centered above the home bar.
+  // The inner spotlight component sits with position: relative, so this
   // fixed-position wrapper does the bottom-anchoring without changing the
   // spotlight's intrinsic layout.
+  //
+  // Lifted from bottom: 116 to bottom: 150 when the bottom bar icons grew
+  // from 58px to 70px tall — the taller bar would otherwise overlap the
+  // spotlight chip.
   spotlightFixedWrap: {
     position: 'fixed' as const,
     left: '50%',
-    bottom: 116,
+    bottom: 150,
     transform: 'translateX(-50%)',
     zIndex: 3,
     display: 'flex',
@@ -7972,13 +8011,17 @@ const S: Record<string, React.CSSProperties> = {
     justifyContent: 'space-around',
     alignItems: 'flex-end',
     gap: 4,
-    padding: '0 12px 2px 12px',
+    padding: '0 8px 4px 8px',
     boxSizing: 'border-box' as const,
     paddingBottom: 'env(safe-area-inset-bottom, 0px)' as any,
   },
   homeBarBtn: {
     flex: 1,
-    maxWidth: 96,
+    // Raised cap from 96 to 120 so each of the 4 buttons can claim
+    // ~25% of a typical iPhone width (390 / 4 ≈ 97 + gap room). With
+    // the bigger 70px icons below this lets them breathe instead of
+    // being capped tiny.
+    maxWidth: 120,
     backgroundColor: 'transparent',
     border: 'none',
     cursor: 'pointer',
@@ -7986,7 +8029,7 @@ const S: Record<string, React.CSSProperties> = {
     flexDirection: 'column' as const,
     alignItems: 'center',
     gap: 2,
-    padding: '2px 0 0 0',
+    padding: '4px 0 0 0',
     // iOS-style press feedback: scale-down + dim on tap. Uses CSS class
     // "sinister-icon-btn" defined in the global stylesheet so :active
     // pseudo-state can drive the animation (inline styles can't).
@@ -7996,9 +8039,11 @@ const S: Record<string, React.CSSProperties> = {
     userSelect: 'none' as const,
   },
   homeBarIcon: {
-    width: 58,
-    height: 58,
-    borderRadius: 13,
+    // Bumped from 58 to 70 to match real iPhone home-screen icon size
+    // (~60pt rendered, which on @2x retina is around 60-70px visible).
+    width: 70,
+    height: 70,
+    borderRadius: 16,
     display: 'block',
     objectFit: 'cover' as const,
     filter: 'drop-shadow(0 2px 6px rgba(0,0,0,0.6))',
@@ -8011,17 +8056,22 @@ const S: Record<string, React.CSSProperties> = {
   },
   // Visual-balance override for icons whose source PNG art fills more of
   // the canvas (List View, Submit/location). Renders them slightly smaller
-  // so they appear the same VISUAL size as the more padded icons (eXposure,
+  // so they appear the same VISUAL size as the more padded icons (DreadFeed,
   // About). The button slot stays the same width so layout doesn't shift —
   // only the image inside is smaller. Margin keeps the smaller icons
   // visually centered relative to the larger ones' baseline.
   homeBarIconSmall: {
-    width: 50,
-    height: 50,
-    margin: 4,
+    // Scaled proportionally with the 58→70 base bump: 50/58 ≈ 0.86,
+    // 0.86 × 70 ≈ 60. Margin scales similarly to keep visual centering.
+    width: 60,
+    height: 60,
+    margin: 5,
   },
   homeBarLabel: {
-    fontSize: 11,
+    // Slightly larger label to match the bigger icons — bumped from 11
+    // to 12. Stays tight enough to fit "List View" / "DreadFeed" on a
+    // single line under each icon.
+    fontSize: 12,
     color: '#F0EBE0',
     letterSpacing: '0.04em',
     textAlign: 'center' as const,
@@ -8146,17 +8196,16 @@ const S: Record<string, React.CSSProperties> = {
   },
   exposureBrandTitle: {
     color: '#FFFFFF',
-    // Punk font reads smaller per pt than Jolly Lodger because its
-    // letterforms are tighter and more compact — bump font-size up so
-    // it has the same visual weight in the header. Letter-spacing is
-    // also looser to give the ransom-note look room to breathe.
-    fontSize: 36,
-    fontFamily: '"Hit me, punk! 01", "Jolly Lodger", system-ui, serif',
+    // LivingHell to match the home page "Dread Directory" title — keeps
+    // the brand typography consistent across the whole app. Sized down
+    // from the home page's 84pt to fit comfortably in the DreadFeed
+    // header bar without dominating the screen.
+    fontSize: 40,
+    fontFamily: '"LivingHell", "Jolly Lodger", system-ui, serif',
     fontWeight: 400,
-    letterSpacing: '0.06em',
-    // White text with the existing purple glow keeps eXposure visually
-    // tied to the rest of the app's purple accents without bleeding the
-    // ransom-note letterforms into the dark header.
+    letterSpacing: '0.04em',
+    // White text with purple glow keeps DreadFeed visually tied to the
+    // rest of the app's purple accents.
     textShadow: `0 0 14px #BF40FFcc, 0 0 4px #FFFFFF88`,
     lineHeight: 1,
   },
