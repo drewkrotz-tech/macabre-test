@@ -277,6 +277,91 @@ async function apiFetchFeed(args: { limit?: number; before?: string | null }): P
   } catch { return { posts: [], nextBefore: null }; }
 }
 
+// Following-only feed — posts by handles the given user follows. Mirrors
+// the shape of apiFetchFeed so the SocialView can swap between "All" and
+// "Following" without touching its render code.
+async function apiFetchFollowingFeed(args: { handle: string; limit?: number; before?: string | null }): Promise<FeedPage> {
+  try {
+    const params = new URLSearchParams();
+    if (args.limit) params.set('limit', String(args.limit));
+    if (args.before) params.set('before', args.before);
+    const qs = params.toString();
+    const url = `${API_BASE}/follows/feed/${encodeURIComponent(args.handle)}${qs ? `?${qs}` : ''}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    return {
+      posts: Array.isArray(data?.posts) ? data.posts : [],
+      nextBefore: data?.nextBefore || null,
+    };
+  } catch { return { posts: [], nextBefore: null }; }
+}
+
+// ---- Follow API ----
+// All follow endpoints live in the dedicated server module follows.js.
+// Asymmetric public follows (no approval flow). All actions return
+// optimistically; client treats network failure as transient and reverts.
+
+type FollowStatus = { followedByYou: boolean; followerCount: number; followingCount: number };
+
+async function apiFollowStatus(args: { target: string; handle: string | null }): Promise<FollowStatus> {
+  try {
+    const qs = args.handle ? `?handle=${encodeURIComponent(args.handle)}` : '';
+    const res = await fetch(`${API_BASE}/follows/status/${encodeURIComponent(args.target)}${qs}`);
+    const data = await res.json();
+    return {
+      followedByYou: !!data?.followedByYou,
+      followerCount: typeof data?.followerCount === 'number' ? data.followerCount : 0,
+      followingCount: typeof data?.followingCount === 'number' ? data.followingCount : 0,
+    };
+  } catch {
+    return { followedByYou: false, followerCount: 0, followingCount: 0 };
+  }
+}
+
+async function apiFollow(args: { follower: string; target: string; deviceId: string }): Promise<{ ok: boolean; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/follows/follow`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    const data = await res.json();
+    if (!res.ok) return { ok: false, reason: data?.error || `HTTP ${res.status}` };
+    return { ok: true };
+  } catch (e: any) { return { ok: false, reason: e?.message || 'network error' }; }
+}
+
+async function apiUnfollow(args: { follower: string; target: string; deviceId: string }): Promise<{ ok: boolean; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/follows/unfollow`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    const data = await res.json();
+    if (!res.ok) return { ok: false, reason: data?.error || `HTTP ${res.status}` };
+    return { ok: true };
+  } catch (e: any) { return { ok: false, reason: e?.message || 'network error' }; }
+}
+
+type HandleEntry = { handle: string; followedAt: string };
+
+async function apiFollowers(handle: string): Promise<HandleEntry[]> {
+  try {
+    const res = await fetch(`${API_BASE}/follows/followers/${encodeURIComponent(handle)}`);
+    const data = await res.json();
+    return Array.isArray(data?.followers) ? data.followers : [];
+  } catch { return []; }
+}
+
+async function apiFollowing(handle: string): Promise<HandleEntry[]> {
+  try {
+    const res = await fetch(`${API_BASE}/follows/following/${encodeURIComponent(handle)}`);
+    const data = await res.json();
+    return Array.isArray(data?.following) ? data.following : [];
+  } catch { return []; }
+}
+
 // Approved posts by one handle (newest first). Powers the IG-style grid
 // on UserProfileView. Server-side filter keeps the client from pulling
 // the full feed and discarding 95% of it.
@@ -672,6 +757,95 @@ function playSubDrop() {
     gain.connect(ctx.destination);
     osc.start(now);
     osc.stop(now + 0.25);
+  } catch { /* silent */ }
+}
+
+// ---------- DreadFeed (IG-style) sounds ----------
+// Distinct from the horror app's playSubDrop/playPop — these are bright,
+// short, IG-style UI blips. The DreadFeed mini-app reaches for "social
+// network" feel rather than "sinister" feel, so these sounds skip the
+// low-freq weight and stay in the 600-1500Hz pleasant range with quick
+// envelopes. All three share the same getAudioCtx() singleton so they
+// inherit the iOS resume/unlock pattern.
+
+// playLikeBlip — short "tap" for double-tap-style like reactions. A
+// quick sine pulse at 900Hz, ~70ms total. Bright enough to be felt as
+// positive feedback without being distracting.
+function playLikeBlip() {
+  const ctx = getAudioCtx();
+  if (!ctx) return;
+  try {
+    const now = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(900, now);
+    osc.frequency.exponentialRampToValueAtTime(1200, now + 0.05);
+    gain.gain.setValueAtTime(0, now);
+    gain.gain.linearRampToValueAtTime(0.14, now + 0.005);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.08);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(now);
+    osc.stop(now + 0.1);
+  } catch { /* silent */ }
+}
+
+// playCommentSent — "thwip" send sound for posting a comment. Two
+// stacked oscillators (700Hz + 1100Hz) sweeping up briefly then fading,
+// gives a satisfying "off it goes" feel like IG's send sound.
+function playCommentSent() {
+  const ctx = getAudioCtx();
+  if (!ctx) return;
+  try {
+    const now = ctx.currentTime;
+    const dur = 0.12;
+    const o1 = ctx.createOscillator();
+    const o2 = ctx.createOscillator();
+    const gain = ctx.createGain();
+    o1.type = 'sine';
+    o2.type = 'sine';
+    o1.frequency.setValueAtTime(700, now);
+    o1.frequency.exponentialRampToValueAtTime(1400, now + dur);
+    o2.frequency.setValueAtTime(1100, now);
+    o2.frequency.exponentialRampToValueAtTime(2200, now + dur);
+    gain.gain.setValueAtTime(0, now);
+    gain.gain.linearRampToValueAtTime(0.12, now + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + dur);
+    o1.connect(gain);
+    o2.connect(gain);
+    gain.connect(ctx.destination);
+    o1.start(now);
+    o2.start(now);
+    o1.stop(now + dur + 0.02);
+    o2.stop(now + dur + 0.02);
+  } catch { /* silent */ }
+}
+
+// playPostShared — longer celebratory "shink!" for successfully creating
+// a DreadFeed post. Three-tone arpeggio (600 → 900 → 1200Hz) over
+// ~220ms. Bigger than playLikeBlip / playCommentSent because creating a
+// post is the more significant action.
+function playPostShared() {
+  const ctx = getAudioCtx();
+  if (!ctx) return;
+  try {
+    const now = ctx.currentTime;
+    const notes = [600, 900, 1200];
+    notes.forEach((freq, i) => {
+      const t = now + i * 0.05;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freq, t);
+      gain.gain.setValueAtTime(0, t);
+      gain.gain.linearRampToValueAtTime(0.12, t + 0.01);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.12);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(t);
+      osc.stop(t + 0.14);
+    });
   } catch { /* silent */ }
 }
 
@@ -2214,6 +2388,14 @@ export default function App() {
             onSelectSite={goDetail}
             onSelectBadges={(h) => setView({ name: 'badges', handle: h })}
             onSelectPost={(postId, postList, preloadedPosts) => setView({ name: 'post', postId, postList, preloadedPosts })}
+            onSelectExposureTab={(tab) => {
+              // Tapping a bottom-bar tab from inside a standalone profile
+              // jumps to eXposure on that sub-tab. Same pattern as
+              // PostDetailView — write the memory first so SocialView
+              // mounts on the right tab.
+              _exposureSubTabMemory = tab;
+              setView({ name: 'social' });
+            }}
             onBack={goHome}
           />
         ),
@@ -2441,7 +2623,15 @@ export default function App() {
           DetailView is excluded because the page already has Get Directions
           + Claim Visit as its primary actions; layering the bottom bar on
           top makes the page feel busy and competes with those CTAs. */}
-      {view.name !== 'nearby' && view.name !== 'detail' && view.name !== 'submit' && view.name !== 'social' && (
+      {/* HomeBottomBar should only appear on the home page and the
+          home-page peer views (list, about, leaders). It must NOT show
+          on any DreadFeed-context screen (social, userProfile, post,
+          badges) — those screens are part of the DreadFeed mini-app
+          and render their own IG-style ExposureBottomBar instead.
+          Showing both bars stacks them and confuses navigation. */}
+      {view.name !== 'nearby' && view.name !== 'detail' && view.name !== 'submit'
+        && view.name !== 'social' && view.name !== 'userProfile'
+        && view.name !== 'post' && view.name !== 'badges' && (
         <HomeBottomBar
           onSubmit={goSubmit}
           onList={goList}
@@ -2801,6 +2991,22 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Feed mode toggle — 'all' shows every approved post; 'following'
+  // restricts to posts by handles the current user follows. Persists
+  // for the session only (resets on remount). When the user has no
+  // handle claimed, 'following' is hidden in the UI.
+  type FeedMode = 'all' | 'following';
+  const [feedMode, setFeedMode] = useState<FeedMode>('all');
+
+  // Helper: load a page from the right endpoint depending on feed mode.
+  // Following mode requires a handle; falls back to empty page if not.
+  const loadPage = async (before: string | null): Promise<FeedPage> => {
+    if (feedMode === 'following') {
+      if (!handle) return { posts: [], nextBefore: null };
+      return apiFetchFollowingFeed({ handle, limit: 20, before });
+    }
+    return apiFetchFeed({ limit: 20, before });
+  };
 
   // ---- Pull-to-refresh state ----
   // When the user is at scrollY=0 and starts dragging down, we record the
@@ -2822,7 +3028,7 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
     if (refreshing) return;
     setRefreshing(true);
     try {
-      const page = await apiFetchFeed({ limit: 20, before: null });
+      const page = await loadPage(null);
       setPosts(page.posts);
       setNextBefore(page.nextBefore);
     } catch { /* silent — keep prior feed visible */ }
@@ -2830,26 +3036,28 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
     setPullDistance(0);
   };
 
-  // Initial load
+  // Initial load — and also re-load when feedMode flips between
+  // All / Following so the user gets fresh content for the chosen tab.
   useEffect(() => {
     let cancelled = false;
     (async () => {
       setLoading(true);
       setError(null);
-      const page = await apiFetchFeed({ limit: 20, before: null });
+      const page = await loadPage(null);
       if (cancelled) return;
       setPosts(page.posts);
       setNextBefore(page.nextBefore);
       setLoading(false);
     })();
     return () => { cancelled = true; };
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [feedMode, handle]);
 
   // Load more — called when the user scrolls near the bottom.
   const loadMore = async () => {
     if (loadingMore || !nextBefore) return;
     setLoadingMore(true);
-    const page = await apiFetchFeed({ limit: 20, before: nextBefore });
+    const page = await loadPage(nextBefore);
     setPosts((prev) => [...prev, ...page.posts]);
     setNextBefore(page.nextBefore);
     setLoadingMore(false);
@@ -2937,6 +3145,28 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
             </span>
           </div>
 
+          {/* Following / For You segmented toggle — only shown when the
+              user has a claimed handle (Following mode is meaningless
+              without one). Two equal-width buttons, the active one is
+              underlined and bold. Tapping flips feedMode which triggers
+              a refetch via the useEffect dep. */}
+          {handle && (
+            <div style={S.feedModeRow}>
+              <button
+                onClick={() => setFeedMode('all')}
+                style={feedMode === 'all' ? S.feedModeBtnActive : S.feedModeBtn}
+              >
+                For You
+              </button>
+              <button
+                onClick={() => setFeedMode('following')}
+                style={feedMode === 'following' ? S.feedModeBtnActive : S.feedModeBtn}
+              >
+                Following
+              </button>
+            </div>
+          )}
+
           {/* Feed body */}
           {loading ? (
             <div style={S.socialEmpty}>Loading the feed…</div>
@@ -2944,7 +3174,9 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
             <div style={S.socialEmpty}>⚠ {error}</div>
           ) : posts.length === 0 ? (
             <div style={S.socialEmpty}>
-              No posts yet.<br />
+              {feedMode === 'following'
+                ? 'No posts from accounts you follow yet.'
+                : 'No posts yet.'}<br />
               <span style={{ opacity: 0.7, fontSize: 13 }}>
                 Visit a site and tap "Post to DreadFeed" to be the first.
               </span>
@@ -3180,6 +3412,7 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
     });
     setSubmitting(false);
     if (result.ok) {
+      playPostShared();
       onPosted();
     } else {
       showToast(`Post failed: ${result.reason || 'unknown error'}`, 'error');
@@ -3465,6 +3698,10 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap 
     }
     if (likeBusy) return;
     setLikeBusy(true);
+
+    // Sound only on LIKE (not unlike) — matches IG/Twitter behavior
+    // where the audible feedback fires on the positive action.
+    if (!liked) playLikeBlip();
 
     // Optimistic update
     const prevLiked = liked;
@@ -3791,6 +4028,7 @@ function CommentSheet({ post, currentHandle, deviceId, onClose, onCountChange }:
       return next;
     });
     onCountChange(comments.length + 1);
+    playCommentSent();
   };
 
   // Toggle a heart on a single comment.
@@ -3802,6 +4040,8 @@ function CommentSheet({ post, currentHandle, deviceId, onClose, onCountChange }:
     const current = commentLikes.get(commentId);
     const prevLiked = !!current?.liked;
     const prevCount = current?.count || 0;
+    // Sound on LIKE only, not unlike.
+    if (!prevLiked) playLikeBlip();
     // Optimistic
     setCommentLikes((prev) => {
       const next = new Map(prev);
@@ -4056,7 +4296,7 @@ function ExposureBrandHeader() {
 //   - GET /badges/:handle for visit count
 //   - GET /posts/handle/:handle for the grid (new server endpoint —
 //     replaces the old "fetch full feed and filter client-side" trick)
-function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSelectSite, onSelectBadges, onSelectPost, onBack, embedded }: {
+function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSelectSite, onSelectBadges, onSelectPost, onSelectExposureTab, onBack, embedded }: {
   profileHandle: string;
   currentHandle: string | null;
   deviceId: string | null;
@@ -4064,12 +4304,23 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
   onSelectSite: (site: SinisterSite) => void;
   onSelectBadges: (handle: string) => void;
   onSelectPost: (postId: string, postList?: string[], preloadedPosts?: SocialPost[]) => void;
+  // Optional — only passed when this view is dispatched as a standalone
+  // route (e.g. tapped @handle from a feed card). Embedded inside the
+  // DreadFeed profile tab, the parent SocialView handles tab nav itself.
+  onSelectExposureTab?: (tab: 'feed' | 'search' | 'post' | 'profile') => void;
   onBack: () => void;
   embedded?: boolean;
 }) {
   const [stats, setStats] = useState<{ visitCount: number; submitCount: number; badgeCount: number } | null>(null);
   const [posts, setPosts] = useState<SocialPost[]>([]);
   const [loading, setLoading] = useState(true);
+  // Follow status: follower count, following count, and whether the
+  // current user follows the profile being viewed. Loaded from
+  // /follows/status/:target on mount.
+  const [followStatus, setFollowStatus] = useState<FollowStatus>({ followedByYou: false, followerCount: 0, followingCount: 0 });
+  const [followBusy, setFollowBusy] = useState(false);
+  // Which handle-list sheet (if any) is open. null when closed.
+  const [listSheet, setListSheet] = useState<'followers' | 'following' | null>(null);
 
   const isMe = !!currentHandle && currentHandle.toLowerCase() === profileHandle.toLowerCase();
 
@@ -4077,10 +4328,11 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
     let cancelled = false;
     (async () => {
       setLoading(true);
-      // Fetch badge stats + this handle's posts in parallel.
-      const [badgeData, handlePosts] = await Promise.all([
+      // Fetch badge stats + posts + follow status in parallel.
+      const [badgeData, handlePosts, fStatus] = await Promise.all([
         apiGetBadges(profileHandle),
         apiFetchPostsByHandle(profileHandle),
+        apiFollowStatus({ target: profileHandle, handle: currentHandle }),
       ]);
       if (cancelled) return;
       setStats({
@@ -4089,16 +4341,52 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
         badgeCount: badgeData.badges.length,
       });
       setPosts(handlePosts);
+      setFollowStatus(fStatus);
       setLoading(false);
     })();
     return () => { cancelled = true; };
-  }, [profileHandle]);
+  }, [profileHandle, currentHandle]);
+
+  // Toggle follow on the profile being viewed. Optimistic update — the
+  // button flips immediately, counts adjust, and we revert if the
+  // server rejects.
+  const toggleFollow = async () => {
+    if (isMe) return;
+    if (!currentHandle || !deviceId) {
+      showToast('Claim a handle to follow people', 'error');
+      return;
+    }
+    if (followBusy) return;
+    setFollowBusy(true);
+
+    const prev = followStatus;
+    // Optimistic: flip the local state.
+    setFollowStatus({
+      followedByYou: !prev.followedByYou,
+      followerCount: prev.followerCount + (prev.followedByYou ? -1 : 1),
+      followingCount: prev.followingCount,
+    });
+
+    const result = prev.followedByYou
+      ? await apiUnfollow({ follower: currentHandle, target: profileHandle, deviceId })
+      : await apiFollow({ follower: currentHandle, target: profileHandle, deviceId });
+
+    if (!result.ok) {
+      // Revert
+      setFollowStatus(prev);
+      showToast(result.reason || 'Could not update follow', 'error');
+    } else if (!prev.followedByYou) {
+      // Newly followed — same audible feedback as a like, IG-style.
+      playLikeBlip();
+    }
+    setFollowBusy(false);
+  };
 
   // Mark variables as intentionally unused — they're part of the
   // standard profile prop bag but this layout doesn't surface them.
   // (sites is used indirectly via onSelectSite; deviceId is reserved
   // for future actions like "Edit profile" or following.)
-  void sites; void onSelectSite; void deviceId;
+  void sites; void onSelectSite; void onSelectBadges; void stats;
 
   return (
     <div style={embedded ? { paddingBottom: 80 } : S.socialViewWrap}>
@@ -4112,23 +4400,29 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
           <img src={exposureIconUrl} alt="" style={S.profileAvatarImg} />
         </div>
         <div style={S.profileStatsCluster}>
+          {/* Posts count — not tappable; shows the count of approved
+              posts for this handle. */}
           <div style={S.profileStatItem}>
             <div style={S.profileStatNum}>{posts.length}</div>
             <div style={S.profileStatLabel}>Posts</div>
           </div>
-          <div style={S.profileStatItem}>
-            <div style={S.profileStatNum}>{stats?.visitCount ?? '—'}</div>
-            <div style={S.profileStatLabel}>Visits</div>
-          </div>
+          {/* Followers — tappable, opens the follower list sheet. */}
           <button
-            onClick={() => { playSubDrop(); onSelectBadges(profileHandle); }}
+            onClick={() => setListSheet('followers')}
             style={{ ...S.profileStatItem, cursor: 'pointer', background: 'transparent', border: 'none' }}
-            aria-label="View badges"
+            aria-label="View followers"
           >
-            <div style={{ ...S.profileStatNum, color: '#BF40FF' }}>
-              {stats?.badgeCount ?? '—'}
-            </div>
-            <div style={{ ...S.profileStatLabel, color: '#BF40FF' }}>Badges</div>
+            <div style={S.profileStatNum}>{followStatus.followerCount}</div>
+            <div style={S.profileStatLabel}>Followers</div>
+          </button>
+          {/* Following — tappable, opens the following list sheet. */}
+          <button
+            onClick={() => setListSheet('following')}
+            style={{ ...S.profileStatItem, cursor: 'pointer', background: 'transparent', border: 'none' }}
+            aria-label="View following"
+          >
+            <div style={S.profileStatNum}>{followStatus.followingCount}</div>
+            <div style={S.profileStatLabel}>Following</div>
           </button>
         </div>
       </div>
@@ -4140,42 +4434,55 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
       </div>
 
       {/* ---- Action button row (IG-style) ---- */}
+      {/* For your own profile: Share Profile button.
+          For someone else's: Follow / Following toggle + Share Profile. */}
       <div style={S.profileActionsRow}>
-        {isMe ? (
-          <>
-            <button
-              onClick={() => { playSubDrop(); onSelectBadges(profileHandle); }}
-              style={S.profileActionBtn}
-            >
-              View Badges
-            </button>
-            <button
-              onClick={() => {
-                // Lightweight share: copy a "view my profile" line. No
-                // deep-link scheme yet, so just put the handle on the
-                // clipboard. Good enough as a v1 — wire to a proper share
-                // sheet once profile URLs exist.
-                try {
-                  navigator.clipboard.writeText(`@${profileHandle} on The Dread Directory`);
-                  showToast('Copied to clipboard', 'success');
-                } catch {
-                  showToast('Could not copy', 'error');
-                }
-              }}
-              style={S.profileActionBtn}
-            >
-              Share Profile
-            </button>
-          </>
-        ) : (
+        {!isMe && (
           <button
-            onClick={() => { playSubDrop(); onSelectBadges(profileHandle); }}
-            style={{ ...S.profileActionBtn, flex: 1 }}
+            onClick={toggleFollow}
+            disabled={followBusy}
+            style={followStatus.followedByYou ? S.profileFollowingBtn : S.profileFollowBtn}
           >
-            View Badges
+            {followStatus.followedByYou ? 'Following' : 'Follow'}
           </button>
         )}
+        <button
+          onClick={() => {
+            // Lightweight share: copy a "view my profile" line. No
+            // deep-link scheme yet, so just put the handle on the
+            // clipboard. Good enough as a v1 — wire to a proper share
+            // sheet once profile URLs exist.
+            try {
+              navigator.clipboard.writeText(`@${profileHandle} on The Dread Directory`);
+              showToast('Copied to clipboard', 'success');
+            } catch {
+              showToast('Could not copy', 'error');
+            }
+          }}
+          style={{ ...S.profileActionBtn, flex: 1 }}
+        >
+          Share Profile
+        </button>
       </div>
+
+      {/* Followers / Following list sheet — opens when a stat is tapped. */}
+      {listSheet && (
+        <HandleListSheet
+          mode={listSheet}
+          forHandle={profileHandle}
+          currentHandle={currentHandle}
+          onClose={() => setListSheet(null)}
+          onSelectHandle={(h) => {
+            setListSheet(null);
+            // Reuse the existing onSelectHandle plumbing — but profile
+            // doesn't get one as a prop. Instead, leverage the back
+            // gesture: we'll just close the sheet and let the user
+            // navigate manually. (Could be improved later.)
+            void h;
+          }}
+        />
+      )}
+
 
       {/* ---- Tab strip (only grid for now, but kept for IG familiarity) ---- */}
       <div style={S.profileTabStrip}>
@@ -4216,10 +4523,146 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
           ))}
         </div>
       )}
+
+      {/* Render the DreadFeed bottom bar only when this view is dispatched
+          standalone (e.g. tapped @handle from a feed card). When embedded
+          inside the DreadFeed Profile tab, SocialView already renders the
+          bar so doubling it up would stack two bars. */}
+      {!embedded && onSelectExposureTab && (
+        <ExposureBottomBar
+          active="profile"
+          onSelect={(tab) => {
+            if (tab === 'post') {
+              // Post composer requires SocialView's GPS + nearest-site
+              // logic; route to feed instead.
+              onSelectExposureTab('feed');
+              return;
+            }
+            onSelectExposureTab(tab);
+          }}
+        />
+      )}
     </div>
   );
 }
 
+
+// ---------- Handle List Sheet ----------
+// IG-style bottom sheet showing a list of handles (followers or
+// following). Same slide-up animation + dismiss patterns as the
+// CommentSheet. Tapping a handle row currently just closes the sheet
+// — full @handle navigation from inside the sheet would need extra
+// plumbing to thread `setView` down here, deferred for now.
+function HandleListSheet({ mode, forHandle, currentHandle, onClose, onSelectHandle }: {
+  mode: 'followers' | 'following';
+  forHandle: string;
+  currentHandle: string | null;
+  onClose: () => void;
+  onSelectHandle: (handle: string) => void;
+}) {
+  const [list, setList] = useState<HandleEntry[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [mounted, setMounted] = useState(false);
+  const [closing, setClosing] = useState(false);
+  const [dragY, setDragY] = useState(0);
+  const dragStartYRef = useRef<number | null>(null);
+
+  void currentHandle; // reserved for future "Follow back" indicators
+
+  useEffect(() => {
+    const id = requestAnimationFrame(() => setMounted(true));
+    return () => cancelAnimationFrame(id);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      const data = mode === 'followers'
+        ? await apiFollowers(forHandle)
+        : await apiFollowing(forHandle);
+      if (cancelled) return;
+      setList(data);
+      setLoading(false);
+    })();
+    return () => { cancelled = true; };
+  }, [mode, forHandle]);
+
+  const animateClose = () => {
+    if (closing) return;
+    setClosing(true);
+    setTimeout(() => onClose(), 260);
+  };
+
+  const onTouchStartHandle = (e: React.TouchEvent) => {
+    if (e.touches.length !== 1) return;
+    dragStartYRef.current = e.touches[0].clientY;
+  };
+  const onTouchMoveHandle = (e: React.TouchEvent) => {
+    if (dragStartYRef.current === null || e.touches.length !== 1) return;
+    const dy = e.touches[0].clientY - dragStartYRef.current;
+    if (dy > 0) setDragY(dy);
+  };
+  const onTouchEndHandle = () => {
+    const dy = dragY;
+    dragStartYRef.current = null;
+    setDragY(0);
+    if (dy > 120) animateClose();
+  };
+
+  const translateY = closing ? '100%' : mounted ? `${dragY}px` : '100%';
+  const title = mode === 'followers' ? 'Followers' : 'Following';
+
+  return createPortal(
+    <div style={S.commentSheetOverlay}>
+      <div style={S.commentSheetBackdrop} onClick={animateClose} />
+      <div
+        style={{
+          ...S.commentSheetPanel,
+          transform: `translateY(${translateY})`,
+          transition: dragStartYRef.current === null ? 'transform 0.26s cubic-bezier(0.32, 0.72, 0, 1)' : 'none',
+        }}
+      >
+        <div
+          style={S.commentSheetHandleArea}
+          onTouchStart={onTouchStartHandle}
+          onTouchMove={onTouchMoveHandle}
+          onTouchEnd={onTouchEndHandle}
+        >
+          <div style={S.commentSheetHandlePill} />
+        </div>
+        <div style={S.commentSheetHeader}>
+          <div style={{ width: 40 }} />
+          <div style={S.commentSheetTitle}>{title}</div>
+          <div style={{ width: 40 }} />
+        </div>
+        <div style={S.commentSheetList}>
+          {loading ? (
+            <div style={S.commentSheetEmpty}>Loading…</div>
+          ) : list.length === 0 ? (
+            <div style={S.commentSheetEmpty}>
+              {mode === 'followers' ? 'No followers yet.' : 'Not following anyone yet.'}
+            </div>
+          ) : (
+            list.map((entry) => (
+              <button
+                key={entry.handle}
+                onClick={() => onSelectHandle(entry.handle)}
+                style={S.handleListRow}
+              >
+                <img src={exposureIconUrl} alt="" style={S.commentAvatar} />
+                <div style={S.commentBodyCol}>
+                  <div style={S.commentHandle}>{entry.handle}</div>
+                </div>
+              </button>
+            ))
+          )}
+        </div>
+      </div>
+    </div>,
+    document.body
+  );
+}
 
 // ---------- Single Post Detail ----------
 // Opened when the user taps a thumbnail in a profile grid. Renders all
@@ -7187,6 +7630,8 @@ function AddPhotoButton({ site, handle, deviceId, currentLocation, onPosted }: {
       return;
     }
 
+    playPostShared();
+
     // Optional external share. We pass the photo as a File so iOS picks
     // image-friendly destinations (Instagram, Messages photo share, etc).
     if (alsoShare && typeof navigator !== 'undefined' && (navigator as any).share) {
@@ -7252,7 +7697,7 @@ function AddPhotoButton({ site, handle, deviceId, currentLocation, onPosted }: {
                 type="checkbox"
                 checked={alsoShare}
                 onChange={(e) => setAlsoShare(e.target.checked)}
-                style={{ accentColor: '#BF40FF', width: 16, height: 16 }}
+                style={{ accentColor: '#FFFFFF', width: 16, height: 16 }}
               />
               Also share to Messages / Instagram / X
             </label>
@@ -8619,8 +9064,8 @@ const S: Record<string, React.CSSProperties> = {
     flex: 1,
     maxWidth: 200,
     backgroundColor: 'rgba(0,0,0,0.45)',
-    border: `1.5px solid #BF40FF`,
-    color: '#BF40FF',
+    border: `1.5px solid #FFFFFF`,
+    color: '#FFFFFF',
     fontFamily: '"Jolly Lodger", system-ui, serif',
     fontSize: 18,
     fontWeight: 400,
@@ -8632,11 +9077,11 @@ const S: Record<string, React.CSSProperties> = {
     alignItems: 'center',
     justifyContent: 'center',
     gap: 6,
-    boxShadow: `0 0 14px #BF40FF66, inset 0 0 8px #BF40FF22`,
-    textShadow: `0 0 8px #BF40FFaa`,
+    boxShadow: `0 0 14px #FFFFFF44, inset 0 0 8px #FFFFFF22`,
+    textShadow: `0 0 8px #FFFFFFaa`,
     backdropFilter: 'blur(2px)',
   },
-  socialLabelHighlight: { fontSize: 18, color: '#BF40FF' },
+  socialLabelHighlight: { fontSize: 18, color: '#FFFFFF' },
   socialIcon: { fontSize: 16, lineHeight: 1 },
   socialLabel: { fontSize: 18 },
 
@@ -8657,7 +9102,7 @@ const S: Record<string, React.CSSProperties> = {
     padding: '14px 16px',
     backgroundColor: 'rgba(10,10,10,0.85)',
     backdropFilter: 'blur(8px)',
-    borderBottom: `1px solid #BF40FF44`,
+    borderBottom: `1px solid #FFFFFF33`,
   },
   // ---- Permanent eXposure brand header ----
   // Solid black bar with a two-line treatment: large neon-purple "eXposure"
@@ -8682,7 +9127,7 @@ const S: Record<string, React.CSSProperties> = {
     paddingLeft: 16,
     paddingRight: 16,
     backgroundColor: '#000',
-    borderBottom: `1px solid #BF40FF66`,
+    borderBottom: `1px solid #FFFFFF44`,
     boxShadow: '0 2px 12px rgba(0,0,0,0.6)',
   },
   exposureBrandTitle: {
@@ -8697,7 +9142,7 @@ const S: Record<string, React.CSSProperties> = {
     letterSpacing: '0.04em',
     // White text with purple glow keeps DreadFeed visually tied to the
     // rest of the app's purple accents.
-    textShadow: `0 0 14px #BF40FFcc, 0 0 4px #FFFFFF88`,
+    textShadow: `0 0 14px #FFFFFFcc, 0 0 4px #FFFFFF88`,
     lineHeight: 1,
   },
   exposureBrandTagline: {
@@ -8719,12 +9164,12 @@ const S: Record<string, React.CSSProperties> = {
     width: '100%',
     overflow: 'hidden',
     backgroundColor: 'transparent',
-    color: '#BF40FF',
+    color: '#FFFFFF',
     fontFamily: '"Jolly Lodger", system-ui, serif',
     fontSize: 16,
     letterSpacing: '0.04em',
     transition: 'height 200ms ease, opacity 150ms ease',
-    textShadow: `0 0 6px #BF40FFaa`,
+    textShadow: `0 0 6px #FFFFFFaa`,
   },
   pullIndicatorText: {
     padding: '8px 12px',
@@ -8756,11 +9201,11 @@ const S: Record<string, React.CSSProperties> = {
     cursor: 'pointer',
   },
   filterChipActive: {
-    border: `1.5px solid #BF40FF`,
+    border: `1.5px solid #FFFFFF`,
     backgroundColor: 'rgba(191,64,255,0.15)',
-    color: '#BF40FF',
-    textShadow: `0 0 6px #BF40FF88`,
-    boxShadow: `0 0 10px #BF40FF44`,
+    color: '#FFFFFF',
+    textShadow: `0 0 6px #FFFFFF88`,
+    boxShadow: `0 0 10px #FFFFFF33`,
   },
   // ---- Static black bottom bar inside eXposure ----
   // Fixed at the bottom of the viewport, never moves on scroll. 4 white
@@ -8837,8 +9282,8 @@ const S: Record<string, React.CSSProperties> = {
     minWidth: 86,
     borderRadius: '50%',
     overflow: 'hidden',
-    border: `2px solid #BF40FF`,
-    boxShadow: `0 0 14px #BF40FF55`,
+    border: `2px solid #FFFFFF`,
+    boxShadow: `0 0 14px #FFFFFF44`,
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
@@ -8869,18 +9314,22 @@ const S: Record<string, React.CSSProperties> = {
     justifyContent: 'center',
   },
   profileStatNum: {
-    fontFamily: '"Jolly Lodger", system-ui, serif',
-    fontSize: 26,
+    // IG-style: bold sans-serif numerals, same family as the rest of
+    // DreadFeed. Was Jolly Lodger which made the profile look like a
+    // different app from the post cards / comments / bottom bar.
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    fontSize: 20,
+    fontWeight: 700,
     color: '#F0EBE0',
-    letterSpacing: '0.04em',
+    letterSpacing: '0.01em',
     lineHeight: 1.1,
   },
   profileStatLabel: {
-    fontSize: 10,
-    color: '#888',
-    letterSpacing: '0.18em',
-    textTransform: 'uppercase' as const,
-    marginTop: 4,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    fontSize: 13,
+    fontWeight: 400,
+    color: '#F0EBE0',
+    marginTop: 2,
   },
   // ---- Display-name / bio strip ----
   profileBioWrap: {
@@ -8888,10 +9337,11 @@ const S: Record<string, React.CSSProperties> = {
     backgroundColor: 'rgba(10,10,10,0.5)',
   },
   profileDisplayName: {
+    fontFamily: 'system-ui, -apple-system, sans-serif',
     color: '#F0EBE0',
-    fontSize: 15,
+    fontSize: 14,
     fontWeight: 600,
-    letterSpacing: '0.02em',
+    letterSpacing: '0.01em',
   },
   // ---- IG-style action button row ----
   profileActionsRow: {
@@ -8912,7 +9362,80 @@ const S: Record<string, React.CSSProperties> = {
     fontWeight: 600,
     letterSpacing: '0.02em',
     cursor: 'pointer',
-    fontFamily: 'inherit',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  // Follow buttons. Filled white when NOT following (call-to-action),
+  // outlined when already following (less visually loud). Matches IG.
+  profileFollowBtn: {
+    flex: 1,
+    padding: '8px 12px',
+    backgroundColor: '#FFFFFF',
+    color: '#000000',
+    border: '1px solid #FFFFFF',
+    borderRadius: 8,
+    fontSize: 13,
+    fontWeight: 700,
+    letterSpacing: '0.02em',
+    cursor: 'pointer',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  profileFollowingBtn: {
+    flex: 1,
+    padding: '8px 12px',
+    backgroundColor: '#1a1a1a',
+    color: '#F0EBE0',
+    border: '1px solid #333',
+    borderRadius: 8,
+    fontSize: 13,
+    fontWeight: 600,
+    letterSpacing: '0.02em',
+    cursor: 'pointer',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  // ---- Follow / For You segmented toggle at top of feed ----
+  // Two flush buttons under the brand header. Active state gets bold
+  // white text + a 2px underline; inactive is greyed out. IG-style.
+  feedModeRow: {
+    display: 'flex',
+    backgroundColor: '#000',
+    borderBottom: '1px solid #1a1a1a',
+  },
+  feedModeBtn: {
+    flex: 1,
+    padding: '12px 0',
+    backgroundColor: 'transparent',
+    color: '#888888',
+    border: 'none',
+    borderBottom: '2px solid transparent',
+    fontSize: 14,
+    fontWeight: 600,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+  },
+  feedModeBtnActive: {
+    flex: 1,
+    padding: '12px 0',
+    backgroundColor: 'transparent',
+    color: '#FFFFFF',
+    border: 'none',
+    borderBottom: '2px solid #FFFFFF',
+    fontSize: 14,
+    fontWeight: 700,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+  },
+  // Row inside the followers / following bottom sheet. Avatar on left,
+  // handle column on right, tap navigates / closes the sheet.
+  handleListRow: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 10,
+    padding: '10px 14px',
+    width: '100%',
+    backgroundColor: 'transparent',
+    border: 'none',
+    cursor: 'pointer',
+    textAlign: 'left' as const,
   },
   // ---- Tab strip above the grid ----
   profileTabStrip: {
@@ -8927,9 +9450,9 @@ const S: Record<string, React.CSSProperties> = {
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
-    color: '#BF40FF',
+    color: '#FFFFFF',
     padding: '4px 18px',
-    borderBottom: `2px solid #BF40FF`,
+    borderBottom: `2px solid #FFFFFF`,
   },
   // ---- 3-column thumbnail grid (IG-style) ----
   // 2px gaps to give the unmistakable IG-grid look without the bright
@@ -8967,7 +9490,7 @@ const S: Record<string, React.CSSProperties> = {
   postDetailIndicator: {
     textAlign: 'center' as const,
     padding: '8px 12px 4px 12px',
-    color: '#BF40FF',
+    color: '#FFFFFF',
     fontSize: 12,
     fontFamily: 'system-ui, -apple-system, sans-serif',
     fontWeight: 600,
@@ -8990,12 +9513,12 @@ const S: Record<string, React.CSSProperties> = {
     textTransform: 'uppercase' as const,
   },
   socialHeaderTitle: {
-    color: '#BF40FF',
+    color: '#FFFFFF',
     fontSize: 22,
     fontFamily: '"Jolly Lodger", system-ui, serif',
     fontWeight: 400,
     letterSpacing: '0.04em',
-    textShadow: `0 0 10px #BF40FFaa`,
+    textShadow: `0 0 10px #FFFFFFaa`,
   },
   socialEmpty: {
     textAlign: 'center' as const,
@@ -9037,7 +9560,7 @@ const S: Record<string, React.CSSProperties> = {
     minWidth: 36,
     borderRadius: '50%',
     padding: 0,
-    background: 'linear-gradient(45deg, #BF40FF, #FF3B5C)',
+    background: 'linear-gradient(45deg, #FFFFFF, #FF3B5C)',
     border: 'none',
     cursor: 'pointer',
     display: 'flex',
@@ -9463,7 +9986,7 @@ const S: Record<string, React.CSSProperties> = {
     backgroundColor: 'rgba(191,64,255,0.06)',
     borderTop: `1px solid #2a2a2a`,
     border: 'none',
-    color: '#BF40FF',
+    color: '#FFFFFF',
     fontSize: 13,
     fontWeight: 600,
     letterSpacing: '0.04em',
@@ -9476,8 +9999,8 @@ const S: Record<string, React.CSSProperties> = {
     padding: '14px 16px',
     marginTop: 12,
     backgroundColor: 'rgba(191,64,255,0.08)',
-    border: `2px solid #BF40FF`,
-    color: '#BF40FF',
+    border: `2px solid #FFFFFF`,
+    color: '#FFFFFF',
     fontFamily: 'system-ui, -apple-system, sans-serif',
     fontSize: 18,
     fontWeight: 700,
@@ -9485,8 +10008,8 @@ const S: Record<string, React.CSSProperties> = {
     textTransform: 'uppercase' as const,
     borderRadius: 12,
     cursor: 'pointer',
-    boxShadow: `0 0 14px #BF40FF55, inset 0 0 10px #BF40FF22`,
-    textShadow: `0 0 8px #BF40FFaa`,
+    boxShadow: `0 0 14px #FFFFFF44, inset 0 0 10px #FFFFFF22`,
+    textShadow: `0 0 8px #FFFFFFaa`,
   },
   addPhotoBtnDisabled: {
     width: '100%',
@@ -9517,16 +10040,16 @@ const S: Record<string, React.CSSProperties> = {
     width: '100%',
     maxWidth: 460,
     backgroundColor: '#141414',
-    border: `1.5px solid #BF40FF`,
+    border: `1.5px solid #FFFFFF`,
     borderRadius: 16,
     padding: 18,
-    boxShadow: `0 0 30px #BF40FF33`,
+    boxShadow: `0 0 30px #FFFFFF22`,
     display: 'flex',
     flexDirection: 'column' as const,
     gap: 14,
   },
   postComposerTitle: {
-    color: '#BF40FF',
+    color: '#FFFFFF',
     fontSize: 18,
     fontWeight: 800,
     letterSpacing: '0.22em',
@@ -9583,15 +10106,15 @@ const S: Record<string, React.CSSProperties> = {
     width: '100%',
     padding: '14px',
     backgroundColor: 'rgba(191,64,255,0.1)',
-    border: `1.5px solid #BF40FF`,
-    color: '#BF40FF',
+    border: `1.5px solid #FFFFFF`,
+    color: '#FFFFFF',
     fontSize: 13,
     fontWeight: 700,
     letterSpacing: '0.18em',
     textTransform: 'uppercase' as const,
     borderRadius: 10,
     cursor: 'pointer',
-    boxShadow: `0 0 12px #BF40FF44`,
+    boxShadow: `0 0 12px #FFFFFF33`,
   },
   // Photo picker placeholder shown before a photo is selected.
   postComposerPicker: {
