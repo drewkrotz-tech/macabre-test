@@ -2373,6 +2373,7 @@ export default function App() {
             onBack={goHome}
             onSelectHandle={(h) => setView({ name: 'userProfile', handle: h })}
             onSelectPost={(postId, postList, preloadedPosts) => setView({ name: 'post', postId, postList, preloadedPosts })}
+            onHandleClaimed={setHandle}
           />
         ),
       };
@@ -2947,7 +2948,128 @@ function HomeBottomBar({ onSubmit, onList, onAbout, onSocial }: {
 type _ExposureSubTab = 'feed' | 'search' | 'post' | 'profile';
 let _exposureSubTabMemory: _ExposureSubTab = 'feed';
 
-function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, onBack, onSelectHandle, onSelectPost }: {
+// ---------- DreadFeed Claim Screen ----------
+// IG-style "Create your account" screen that lives in the Profile sub-tab
+// when the user has no handle claimed. Previously this slot just told the
+// user to "Open Submit a Location to claim one" — terrible UX for a
+// DreadFeed-only user who never plans to submit a haunted site.
+//
+// Reuses the same apiCheckHandle / apiClaimHandle backend as the inline
+// claim in SubmitView. On success, calls onClaimed which lifts to the
+// App-level handle state — like buttons, comments, follows immediately
+// start working without a refresh.
+function DreadFeedClaimScreen({ deviceId, onClaimed }: {
+  deviceId: string | null;
+  onClaimed: (handle: string) => void;
+}) {
+  const [typed, setTyped] = useState('');
+  const [status, setStatus] = useState<'idle' | 'checking' | 'available' | 'taken' | 'invalid'>('idle');
+  const [statusMsg, setStatusMsg] = useState('');
+  const [claiming, setClaiming] = useState(false);
+  const [claimErr, setClaimErr] = useState<string | null>(null);
+  const debounceRef = useRef<number | null>(null);
+
+  // Live availability check, debounced 350ms after the last keystroke.
+  // Same logic as ClaimHandleInline — kept inline here so we can render
+  // a custom IG-style layout around it without forcing ClaimHandleInline
+  // to grow extra "presentation mode" props.
+  useEffect(() => {
+    if (debounceRef.current) {
+      window.clearTimeout(debounceRef.current);
+      debounceRef.current = null;
+    }
+    const trimmed = typed.trim();
+    if (trimmed.length === 0) {
+      setStatus('idle');
+      setStatusMsg('');
+      return;
+    }
+    setStatus('checking');
+    setStatusMsg('checking…');
+    debounceRef.current = window.setTimeout(async () => {
+      const r = await apiCheckHandle(trimmed);
+      if (r.available) {
+        setStatus('available');
+        setStatusMsg('available');
+      } else if (r.reason && r.reason.toLowerCase().includes('taken')) {
+        setStatus('taken');
+        setStatusMsg('taken');
+      } else {
+        setStatus('invalid');
+        setStatusMsg(r.reason || 'invalid');
+      }
+    }, 350);
+    return () => {
+      if (debounceRef.current) window.clearTimeout(debounceRef.current);
+    };
+  }, [typed]);
+
+  const onClaim = async () => {
+    const trimmed = typed.trim();
+    if (!deviceId || !trimmed || status !== 'available' || claiming) return;
+    setClaiming(true);
+    setClaimErr(null);
+    const r = await apiClaimHandle(trimmed, deviceId);
+    setClaiming(false);
+    if (r.ok && r.handle) {
+      playPostShared(); // celebratory three-tone arpeggio on claim success
+      onClaimed(r.handle);
+    } else {
+      setClaimErr(r.reason || 'Claim failed.');
+    }
+  };
+
+  const statusColor =
+    status === 'available' ? '#5dd069' :
+    status === 'taken' ? '#ff6b6b' :
+    status === 'invalid' ? '#ffb648' :
+    '#888888';
+
+  return (
+    <div style={S.dreadFeedClaimWrap}>
+      <div style={S.dreadFeedClaimInner}>
+        <div style={S.dreadFeedClaimTitle}>Create your account</div>
+        <div style={S.dreadFeedClaimSubtitle}>
+          Pick a handle. This is your forever name on DreadFeed —
+          you can't change it later.
+        </div>
+        <input
+          type="text"
+          value={typed}
+          onChange={(e) => setTyped(e.target.value.replace(/[^A-Za-z0-9_]/g, ''))}
+          placeholder="username"
+          maxLength={20}
+          autoCorrect="off"
+          autoCapitalize="off"
+          spellCheck={false}
+          style={S.dreadFeedClaimInput}
+          disabled={claiming}
+        />
+        {statusMsg && (
+          <div style={{ ...S.dreadFeedClaimStatus, color: statusColor }}>
+            {status === 'available' ? '✓ ' :
+             status === 'taken' ? '✗ ' :
+             status === 'invalid' ? '⚠ ' : ''}{statusMsg}
+          </div>
+        )}
+        <button
+          onClick={onClaim}
+          disabled={status !== 'available' || claiming}
+          style={status === 'available' && !claiming ? S.dreadFeedClaimBtn : S.dreadFeedClaimBtnDisabled}
+        >
+          {claiming ? 'Creating…' : 'Create Account'}
+        </button>
+        {claimErr && <div style={S.dreadFeedClaimError}>{claimErr}</div>}
+        <div style={S.dreadFeedClaimFooter}>
+          3–20 characters. Letters, numbers, underscores.
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, onBack, onSelectHandle, onSelectPost, onHandleClaimed }: {
   handle: string | null;
   deviceId: string | null;
   sites: SinisterSite[];
@@ -2956,6 +3078,11 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
   onBack: () => void;
   onSelectHandle: (handle: string) => void;
   onSelectPost: (postId: string, postList?: string[], preloadedPosts?: SocialPost[]) => void;
+  // Called when the user successfully claims a handle from the inline
+  // ClaimHandleScreen in the Profile tab. The parent App lifts this
+  // into its top-level `handle` state so subsequent likes/comments/
+  // follows immediately work without a refresh.
+  onHandleClaimed: (h: string) => void;
 }) {
   // Sub-tab inside eXposure. The static black bottom bar switches
   // between four sub-screens: 'feed' (the post feed, eXposure home),
@@ -3234,13 +3361,10 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
             embedded
           />
         ) : (
-          <div style={S.socialEmpty}>
-            <div style={{ marginBottom: 14, fontSize: 16 }}>No handle claimed yet.</div>
-            <span style={{ opacity: 0.7, fontSize: 13 }}>
-              Claim a handle to build your DreadFeed profile.<br />
-              Open Submit a Location to claim one.
-            </span>
-          </div>
+          <DreadFeedClaimScreen
+            deviceId={deviceId}
+            onClaimed={onHandleClaimed}
+          />
         )
       )}
 
@@ -3568,7 +3692,6 @@ function ExposureSearchView({ allPosts, currentHandle, deviceId, sites, onSelect
   onSelectHandle: (handle: string) => void;
 }) {
   const [query, setQuery] = useState('');
-  const [category, setCategory] = useState<string | null>(null);
 
   const siteById = useMemo(() => {
     const m = new Map<string, SinisterSite>();
@@ -3578,7 +3701,6 @@ function ExposureSearchView({ allPosts, currentHandle, deviceId, sites, onSelect
 
   const q = query.trim().toLowerCase();
   const filtered = allPosts.filter((p) => {
-    if (category && p.siteCategory !== category) return false;
     if (!q) return true;
     // Match against handle, caption, or site title.
     return (
@@ -3589,14 +3711,14 @@ function ExposureSearchView({ allPosts, currentHandle, deviceId, sites, onSelect
   });
 
   return (
-    <div style={{ paddingBottom: 156 }}>
+    <div style={{ paddingBottom: 120 }}>
       {/* Results — render newest-first as user types. Live above the
           sticky search input. paddingBottom on the parent div leaves
-          space for the input + chips + black bar (~156px) so the last
-          result isn't hidden. */}
+          space for the input + black bar (~120px) so the last result
+          isn't hidden. */}
       {filtered.length === 0 ? (
         <div style={S.socialEmpty}>
-          {q || category ? 'No matches.' : 'Start typing to search.'}<br />
+          {q ? 'No matches.' : 'Start typing to search.'}<br />
           <span style={{ opacity: 0.6, fontSize: 12 }}>
             Try a handle, a caption keyword, or a site name.
           </span>
@@ -3624,23 +3746,6 @@ function ExposureSearchView({ allPosts, currentHandle, deviceId, sites, onSelect
           transform doesn't break position:fixed. */}
       {createPortal(
         <div style={S.searchStickyBar}>
-          <div style={S.filterChipBar}>
-            <button
-              onClick={() => { playSubDrop(); setCategory(null); }}
-              style={{ ...S.filterChip, ...(category === null ? S.filterChipActive : {}) }}
-            >
-              All
-            </button>
-            {CATEGORIES.map((cat) => (
-              <button
-                key={cat.key}
-                onClick={() => { playSubDrop(); setCategory(cat.key); }}
-                style={{ ...S.filterChip, ...(category === cat.key ? S.filterChipActive : {}) }}
-              >
-                {cat.label}
-              </button>
-            ))}
-          </div>
           <div style={{ padding: '8px 12px' }}>
             <input
               type="text"
@@ -9176,37 +9281,6 @@ const S: Record<string, React.CSSProperties> = {
   },
   // Category filter chip strip. Horizontally scrollable row of pill
   // buttons; the active one is filled purple, others are outlined.
-  filterChipBar: {
-    display: 'flex',
-    gap: 8,
-    padding: '10px 12px',
-    overflowX: 'auto' as const,
-    overflowY: 'hidden' as const,
-    whiteSpace: 'nowrap' as const,
-    backgroundColor: 'rgba(10,10,10,0.5)',
-    borderBottom: `1px solid #2a2a2a`,
-    scrollbarWidth: 'none' as const,
-    WebkitOverflowScrolling: 'touch' as const,
-  },
-  filterChip: {
-    flex: '0 0 auto',
-    padding: '6px 14px',
-    borderRadius: 999,
-    border: `1px solid #444`,
-    backgroundColor: 'rgba(0,0,0,0.4)',
-    color: '#BBB',
-    fontFamily: '"Jolly Lodger", system-ui, serif',
-    fontSize: 16,
-    letterSpacing: '0.04em',
-    cursor: 'pointer',
-  },
-  filterChipActive: {
-    border: `1.5px solid #FFFFFF`,
-    backgroundColor: 'rgba(191,64,255,0.15)',
-    color: '#FFFFFF',
-    textShadow: `0 0 6px #FFFFFF88`,
-    boxShadow: `0 0 10px #FFFFFF33`,
-  },
   // ---- Static black bottom bar inside eXposure ----
   // Fixed at the bottom of the viewport, never moves on scroll. 4 white
   // SVG icons. Active tab brightens and gets a subtle glow.
@@ -9423,6 +9497,100 @@ const S: Record<string, React.CSSProperties> = {
     fontWeight: 700,
     fontFamily: 'system-ui, -apple-system, sans-serif',
     cursor: 'pointer',
+  },
+  // ---- DreadFeed Claim Screen (Profile tab when no handle) ----
+  // Full-height centered claim form. Sits in the same scrollable area
+  // that the profile would normally occupy, so it slots cleanly into
+  // the existing SocialView layout (brand header above, bottom bar
+  // below). No background image — pure black to match the IG-style
+  // sign-up aesthetic.
+  dreadFeedClaimWrap: {
+    display: 'flex',
+    alignItems: 'flex-start',
+    justifyContent: 'center',
+    paddingTop: 40,
+    paddingBottom: 120,
+    minHeight: 'calc(100vh - 220px)',
+  },
+  dreadFeedClaimInner: {
+    width: '100%',
+    maxWidth: 360,
+    padding: '0 24px',
+    display: 'flex',
+    flexDirection: 'column' as const,
+    alignItems: 'stretch',
+  },
+  dreadFeedClaimTitle: {
+    color: '#FFFFFF',
+    fontSize: 22,
+    fontWeight: 700,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    textAlign: 'center' as const,
+    marginBottom: 8,
+  },
+  dreadFeedClaimSubtitle: {
+    color: '#888888',
+    fontSize: 13,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    textAlign: 'center' as const,
+    marginBottom: 24,
+    lineHeight: 1.4,
+  },
+  dreadFeedClaimInput: {
+    backgroundColor: '#0f0f0f',
+    color: '#FFFFFF',
+    border: '1px solid #333',
+    borderRadius: 8,
+    padding: '12px 14px',
+    fontSize: 16,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    outline: 'none',
+    marginBottom: 6,
+  } as any,
+  dreadFeedClaimStatus: {
+    fontSize: 12,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    marginBottom: 14,
+    letterSpacing: '0.04em',
+  },
+  dreadFeedClaimBtn: {
+    backgroundColor: '#FFFFFF',
+    color: '#000000',
+    border: 'none',
+    borderRadius: 8,
+    padding: '12px 14px',
+    fontSize: 15,
+    fontWeight: 700,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+    marginTop: 8,
+  },
+  dreadFeedClaimBtnDisabled: {
+    backgroundColor: '#222',
+    color: '#666',
+    border: 'none',
+    borderRadius: 8,
+    padding: '12px 14px',
+    fontSize: 15,
+    fontWeight: 700,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'default',
+    marginTop: 8,
+  },
+  dreadFeedClaimError: {
+    color: '#ff6b6b',
+    fontSize: 13,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    marginTop: 10,
+    textAlign: 'center' as const,
+  },
+  dreadFeedClaimFooter: {
+    color: '#666',
+    fontSize: 11,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    textAlign: 'center' as const,
+    marginTop: 16,
+    letterSpacing: '0.03em',
   },
   // Row inside the followers / following bottom sheet. Avatar on left,
   // handle column on right, tap navigates / closes the sheet.
@@ -9983,7 +10151,7 @@ const S: Record<string, React.CSSProperties> = {
     width: '100%',
     textAlign: 'left' as const,
     padding: '10px 14px',
-    backgroundColor: 'rgba(191,64,255,0.06)',
+    backgroundColor: 'rgba(255,255,255,0.04)',
     borderTop: `1px solid #2a2a2a`,
     border: 'none',
     color: '#FFFFFF',
@@ -9998,7 +10166,7 @@ const S: Record<string, React.CSSProperties> = {
     width: '100%',
     padding: '14px 16px',
     marginTop: 12,
-    backgroundColor: 'rgba(191,64,255,0.08)',
+    backgroundColor: 'rgba(255,255,255,0.05)',
     border: `2px solid #FFFFFF`,
     color: '#FFFFFF',
     fontFamily: 'system-ui, -apple-system, sans-serif',
@@ -10105,7 +10273,7 @@ const S: Record<string, React.CSSProperties> = {
   postComposerSubmit: {
     width: '100%',
     padding: '14px',
-    backgroundColor: 'rgba(191,64,255,0.1)',
+    backgroundColor: 'rgba(255,255,255,0.06)',
     border: `1.5px solid #FFFFFF`,
     color: '#FFFFFF',
     fontSize: 13,
