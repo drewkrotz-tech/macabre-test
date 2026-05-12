@@ -1,6 +1,7 @@
 // @ts-ignore — Vite handles .ttf imports as URL strings
 declare module '*.ttf' { const url: string; export default url; }
 declare module '*.png' { const url: string; export default url; }
+declare module '*.svg' { const url: string; export default url; }
 
 import { forwardRef, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
@@ -21,6 +22,57 @@ import exposureIconUrl from './assets/exposure.png';
 import leaderIconUrl from './assets/leader.png';
 import aboutIconUrl from './assets/about.png';
 import locationIconUrl from './assets/location.png';
+
+// Library avatar assets — 12 horror-themed SVG icons users can pick
+// as their profile avatar (alternative to uploading a custom photo).
+// IDs MUST stay in sync with the server's LIBRARY_AVATAR_IDS set in
+// handles.js — adding/removing here without updating the server will
+// cause the server to reject the chosen id.
+import avatarSkullUrl from './assets/avatars/avatar-skull.svg';
+import avatarPumpkinUrl from './assets/avatars/avatar-pumpkin.svg';
+import avatarGhostUrl from './assets/avatars/avatar-ghost.svg';
+import avatarCrowUrl from './assets/avatars/avatar-crow.svg';
+import avatarTombstoneUrl from './assets/avatars/avatar-tombstone.svg';
+import avatarMoonUrl from './assets/avatars/avatar-moon.svg';
+import avatarPentagramUrl from './assets/avatars/avatar-pentagram.svg';
+import avatarHandprintUrl from './assets/avatars/avatar-handprint.svg';
+import avatarSkeletonHandUrl from './assets/avatars/avatar-skeleton-hand.svg';
+import avatarCandleUrl from './assets/avatars/avatar-candle.svg';
+import avatarSpiderUrl from './assets/avatars/avatar-spider.svg';
+import avatarBatUrl from './assets/avatars/avatar-bat.svg';
+
+const LIBRARY_AVATARS: { id: string; label: string; url: string }[] = [
+  { id: 'skull',         label: 'Skull',         url: avatarSkullUrl },
+  { id: 'pumpkin',       label: 'Pumpkin',       url: avatarPumpkinUrl },
+  { id: 'ghost',         label: 'Ghost',         url: avatarGhostUrl },
+  { id: 'crow',          label: 'Crow',          url: avatarCrowUrl },
+  { id: 'tombstone',     label: 'Tombstone',     url: avatarTombstoneUrl },
+  { id: 'moon',          label: 'Moon',          url: avatarMoonUrl },
+  { id: 'pentagram',     label: 'Pentagram',     url: avatarPentagramUrl },
+  { id: 'handprint',     label: 'Handprint',     url: avatarHandprintUrl },
+  { id: 'skeleton-hand', label: 'Skeleton hand', url: avatarSkeletonHandUrl },
+  { id: 'candle',        label: 'Candle',        url: avatarCandleUrl },
+  { id: 'spider',        label: 'Spider',        url: avatarSpiderUrl },
+  { id: 'bat',           label: 'Bat',           url: avatarBatUrl },
+];
+const LIBRARY_AVATAR_BY_ID: Record<string, string> = LIBRARY_AVATARS.reduce(
+  (acc, a) => { acc[a.id] = a.url; return acc; },
+  {} as Record<string, string>,
+);
+
+// Resolve a server-returned avatarUrl string into a renderable URL.
+// Three input shapes:
+//   - null/undefined: caller falls back to default (exposureIconUrl)
+//   - 'library:<id>': mapped to the bundled SVG asset (no network hit)
+//   - 'https://...': returned as-is (custom upload from R2)
+function resolveAvatarUrl(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  if (raw.startsWith('library:')) {
+    const id = raw.slice('library:'.length);
+    return LIBRARY_AVATAR_BY_ID[id] || null;
+  }
+  return raw;
+}
 
 // Register the Living Hell font face once at module load.
 if (typeof document !== 'undefined' && !document.getElementById('__livinghell-fontface')) {
@@ -181,6 +233,65 @@ async function apiClaimHandle(
     });
     return await res.json();
   } catch { return { ok: false, reason: 'network error' }; }
+}
+
+// ---- Avatar APIs ----
+// Set a library avatar (one of the 12 bundled SVGs). Server validates
+// libraryId against its allow-list — invalid ids return 400.
+async function apiSetLibraryAvatar(args: { handle: string; deviceId: string; libraryId: string }):
+  Promise<{ ok: boolean; avatarUrl?: string | null; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/handles/avatar/library`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    return await res.json();
+  } catch { return { ok: false, reason: 'network error' }; }
+}
+
+// Upload a custom avatar photo. Server resizes to 256x256 JPEG, strips
+// EXIF, stores at avatars/{lowerHandle}.jpg in R2. Returns the new
+// avatarUrl with a cache-busting query param so the UI refreshes.
+async function apiUploadAvatar(args: { handle: string; deviceId: string; photo: File | Blob }):
+  Promise<{ ok: boolean; avatarUrl?: string | null; reason?: string }> {
+  try {
+    const fd = new FormData();
+    fd.append('handle', args.handle);
+    fd.append('deviceId', args.deviceId);
+    fd.append('photo', args.photo);
+    const res = await fetch(`${API_BASE}/handles/avatar/upload`, {
+      method: 'POST',
+      body: fd,
+    });
+    return await res.json();
+  } catch { return { ok: false, reason: 'network error' }; }
+}
+
+// Revert to the default placeholder. Server deletes the prior custom
+// upload from R2 (best-effort) and clears the avatar field.
+async function apiRemoveAvatar(args: { handle: string; deviceId: string }):
+  Promise<{ ok: boolean; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/handles/avatar/remove`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    return await res.json();
+  } catch { return { ok: false, reason: 'network error' }; }
+}
+
+// Fetch one handle's current avatar URL. Used when the post/comment/etc
+// payload didn't carry the avatar (older records, comments not yet
+// enriched server-side). Returns null if the handle has no custom avatar.
+async function apiGetAvatar(handle: string): Promise<string | null> {
+  try {
+    const res = await fetch(`${API_BASE}/handles/avatar/${encodeURIComponent(handle)}`);
+    if (!res.ok) return null;
+    const data = await res.json();
+    return (data && typeof data.avatarUrl === 'string') ? data.avatarUrl : null;
+  } catch { return null; }
 }
 
 // ---- Email-path account creation (verified at claim time) ----
@@ -504,6 +615,11 @@ type SocialPost = {
   siteTitle: string | null;
   siteCategory: string | null;
   handle: string;
+  // Server returns the post author's current avatar — either null
+  // (default placeholder), 'library:<id>' (bundled SVG), or a full
+  // R2 URL (custom upload). Resolved via resolveAvatarUrl() before
+  // passing to <img src>.
+  avatarUrl?: string | null;
   caption: string;
   photoUrl: string;
   createdAt: string;
@@ -5476,11 +5592,15 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap 
       {/* Top row: avatar | handle · time | location chip | menu */}
       <div style={S.postHeader}>
         <button onClick={onHandleTap} style={S.postAvatarBtn} aria-label={`${post.handle} profile`}>
-          {/* Skull placeholder avatar — until users can upload their own.
-              Wrapped in a circular div with a thin neon-purple ring so
-              the eXposure identity reads on the otherwise IG-neutral
-              card. Same icon for everyone for now. */}
-          <img src={exposureIconUrl} alt="" style={S.postAvatarImg} />
+          {/* Author avatar — server denormalizes post.avatarUrl. Falls
+              back to the default exposure icon if the user hasn't picked
+              a library/upload avatar yet. Wrapped in the same circular
+              ring styling as before. */}
+          <img
+            src={resolveAvatarUrl(post.avatarUrl) || exposureIconUrl}
+            alt=""
+            style={S.postAvatarImg}
+          />
         </button>
         <div style={S.postHeaderTextCol}>
           <div style={S.postHeaderLine1}>
@@ -6223,6 +6343,11 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
   const [stats, setStats] = useState<{ visitCount: number; submitCount: number; badgeCount: number } | null>(null);
   const [posts, setPosts] = useState<SocialPost[]>([]);
   const [loading, setLoading] = useState(true);
+  // The profile's current avatar URL (raw server form — 'library:xxx',
+  // full https URL, or null). Resolved via resolveAvatarUrl() at render
+  // time. Fetched on mount and refreshed when the user (if it's their
+  // own profile) picks a new avatar from the picker.
+  const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
   // Follow status: follower count, following count, and whether the
   // current user follows the profile being viewed. Loaded from
   // /follows/status/:target on mount.
@@ -6234,6 +6359,8 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
   // Toggling flips immediately and persists via apiBlock / apiUnblock.
   const [isBlocked, setIsBlocked] = useState(false);
   const [blockBusy, setBlockBusy] = useState(false);
+  // Avatar picker visibility. Only relevant on your own profile.
+  const [avatarPickerOpen, setAvatarPickerOpen] = useState(false);
 
   const isMe = !!currentHandle && currentHandle.toLowerCase() === profileHandle.toLowerCase();
 
@@ -6241,12 +6368,14 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
     let cancelled = false;
     (async () => {
       setLoading(true);
-      // Fetch badge stats + posts + follow status + hidden set in parallel.
-      const [badgeData, handlePosts, fStatus, hidden] = await Promise.all([
+      // Fetch badge stats + posts + follow status + hidden set + avatar
+      // in parallel.
+      const [badgeData, handlePosts, fStatus, hidden, avatar] = await Promise.all([
         apiGetBadges(profileHandle),
         apiFetchPostsByHandle(profileHandle),
         apiFollowStatus({ target: profileHandle, handle: currentHandle }),
         getHiddenSet(currentHandle),
+        apiGetAvatar(profileHandle),
       ]);
       if (cancelled) return;
       setStats({
@@ -6257,6 +6386,7 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
       setPosts(handlePosts);
       setFollowStatus(fStatus);
       setIsBlocked(hidden.has(profileHandle.toLowerCase()));
+      setAvatarUrl(avatar);
       setLoading(false);
     })();
     return () => { cancelled = true; };
@@ -6352,7 +6482,29 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
       {/* ---- IG-style profile row: big avatar + stats ---- */}
       <div style={S.profileTopRow}>
         <div style={S.profileAvatarWrap}>
-          <img src={exposureIconUrl} alt="" style={S.profileAvatarImg} />
+          {isMe ? (
+            // Own profile: tapping the avatar opens the picker so users
+            // can pick a library icon or upload a photo. Camera-icon
+            // overlay hints that it's editable.
+            <button
+              onClick={() => setAvatarPickerOpen(true)}
+              style={S.profileAvatarEditBtn}
+              aria-label="Change avatar"
+            >
+              <img
+                src={resolveAvatarUrl(avatarUrl) || exposureIconUrl}
+                alt=""
+                style={S.profileAvatarImg}
+              />
+              <span style={S.profileAvatarEditBadge}>＋</span>
+            </button>
+          ) : (
+            <img
+              src={resolveAvatarUrl(avatarUrl) || exposureIconUrl}
+              alt=""
+              style={S.profileAvatarImg}
+            />
+          )}
         </div>
         <div style={S.profileStatsCluster}>
           {/* Posts count — not tappable; shows the count of approved
@@ -6510,10 +6662,175 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
           }}
         />
       )}
+
+      {/* Avatar picker — only mounted when the user (on their own
+          profile) tapped the edit badge. Library tab + Upload tab.
+          On successful change, the picker calls onChanged with the
+          new server-form URL so the profile updates without a refetch. */}
+      {avatarPickerOpen && isMe && currentHandle && deviceId && (
+        <AvatarPickerModal
+          handle={currentHandle}
+          deviceId={deviceId}
+          currentAvatarUrl={avatarUrl}
+          onClose={() => setAvatarPickerOpen(false)}
+          onChanged={(newUrl) => {
+            setAvatarUrl(newUrl);
+            setAvatarPickerOpen(false);
+            showToast('Avatar updated', 'success');
+          }}
+        />
+      )}
     </div>
   );
 }
 
+
+// ---------- Avatar Picker Modal ----------
+// Two-tab picker for changing a user's profile avatar. Tab 1 (Library)
+// shows the 12 bundled SVGs in a 3-column grid. Tab 2 (Upload) lets the
+// user pick a photo from their camera roll; the server resizes + crops
+// to 256x256 JPEG and stores it on R2.
+//
+// Calls onChanged(newServerUrl) on success — caller updates its avatar
+// state without a refetch. server URLs come back in the form
+// 'library:<id>' for picks or 'https://...' for uploads.
+function AvatarPickerModal({ handle, deviceId, currentAvatarUrl, onClose, onChanged }: {
+  handle: string;
+  deviceId: string;
+  currentAvatarUrl: string | null;
+  onClose: () => void;
+  onChanged: (newUrl: string | null) => void;
+}) {
+  const [tab, setTab] = useState<'library' | 'upload'>('library');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Track which library id (if any) is currently active so the grid can
+  // highlight it.
+  const currentLibraryId = (currentAvatarUrl && currentAvatarUrl.startsWith('library:'))
+    ? currentAvatarUrl.slice('library:'.length)
+    : null;
+  const isCurrentUpload = !!(currentAvatarUrl && currentAvatarUrl.startsWith('http'));
+
+  const onPickLibrary = async (id: string) => {
+    if (busy) return;
+    setBusy(true);
+    setErr(null);
+    const r = await apiSetLibraryAvatar({ handle, deviceId, libraryId: id });
+    setBusy(false);
+    if (!r.ok) {
+      setErr(r.reason || 'Failed to set avatar.');
+      return;
+    }
+    onChanged(r.avatarUrl ?? null);
+  };
+
+  const onFilePicked = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files && e.target.files[0];
+    // Reset the input so picking the same file twice in a row still fires.
+    if (fileInputRef.current) fileInputRef.current.value = '';
+    if (!file) return;
+    if (busy) return;
+    setBusy(true);
+    setErr(null);
+    const r = await apiUploadAvatar({ handle, deviceId, photo: file });
+    setBusy(false);
+    if (!r.ok) {
+      setErr(r.reason || 'Upload failed.');
+      return;
+    }
+    onChanged(r.avatarUrl ?? null);
+  };
+
+  const onRemove = async () => {
+    if (busy) return;
+    setBusy(true);
+    setErr(null);
+    const r = await apiRemoveAvatar({ handle, deviceId });
+    setBusy(false);
+    if (!r.ok) {
+      setErr(r.reason || 'Failed to remove avatar.');
+      return;
+    }
+    onChanged(null);
+  };
+
+  return createPortal(
+    <div style={S.avatarPickerBackdrop} onClick={onClose}>
+      <div style={S.avatarPickerSheet} onClick={(e) => e.stopPropagation()}>
+        <div style={S.avatarPickerHeader}>
+          <button onClick={onClose} style={S.avatarPickerCancelBtn}>Cancel</button>
+          <div style={S.avatarPickerTitle}>Change avatar</div>
+          <div style={{ width: 60 }} />
+        </div>
+
+        <div style={S.avatarPickerTabs}>
+          <button
+            onClick={() => setTab('library')}
+            style={{ ...S.avatarPickerTab, ...(tab === 'library' ? S.avatarPickerTabActive : {}) }}
+          >Library</button>
+          <button
+            onClick={() => setTab('upload')}
+            style={{ ...S.avatarPickerTab, ...(tab === 'upload' ? S.avatarPickerTabActive : {}) }}
+          >Upload</button>
+        </div>
+
+        {err && <div style={S.avatarPickerErr}>{err}</div>}
+
+        {tab === 'library' && (
+          <div style={S.avatarPickerGrid}>
+            {LIBRARY_AVATARS.map((a) => (
+              <button
+                key={a.id}
+                onClick={() => onPickLibrary(a.id)}
+                disabled={busy}
+                style={{
+                  ...S.avatarPickerCell,
+                  ...(a.id === currentLibraryId ? S.avatarPickerCellActive : {}),
+                }}
+                aria-label={a.label}
+              >
+                <img src={a.url} alt={a.label} style={S.avatarPickerCellImg} />
+              </button>
+            ))}
+          </div>
+        )}
+
+        {tab === 'upload' && (
+          <div style={S.avatarPickerUploadPane}>
+            <div style={S.avatarPickerUploadHint}>
+              Pick a photo from your camera roll. We'll resize and crop it
+              to a square. Avatars are public — don't upload anything you
+              don't want others to see.
+            </div>
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              disabled={busy}
+              style={S.avatarPickerUploadBtn}
+            >{busy ? 'Uploading…' : 'Choose photo'}</button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*"
+              onChange={onFilePicked}
+              style={{ display: 'none' }}
+            />
+          </div>
+        )}
+
+        {(currentLibraryId || isCurrentUpload) && (
+          <button
+            onClick={onRemove}
+            disabled={busy}
+            style={S.avatarPickerRemoveBtn}
+          >Reset to default</button>
+        )}
+      </div>
+    </div>,
+    document.body
+  );
+}
 
 // ---------- Handle List Sheet ----------
 // IG-style bottom sheet showing a list of handles (followers or
@@ -11271,6 +11588,175 @@ const S: Record<string, React.CSSProperties> = {
     pointerEvents: 'none' as const,
     WebkitUserSelect: 'none' as const,
     WebkitTouchCallout: 'none' as const,
+  },
+  // Wraps the big profile avatar when it's tappable (own profile only).
+  // Removes default button chrome; positioning relative so the edit
+  // badge can sit absolutely in the bottom-right corner.
+  profileAvatarEditBtn: {
+    width: '100%',
+    height: '100%',
+    padding: 0,
+    margin: 0,
+    border: 'none',
+    background: 'transparent',
+    cursor: 'pointer',
+    position: 'relative' as const,
+    display: 'block',
+  },
+  // Small "+" badge in the bottom-right corner of the editable avatar.
+  // Hints to the user that the avatar is tappable to change.
+  profileAvatarEditBadge: {
+    position: 'absolute' as const,
+    right: -2,
+    bottom: -2,
+    width: 24,
+    height: 24,
+    borderRadius: '50%',
+    background: '#FF3B5C',
+    color: '#FFFFFF',
+    fontSize: 18,
+    lineHeight: '22px',
+    fontWeight: 700 as const,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    border: '2px solid #0a0a0a',
+    pointerEvents: 'none' as const,
+  },
+  // Avatar picker modal — bottom sheet style, matches the rest of the
+  // app's modal sheets (BlockedListModal, comment composer, etc).
+  avatarPickerBackdrop: {
+    position: 'fixed' as const,
+    inset: 0,
+    background: 'rgba(0,0,0,0.85)',
+    zIndex: 10000,
+    display: 'flex',
+    alignItems: 'flex-end',
+    justifyContent: 'center',
+  },
+  avatarPickerSheet: {
+    width: '100%',
+    maxWidth: 520,
+    background: '#0a0a0a',
+    borderTopLeftRadius: 16,
+    borderTopRightRadius: 16,
+    padding: '12px 16px 24px',
+    display: 'flex',
+    flexDirection: 'column' as const,
+    maxHeight: '85vh',
+    overflowY: 'auto' as const,
+  },
+  avatarPickerHeader: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingBottom: 8,
+  },
+  avatarPickerTitle: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: 600 as const,
+    flex: 1,
+    textAlign: 'center' as const,
+  },
+  avatarPickerCancelBtn: {
+    background: 'transparent',
+    color: '#FFFFFF',
+    border: 'none',
+    fontSize: 15,
+    width: 60,
+    textAlign: 'left' as const,
+    padding: 0,
+    cursor: 'pointer',
+  },
+  avatarPickerTabs: {
+    display: 'flex',
+    gap: 8,
+    padding: '8px 0 16px',
+  },
+  avatarPickerTab: {
+    flex: 1,
+    padding: '10px 0',
+    background: 'transparent',
+    color: '#888',
+    border: '1px solid #333',
+    borderRadius: 8,
+    fontSize: 14,
+    fontWeight: 600 as const,
+    cursor: 'pointer',
+  },
+  avatarPickerTabActive: {
+    background: '#FFFFFF',
+    color: '#000000',
+    borderColor: '#FFFFFF',
+  },
+  avatarPickerErr: {
+    color: '#FF3B5C',
+    fontSize: 13,
+    padding: '0 0 8px',
+    textAlign: 'center' as const,
+  },
+  avatarPickerGrid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(3, 1fr)',
+    gap: 10,
+  },
+  avatarPickerCell: {
+    aspectRatio: '1 / 1',
+    background: '#1a1a1a',
+    border: '2px solid transparent',
+    borderRadius: '50%',
+    padding: 0,
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    overflow: 'hidden',
+  },
+  avatarPickerCellActive: {
+    borderColor: '#FF3B5C',
+    boxShadow: '0 0 12px #FF3B5C66',
+  },
+  avatarPickerCellImg: {
+    width: '70%',
+    height: '70%',
+    objectFit: 'contain' as const,
+    pointerEvents: 'none' as const,
+  },
+  avatarPickerUploadPane: {
+    padding: '8px 0',
+    display: 'flex',
+    flexDirection: 'column' as const,
+    alignItems: 'center',
+    gap: 16,
+  },
+  avatarPickerUploadHint: {
+    color: '#888',
+    fontSize: 13,
+    lineHeight: 1.4,
+    textAlign: 'center' as const,
+    padding: '0 16px',
+  },
+  avatarPickerUploadBtn: {
+    background: '#FFFFFF',
+    color: '#000000',
+    border: 'none',
+    borderRadius: 8,
+    padding: '12px 28px',
+    fontSize: 15,
+    fontWeight: 600 as const,
+    cursor: 'pointer',
+  },
+  avatarPickerRemoveBtn: {
+    marginTop: 16,
+    background: 'transparent',
+    color: '#FF3B5C',
+    border: '1px solid #FF3B5C',
+    borderRadius: 8,
+    padding: '10px 0',
+    fontSize: 14,
+    fontWeight: 600 as const,
+    cursor: 'pointer',
   },
   profileStatsCluster: {
     flex: 1,
