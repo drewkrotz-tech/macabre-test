@@ -2629,7 +2629,7 @@ function HomeBottomBar({ onSubmit, onList, onAbout, onSocial }: {
         onClick={() => { playBackSound(); onSocial(); }}
       >
         <img src={exposureIconUrl} alt="" style={S.homeBarIcon} />
-        <span style={S.homeBarLabel}>eXposure</span>
+        <span style={S.homeBarLabel}>DreadFeed</span>
       </button>
       <button
         className="sinister-icon-btn" style={S.homeBarBtn}
@@ -2862,7 +2862,7 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
             <div style={S.socialEmpty}>
               No posts yet.<br />
               <span style={{ opacity: 0.7, fontSize: 13 }}>
-                Visit a site and tap "Post to eXposure" to be the first.
+                Visit a site and tap "Post to DreadFeed" to be the first.
               </span>
             </div>
           ) : (
@@ -2921,7 +2921,7 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
           <div style={S.socialEmpty}>
             <div style={{ marginBottom: 14, fontSize: 16 }}>No handle claimed yet.</div>
             <span style={{ opacity: 0.7, fontSize: 13 }}>
-              Claim a handle to build your eXposure profile.<br />
+              Claim a handle to build your DreadFeed profile.<br />
               Open Submit a Location to claim one.
             </span>
           </div>
@@ -2960,7 +2960,7 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
           onClose={() => setPostSheetOpen(false)}
           onPosted={() => {
             setPostSheetOpen(false);
-            showToast('Posted to eXposure', 'success');
+            showToast('Posted to DreadFeed', 'success');
             void refreshFeed();
           }}
         />
@@ -3554,8 +3554,7 @@ function formatTimeAgo(iso: string): string {
 function ExposureBrandHeader() {
   return (
     <div style={S.exposureBrandHeader}>
-      <div style={S.exposureBrandTitle}>eXposure</div>
-      <div style={S.exposureBrandTagline}>Photos from the most haunted places</div>
+      <div style={S.exposureBrandTitle}>DreadFeed</div>
     </div>
   );
 }
@@ -3718,10 +3717,10 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
         <div style={S.socialEmpty}>Loading…</div>
       ) : posts.length === 0 ? (
         <div style={S.socialEmpty}>
-          {isMe ? 'You haven\u2019t posted to eXposure yet.' : 'No posts yet.'}
+          {isMe ? 'You haven\u2019t posted to DreadFeed yet.' : 'No posts yet.'}
           <br />
           <span style={{ opacity: 0.7, fontSize: 13 }}>
-            {isMe ? 'Visit a site and tap "Post to eXposure" to share.' : 'Check back later.'}
+            {isMe ? 'Visit a site and tap "Post to DreadFeed" to share.' : 'Check back later.'}
           </span>
         </div>
       ) : (
@@ -6715,7 +6714,7 @@ function AddPhotoButton({ site, handle, deviceId, currentLocation, onPosted }: {
         onClick={() => fileRef.current?.click()}
         style={S.addPhotoBtn}
       >
-        📷 Post to eXposure
+        📷 Post to DreadFeed
       </button>
 
       {/* Composer modal — appears after the user captures a photo. */}
