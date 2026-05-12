@@ -211,15 +211,16 @@ async function apiFinishEmailClaim(args: { handle: string; code: string; deviceI
   } catch (e: any) { return { ok: false, reason: e?.message || 'network error' }; }
 }
 
-async function apiGetMyHandle(deviceId: string): Promise<{ handle: string | null; hasEmail: boolean }> {
+async function apiGetMyHandle(deviceId: string): Promise<{ handle: string | null; hasEmail: boolean; hasApple: boolean }> {
   try {
     const res = await fetch(`${API_BASE}/handles/me?deviceId=${encodeURIComponent(deviceId)}`);
     const data = await res.json();
     return {
       handle: data?.handle || null,
       hasEmail: !!data?.hasEmail,
+      hasApple: !!data?.hasApple,
     };
-  } catch { return { handle: null, hasEmail: false }; }
+  } catch { return { handle: null, hasEmail: false, hasApple: false }; }
 }
 
 // ---------- Account management API ----------
@@ -236,6 +237,22 @@ async function apiSignInApple(args: { identityToken: string; deviceId: string })
     });
     return await res.json();
   } catch (e: any) { return { ok: false, handle: null, reason: e?.message || 'network error' }; }
+}
+
+// Link an Apple ID to an existing handle. Used by the migration modal —
+// the regular sign-in-apple flow assumes "log me in by Apple ID", but
+// grandfathered users need "attach Apple ID to the handle I'm currently
+// in." Verifies ownership AND the Apple JWT.
+async function apiLinkApple(args: { handle: string; deviceId: string; identityToken: string }):
+  Promise<{ ok: boolean; handle?: string; reason?: string; existingHandle?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/handles/link-apple`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    return await res.json();
+  } catch (e: any) { return { ok: false, reason: e?.message || 'network error' }; }
 }
 
 async function apiAddEmail(args: { handle: string; deviceId: string; email: string }): Promise<{ ok: boolean; reason?: string }> {
@@ -2085,12 +2102,14 @@ export default function App() {
   });
 
   // Email-migration prompt for grandfathered handles. Set true at app
-  // boot when /handles/me reports the user owns a handle but has no
-  // email on file. The modal blocks dismissal — they have to add an
-  // email (or sign in with Apple) to continue. Stops the "I lost my
-  // phone and now I'm locked out forever" Evan scenario for every
-  // future user.
+  // boot when /handles/me reports the user owns a handle but is missing
+  // either an email OR an Apple ID link. The modal blocks dismissal —
+  // they have to add the missing recovery method to continue.
   const [showMigrateEmail, setShowMigrateEmail] = useState(false);
+  // Snapshot of which recovery methods are already on the account at
+  // boot — used by the modal to hide buttons for methods that exist.
+  const [migrateHasEmail, setMigrateHasEmail] = useState(false);
+  const [migrateHasApple, setMigrateHasApple] = useState(false);
   // Sites are loaded from the server at startup. While the network call is
   // pending, we use the bundled FALLBACK_SITES so the app isn't empty.
   // After the fetch completes, `sites` is replaced with the live data.
@@ -2127,12 +2146,13 @@ export default function App() {
         if (cancelled) return;
         if (me.handle) {
           setHandle(me.handle);
-          // If this is a grandfathered handle (claimed before email was
-          // required), surface the migration prompt. The prompt mounts
-          // at the App root and blocks the UI until the user adds an
-          // email (or signs in with Apple, which attaches Apple's
-          // verified email automatically).
-          if (!me.hasEmail) {
+          // Migration prompt fires when EITHER recovery method is missing —
+          // we want every account to have both an email and an Apple ID
+          // for redundant recovery. Apple is preferred (one-tap on next
+          // device), email is the universal fallback.
+          if (!me.hasEmail || !me.hasApple) {
+            setMigrateHasEmail(me.hasEmail);
+            setMigrateHasApple(me.hasApple);
             setShowMigrateEmail(true);
           }
           // Load visit history so DetailView can show the visited state
@@ -2963,6 +2983,8 @@ export default function App() {
         <MigrateEmailModal
           handle={handle}
           deviceId={deviceId}
+          hasEmail={migrateHasEmail}
+          hasApple={migrateHasApple}
           onDone={() => setShowMigrateEmail(false)}
         />
       )}
@@ -3730,9 +3752,11 @@ function EulaModal({ onAccept }: { onAccept: () => void }) {
 //
 // No close button — must complete one path. Once an email is on file,
 // the modal never shows again for this handle.
-function MigrateEmailModal({ handle, deviceId, onDone }: {
+function MigrateEmailModal({ handle, deviceId, hasEmail, hasApple, onDone }: {
   handle: string;
   deviceId: string;
+  hasEmail: boolean;
+  hasApple: boolean;
   onDone: () => void;
 }) {
   type Step = 'choose' | 'email-pick' | 'email-code';
@@ -3753,19 +3777,25 @@ function MigrateEmailModal({ handle, deviceId, onDone }: {
       if (!fail.cancelled) setErr(fail.reason);
       return;
     }
-    const r = await apiSignInApple({ identityToken: native.identityToken, deviceId });
+    // Use link-apple, NOT sign-in-apple. We want to ATTACH this Apple ID
+    // to the handle the user is already signed in as — not log in by
+    // Apple ID (which would fail for a new Apple ID with no handle).
+    const r = await apiLinkApple({
+      handle,
+      deviceId,
+      identityToken: native.identityToken,
+    });
     setBusy(false);
     if (r.ok) {
-      // Server's existing-user branch attaches the email automatically.
-      // If r.handle doesn't match our current handle, that's a
-      // misconfiguration — surface it to the user.
-      if (r.handle && r.handle.toLowerCase() !== handle.toLowerCase()) {
-        setErr(`This Apple ID is linked to a different handle (${r.handle}). Please use the email path instead.`);
-        return;
-      }
       onDone();
     } else {
-      setErr(r.reason || 'Sign in with Apple failed.');
+      // Most likely failure: Apple ID already linked to a different handle.
+      // Surface the conflict; the user can use the email path instead.
+      if (r.existingHandle) {
+        setErr(`This Apple ID is already linked to @${r.existingHandle}. Use email recovery instead.`);
+      } else {
+        setErr(r.reason || 'Could not link Apple ID.');
+      }
     }
   };
 
@@ -3808,33 +3838,40 @@ function MigrateEmailModal({ handle, deviceId, onDone }: {
             <div style={S.eulaTitle}>One more thing</div>
             <div style={S.eulaBody}>
               <p style={S.eulaPara}>
-                Welcome back, <strong>@{handle}</strong>. We need a recovery method on your account so you don't lose access if you lose your phone.
-              </p>
-              <p style={S.eulaPara}>
-                Pick one — it only takes a few seconds.
+                Welcome back, <strong>@{handle}</strong>. {hasEmail && !hasApple
+                  ? "Link your Apple ID so you can sign in on a new device with one tap."
+                  : !hasEmail && hasApple
+                  ? "Add a recovery email as a backup in case you lose access to your Apple ID."
+                  : "We need a recovery method on your account so you don't lose access if you lose your phone."}
               </p>
             </div>
-            <button
-              onClick={onApple}
-              disabled={busy}
-              style={S.dreadFeedAppleBtn}
-            >
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="#FFFFFF" style={{ marginRight: 8 }}>
-                <path d="M17.05 20.28c-.98.95-2.05.8-3.08.35-1.09-.46-2.09-.48-3.24 0-1.44.62-2.2.44-3.06-.35C2.79 15.25 3.51 7.59 9.05 7.31c1.35.07 2.29.74 3.08.8 1.18-.24 2.31-.93 3.57-.84 1.51.12 2.65.72 3.4 1.8-3.12 1.87-2.38 5.98.48 7.13-.57 1.5-1.31 2.99-2.54 4.09zM12.03 7.25c-.15-2.23 1.66-4.07 3.74-4.25.29 2.58-2.34 4.5-3.74 4.25z" />
-              </svg>
-              {busy ? 'Connecting…' : 'Sign in with Apple'}
-            </button>
-            <div style={S.dreadFeedClaimOrRow}>
-              <div style={S.dreadFeedClaimOrLine} />
-              <span style={S.dreadFeedClaimOrText}>or</span>
-              <div style={S.dreadFeedClaimOrLine} />
-            </div>
-            <button
-              onClick={() => { setStep('email-pick'); setErr(null); }}
-              style={S.dreadFeedEmailBtn}
-            >
-              Add recovery email
-            </button>
+            {!hasApple && (
+              <button
+                onClick={onApple}
+                disabled={busy}
+                style={S.dreadFeedAppleBtn}
+              >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="#FFFFFF" style={{ marginRight: 8 }}>
+                  <path d="M17.05 20.28c-.98.95-2.05.8-3.08.35-1.09-.46-2.09-.48-3.24 0-1.44.62-2.2.44-3.06-.35C2.79 15.25 3.51 7.59 9.05 7.31c1.35.07 2.29.74 3.08.8 1.18-.24 2.31-.93 3.57-.84 1.51.12 2.65.72 3.4 1.8-3.12 1.87-2.38 5.98.48 7.13-.57 1.5-1.31 2.99-2.54 4.09zM12.03 7.25c-.15-2.23 1.66-4.07 3.74-4.25.29 2.58-2.34 4.5-3.74 4.25z" />
+                </svg>
+                {busy ? 'Connecting…' : (hasEmail ? 'Link Apple ID' : 'Sign in with Apple')}
+              </button>
+            )}
+            {!hasApple && !hasEmail && (
+              <div style={S.dreadFeedClaimOrRow}>
+                <div style={S.dreadFeedClaimOrLine} />
+                <span style={S.dreadFeedClaimOrText}>or</span>
+                <div style={S.dreadFeedClaimOrLine} />
+              </div>
+            )}
+            {!hasEmail && (
+              <button
+                onClick={() => { setStep('email-pick'); setErr(null); }}
+                style={S.dreadFeedEmailBtn}
+              >
+                Add recovery email
+              </button>
+            )}
             {err && <div style={S.modalError}>{err}</div>}
           </>
         )}
