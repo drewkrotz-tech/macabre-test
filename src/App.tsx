@@ -252,6 +252,36 @@ async function apiBlockedList(handle: string): Promise<{ handle: string; created
   } catch { return []; }
 }
 
+// ---- Hidden set (blocked handles) ----
+// Module-level cache of the viewer's blocked list, used to filter feeds
+// and comments client-side without round-tripping per-render. Reloaded
+// when the viewer changes handles or after a block/unblock action.
+// Holding lowercase handles for case-insensitive matching.
+let _hiddenSetCache: { viewer: string | null; set: Set<string>; loadedAt: number } = {
+  viewer: null,
+  set: new Set(),
+  loadedAt: 0,
+};
+const HIDDEN_SET_TTL_MS = 60 * 1000; // 1 minute — short enough to feel live after a block
+
+async function getHiddenSet(viewer: string | null): Promise<Set<string>> {
+  if (!viewer) return new Set();
+  const lower = viewer.toLowerCase();
+  const fresh = _hiddenSetCache.viewer === lower &&
+                (Date.now() - _hiddenSetCache.loadedAt) < HIDDEN_SET_TTL_MS;
+  if (fresh) return _hiddenSetCache.set;
+  const list = await apiBlockedList(viewer);
+  const set = new Set(list.map((b) => (b.handle || '').toLowerCase()));
+  _hiddenSetCache = { viewer: lower, set, loadedAt: Date.now() };
+  return set;
+}
+
+// Invalidate the cache — call after every successful block/unblock so the
+// next feed render reflects the change without waiting for the TTL.
+function invalidateHiddenSet() {
+  _hiddenSetCache = { viewer: null, set: new Set(), loadedAt: 0 };
+}
+
 // ---------- Visit-claim API ----------
 // POST /visits — server checks (handle, deviceId) ownership, verifies the
 // reported lat/lng is within 100m of the site's coords, dedupes (one visit
@@ -1946,6 +1976,19 @@ export default function App() {
   // on a re-prompt, never on first ask). Persisted decision in localStorage
   // so we never nag a user who has already accepted or declined.
   const [showAlwaysModal, setShowAlwaysModal] = useState(false);
+  // EULA acceptance — App Store guideline 1.2 + 5.1.1(v) require an EULA
+  // for apps with user-generated content. On first launch (or after a
+  // version bump) we show the modal until the user accepts. localStorage
+  // persists acceptance across launches; bumping EULA_VERSION re-prompts.
+  const [showEula, setShowEula] = useState(() => {
+    try {
+      return localStorage.getItem(EULA_LS_KEY) !== '1';
+    } catch {
+      // Storage unavailable (private mode etc) — show it; better to
+      // re-prompt than to skip the legal gate.
+      return true;
+    }
+  });
   // Sites are loaded from the server at startup. While the network call is
   // pending, we use the bundled FALLBACK_SITES so the app isn't empty.
   // After the fetch completes, `sites` is replaced with the live data.
@@ -2790,6 +2833,19 @@ export default function App() {
         />
       )}
       <ToastHost />
+      {/* First-launch EULA gate — top of the stacking order so it sits
+          above everything else (even other modals). Persisted to
+          localStorage on accept. */}
+      {showEula && (
+        <EulaModal
+          onAccept={() => {
+            try {
+              localStorage.setItem(EULA_LS_KEY, '1');
+            } catch { /* ignore — fine to re-prompt next launch */ }
+            setShowEula(false);
+          }}
+        />
+      )}
       {showAlwaysModal && (
         <AlwaysLocationModal
           onEnable={async () => {
@@ -3395,6 +3451,7 @@ function BlockedListModal({ handle, deviceId, onClose }: {
     const result = await apiUnblock({ blocker: handle, blocked: target, deviceId });
     if (result.ok) {
       setList((prev) => prev.filter((b) => b.handle.toLowerCase() !== target.toLowerCase()));
+      invalidateHiddenSet();
       showToast(`Unblocked ${target}`, 'success');
     } else {
       showToast(result.reason || 'Unblock failed', 'error');
@@ -3423,7 +3480,249 @@ function BlockedListModal({ handle, deviceId, onClose }: {
   );
 }
 
-// ---------- Delete Account Modal ----------
+// ---------- Post / Comment action sheet (3-dot menu) ----------
+// Bottom-sheet that slides up from the bottom on iOS / Android pattern.
+// Used for both posts (Report, Block author, Cancel) and comments (Report,
+// Block author, Cancel). Own posts/comments show no menu — Delete on own
+// content lives on the row itself.
+//
+// Rendered via portal so it floats above feed cards regardless of the
+// parent's transform context (the same trick CommentSheet uses).
+function ActionSheet({ title, actions, onClose }: {
+  title?: string;
+  actions: { label: string; onClick: () => void; destructive?: boolean }[];
+  onClose: () => void;
+}) {
+  const [mounted, setMounted] = useState(false);
+  const [closing, setClosing] = useState(false);
+
+  useEffect(() => {
+    const id = requestAnimationFrame(() => setMounted(true));
+    return () => cancelAnimationFrame(id);
+  }, []);
+
+  const animateClose = () => {
+    if (closing) return;
+    setClosing(true);
+    window.setTimeout(onClose, 180);
+  };
+
+  const visible = mounted && !closing;
+  return createPortal(
+    <div
+      style={{ ...S.actionSheetBackdrop, opacity: visible ? 1 : 0 }}
+      onClick={animateClose}
+    >
+      <div
+        style={{ ...S.actionSheet, transform: visible ? 'translateY(0)' : 'translateY(100%)' }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        {title && <div style={S.actionSheetTitle}>{title}</div>}
+        {actions.map((a, i) => (
+          <button
+            key={i}
+            onClick={() => { animateClose(); window.setTimeout(a.onClick, 200); }}
+            style={a.destructive ? S.actionSheetBtnDestructive : S.actionSheetBtn}
+          >
+            {a.label}
+          </button>
+        ))}
+        <button onClick={animateClose} style={S.actionSheetCancelBtn}>
+          Cancel
+        </button>
+      </div>
+    </div>,
+    document.body
+  );
+}
+
+// ---------- EULA / Terms acceptance modal ----------
+// Shown on first launch. App Store guideline 1.2 + 5.1.1(v) require an
+// EULA for apps with user-generated content, particularly when those
+// apps include blocking/reporting features. We persist acceptance in
+// localStorage so the user only sees this once. Bumping the EULA_VERSION
+// constant below re-prompts existing users (e.g. after a material terms
+// change).
+const EULA_VERSION = '1';
+const EULA_LS_KEY = 'sinister.eulaAccepted.v' + EULA_VERSION;
+
+function EulaModal({ onAccept }: { onAccept: () => void }) {
+  // No close button — user must accept to continue.
+  return (
+    <div style={S.eulaBackdrop}>
+      <div style={S.eulaSheet}>
+        <div style={S.eulaTitle}>Welcome to The Dread Directory</div>
+        <div style={S.eulaBody}>
+          <p style={S.eulaPara}>
+            Before you start, please review and accept our terms.
+          </p>
+          <p style={S.eulaPara}>
+            <strong>Community guidelines.</strong> The Dread Directory is for
+            sharing real haunted, abandoned, and sinister locations.
+            Don't post objectionable content — no harassment, hate speech,
+            sexual content, violence, or illegal activity. Posts and
+            comments are reviewed and may be removed.
+          </p>
+          <p style={S.eulaPara}>
+            <strong>Zero tolerance.</strong> Accounts that post abusive
+            material will be banned with no warning. You can report or
+            block any user from the 3-dot menu on their posts or profile.
+          </p>
+          <p style={S.eulaPara}>
+            <strong>Your content.</strong> You retain ownership of photos
+            you post but grant us a license to display them in the app.
+            You can delete your account and all your data at any time
+            from Settings.
+          </p>
+          <p style={S.eulaPara}>
+            By tapping Accept you agree to our{' '}
+            <a
+              href="https://sinistertrivia.com/terms"
+              target="_blank"
+              rel="noopener noreferrer"
+              style={S.eulaLink}
+            >Terms of Service</a>{' '}and{' '}
+            <a
+              href="https://sinistertrivia.com/privacy"
+              target="_blank"
+              rel="noopener noreferrer"
+              style={S.eulaLink}
+            >Privacy Policy</a>.
+          </p>
+        </div>
+        <button onClick={onAccept} style={S.eulaAcceptBtn}>
+          Accept &amp; Continue
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ---------- Recover Account Modal ----------
+// Two-step flow inside a CenteredModal:
+//   Step 1 — user types their handle, we POST /handles/request-recovery.
+//            Server sends a 6-digit code to the email on file (if any).
+//            For privacy, server always returns ok=true regardless, so
+//            we just advance to step 2.
+//   Step 2 — user types the 6-digit code, we POST /handles/recover
+//            with { handle, code, newDeviceId }. On success, the
+//            handle's deviceId is swapped to this device and we notify
+//            the parent which sets the handle and dismisses the modal.
+function RecoverAccountModal({ newDeviceId, onClose, onRecovered }: {
+  newDeviceId: string;
+  onClose: () => void;
+  onRecovered: (handle: string) => void;
+}) {
+  const [step, setStep] = useState<'handle' | 'code'>('handle');
+  const [handle, setHandle] = useState('');
+  const [code, setCode] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const requestCode = async () => {
+    const trimmed = handle.trim();
+    if (!trimmed || busy) return;
+    setBusy(true);
+    setErr(null);
+    const result = await apiRequestRecovery(trimmed);
+    setBusy(false);
+    if (result.ok) {
+      // Always advance — server doesn't reveal whether an email exists.
+      setStep('code');
+    } else {
+      setErr(result.reason || 'Could not request a recovery code.');
+    }
+  };
+
+  const submitCode = async () => {
+    const cleanCode = code.trim();
+    if (!/^\d{6}$/.test(cleanCode) || busy) return;
+    setBusy(true);
+    setErr(null);
+    const result = await apiRecover({
+      handle: handle.trim(),
+      code: cleanCode,
+      newDeviceId,
+    });
+    setBusy(false);
+    if (result.ok && result.handle) {
+      onRecovered(result.handle);
+    } else {
+      setErr(result.reason || 'Invalid code or expired.');
+    }
+  };
+
+  return (
+    <CenteredModal
+      title={step === 'handle' ? 'Recover account' : 'Enter recovery code'}
+      onClose={onClose}
+    >
+      <div style={S.modalBody}>
+        {step === 'handle' ? (
+          <>
+            <div style={S.modalText}>
+              Enter your handle. If you have a recovery email on file, we'll send a 6-digit code.
+            </div>
+            <input
+              type="text"
+              value={handle}
+              onChange={(e) => setHandle(e.target.value.replace(/[^A-Za-z0-9_]/g, ''))}
+              placeholder="your handle"
+              maxLength={20}
+              autoCorrect="off"
+              autoCapitalize="off"
+              spellCheck={false}
+              style={{ ...S.modalInput, marginTop: 10 }}
+              disabled={busy}
+            />
+            {err && <div style={S.modalError}>{err}</div>}
+            <button
+              onClick={requestCode}
+              disabled={!handle.trim() || busy}
+              style={!handle.trim() || busy ? S.modalBtnDisabled : S.modalBtnPrimary}
+            >
+              {busy ? 'Sending…' : 'Send code'}
+            </button>
+          </>
+        ) : (
+          <>
+            <div style={S.modalText}>
+              We sent a 6-digit code to the email on file for <strong>{handle.trim()}</strong>. Enter it below.
+            </div>
+            <input
+              type="text"
+              inputMode="numeric"
+              pattern="\d{6}"
+              value={code}
+              onChange={(e) => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+              placeholder="123456"
+              maxLength={6}
+              style={{ ...S.modalInput, marginTop: 10, letterSpacing: 6, textAlign: 'center', fontSize: 20, fontFamily: 'monospace' }}
+              disabled={busy}
+            />
+            {err && <div style={S.modalError}>{err}</div>}
+            <button
+              onClick={submitCode}
+              disabled={code.length !== 6 || busy}
+              style={code.length !== 6 || busy ? S.modalBtnDisabled : S.modalBtnPrimary}
+            >
+              {busy ? 'Verifying…' : 'Recover account'}
+            </button>
+            <button
+              onClick={() => { setStep('handle'); setCode(''); setErr(null); }}
+              style={S.modalBtnSecondary}
+              disabled={busy}
+            >
+              Back
+            </button>
+          </>
+        )}
+      </div>
+    </CenteredModal>
+  );
+}
+
+
 function DeleteAccountModal({ handle, deviceId, onClose, onDeleted }: {
   handle: string;
   deviceId: string;
@@ -3612,6 +3911,9 @@ function DreadFeedClaimScreen({ deviceId, onClaimed }: {
   const [claiming, setClaiming] = useState(false);
   const [claimErr, setClaimErr] = useState<string | null>(null);
   const debounceRef = useRef<number | null>(null);
+  // Recover-account modal open state. Opens from the "Lost my phone?"
+  // link below the Create Account button.
+  const [recoverOpen, setRecoverOpen] = useState(false);
 
   // Live availability check, debounced 350ms after the last keystroke.
   // Same logic as ClaimHandleInline — kept inline here so we can render
@@ -3707,7 +4009,58 @@ function DreadFeedClaimScreen({ deviceId, onClaimed }: {
         <div style={S.dreadFeedClaimFooter}>
           3–20 characters. Letters, numbers, underscores.
         </div>
+
+        {/* OR divider — visually separates the new-account flow from
+            the alternate-auth options below. */}
+        <div style={S.dreadFeedClaimOrRow}>
+          <div style={S.dreadFeedClaimOrLine} />
+          <span style={S.dreadFeedClaimOrText}>or</span>
+          <div style={S.dreadFeedClaimOrLine} />
+        </div>
+
+        {/* Sign in with Apple — STUB. Real implementation requires
+            Capacitor Sign in with Apple plugin + server-side JWT
+            verification (handles.js has the verification scaffolding,
+            but the client-side native call isn't wired yet). For now
+            we surface the button so the launch UX hints at the future
+            flow; tapping it shows a "coming soon" toast. */}
+        <button
+          onClick={() => {
+            showToast('Sign in with Apple coming soon', 'info');
+          }}
+          style={S.dreadFeedAppleBtn}
+          aria-label="Sign in with Apple"
+        >
+          {/* Apple logo SVG — single-color white per Apple's HIG. */}
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="#FFFFFF" style={{ marginRight: 8 }}>
+            <path d="M17.05 20.28c-.98.95-2.05.8-3.08.35-1.09-.46-2.09-.48-3.24 0-1.44.62-2.2.44-3.06-.35C2.79 15.25 3.51 7.59 9.05 7.31c1.35.07 2.29.74 3.08.8 1.18-.24 2.31-.93 3.57-.84 1.51.12 2.65.72 3.4 1.8-3.12 1.87-2.38 5.98.48 7.13-.57 1.5-1.31 2.99-2.54 4.09zM12.03 7.25c-.15-2.23 1.66-4.07 3.74-4.25.29 2.58-2.34 4.5-3.74 4.25z" />
+          </svg>
+          Sign in with Apple
+        </button>
+
+        {/* "Lost my phone?" recovery link — opens a modal that walks
+            through entering a handle and a 6-digit code that we email
+            to the address attached to that handle. */}
+        <button
+          onClick={() => setRecoverOpen(true)}
+          style={S.dreadFeedRecoverLink}
+        >
+          Lost my phone? Recover account
+        </button>
       </div>
+
+      {/* Recover-account modal */}
+      {recoverOpen && deviceId && (
+        <RecoverAccountModal
+          newDeviceId={deviceId}
+          onClose={() => setRecoverOpen(false)}
+          onRecovered={(recoveredHandle) => {
+            setRecoverOpen(false);
+            playPostShared();
+            onClaimed(recoveredHandle);
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -3774,12 +4127,28 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
 
   // Helper: load a page from the right endpoint depending on feed mode.
   // Following mode requires a handle; falls back to empty page if not.
+  // After fetching, we filter out posts authored by handles the viewer
+  // has blocked. Server doesn't know about the viewer's block list, so
+  // filtering is client-side. Anonymous viewers (no handle) get
+  // everything — there's no block list without an account.
   const loadPage = async (before: string | null): Promise<FeedPage> => {
+    let page: FeedPage;
     if (feedMode === 'following') {
       if (!handle) return { posts: [], nextBefore: null };
-      return apiFetchFollowingFeed({ handle, limit: 20, before });
+      page = await apiFetchFollowingFeed({ handle, limit: 20, before });
+    } else {
+      page = await apiFetchFeed({ limit: 20, before });
     }
-    return apiFetchFeed({ limit: 20, before });
+    if (handle) {
+      const hidden = await getHiddenSet(handle);
+      if (hidden.size > 0) {
+        return {
+          posts: page.posts.filter((p) => !hidden.has((p.handle || '').toLowerCase())),
+          nextBefore: page.nextBefore,
+        };
+      }
+    }
+    return page;
   };
 
   // ---- Pull-to-refresh state ----
@@ -4429,6 +4798,11 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap 
   const [commentCount, setCommentCount] = useState(post.commentCount || 0);
   // Whether the IG-style comment sheet is open over this post.
   const [commentsOpen, setCommentsOpen] = useState(false);
+  // 3-dot menu state — action sheet open, report modal open.
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [reportOpen, setReportOpen] = useState(false);
+
+  const isOwn = !!currentHandle && currentHandle.toLowerCase() === (post.handle || '').toLowerCase();
 
   // Fetch authoritative like state on mount. Server is the source of
   // truth — the post.likeCount cached on the feed is just a starting
@@ -4503,7 +4877,11 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap 
             </button>
           )}
         </div>
-        <button style={S.postMenuBtn} aria-label="More" disabled>⋯</button>
+        <button
+          onClick={() => setMenuOpen(true)}
+          style={S.postMenuBtn}
+          aria-label="More options"
+        >⋯</button>
       </div>
 
       {/* Photo — edge-to-edge with slightly rounded corners (per request).
@@ -4612,6 +4990,65 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap 
           onCountChange={(n) => setCommentCount(n)}
         />
       )}
+
+      {/* 3-dot action sheet — Report and Block options. Own posts get
+          no menu options surfaced here (Delete-own-content can live
+          elsewhere; for now, owners have nothing to do from the menu). */}
+      {menuOpen && (
+        <ActionSheet
+          onClose={() => setMenuOpen(false)}
+          actions={isOwn ? [] : [
+            {
+              label: 'Report post',
+              onClick: () => {
+                if (!currentHandle || !deviceId) {
+                  showToast('Claim a handle to report', 'error');
+                  return;
+                }
+                setReportOpen(true);
+              },
+              destructive: true,
+            },
+            {
+              label: `Block @${post.handle}`,
+              onClick: async () => {
+                if (!currentHandle || !deviceId) {
+                  showToast('Claim a handle to block', 'error');
+                  return;
+                }
+                const result = await apiBlock({
+                  blocker: currentHandle,
+                  blocked: post.handle,
+                  deviceId,
+                });
+                if (result.ok) {
+                  invalidateHiddenSet();
+                  showToast(`Blocked @${post.handle}`, 'success');
+                } else {
+                  showToast(result.reason || 'Block failed', 'error');
+                }
+              },
+              destructive: true,
+            },
+          ]}
+        />
+      )}
+
+      {/* Report modal — only renders when user picks Report from the
+          action sheet. apiReport already handles dedupe server-side. */}
+      {reportOpen && currentHandle && deviceId && (
+        <ReportModal
+          targetType="post"
+          targetId={post.id}
+          handle={currentHandle}
+          deviceId={deviceId}
+          onClose={() => setReportOpen(false)}
+          onReported={() => {
+            setReportOpen(false);
+            showToast('Thanks — report sent', 'success');
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -4657,6 +5094,12 @@ function CommentSheet({ post, currentHandle, deviceId, onClose, onCountChange }:
   // threshold, we flip `closing` true → CSS transitions back down → on
   // transitionend we call onClose to actually unmount.
   const [closing, setClosing] = useState(false);
+  // 3-dot menu state for a single comment row. Holds the id of the
+  // comment whose action sheet is open (null = closed). Report modal
+  // tracks the target comment separately so the sheet can close before
+  // the report modal opens.
+  const [menuCommentId, setMenuCommentId] = useState<string | null>(null);
+  const [reportComment, setReportComment] = useState<SocialComment | null>(null);
 
   // Mount transition — set `mounted` true on next frame so the
   // translateY(100%) initial style gets a chance to commit before the
@@ -4671,21 +5114,31 @@ function CommentSheet({ post, currentHandle, deviceId, onClose, onCountChange }:
     let cancelled = false;
     (async () => {
       setLoading(true);
-      const list = await apiFetchComments(post.id);
+      // Fetch comments + hidden set in parallel, then filter out any
+      // comments authored by handles the viewer has blocked. Comments
+      // by blocked users never appear in the sheet at all.
+      const [list, hidden] = await Promise.all([
+        apiFetchComments(post.id),
+        getHiddenSet(currentHandle),
+      ]);
       if (cancelled) return;
-      setComments(list);
+      const visible = list.filter((c) => !hidden.has((c.handle || '').toLowerCase()));
+      setComments(visible);
       setLoading(false);
-      onCountChange(list.length);
+      // Count reported to parent reflects visible-to-viewer count, not
+      // server total. That matches IG behavior (blocked content is
+      // invisible everywhere) and keeps the badge accurate to UX.
+      onCountChange(visible.length);
 
       // Fetch like status for each comment in parallel. Skip silently
       // if there's no handle (anonymous viewer).
-      if (currentHandle && list.length > 0) {
+      if (currentHandle && visible.length > 0) {
         const results = await Promise.all(
-          list.map((c) => apiCommentLikeStatus({ commentId: c.id, handle: currentHandle }))
+          visible.map((c) => apiCommentLikeStatus({ commentId: c.id, handle: currentHandle }))
         );
         if (cancelled) return;
         const map = new Map<string, { liked: boolean; count: number }>();
-        list.forEach((c, i) => {
+        visible.forEach((c, i) => {
           map.set(c.id, { liked: results[i].liked, count: results[i].count });
         });
         setCommentLikes(map);
@@ -4887,6 +5340,7 @@ function CommentSheet({ post, currentHandle, deviceId, onClose, onCountChange }:
           ) : (
             comments.map((c) => {
               const likeState = commentLikes.get(c.id) || { liked: false, count: c.likeCount || 0 };
+              const isOwnComment = !!currentHandle && currentHandle.toLowerCase() === (c.handle || '').toLowerCase();
               return (
                 <div key={c.id} style={S.commentRow}>
                   <img src={exposureIconUrl} alt="" style={S.commentAvatar} />
@@ -4918,6 +5372,17 @@ function CommentSheet({ post, currentHandle, deviceId, onClose, onCountChange }:
                       <span style={S.commentLikeCount}>{likeState.count}</span>
                     )}
                   </button>
+                  {/* 3-dot menu — only on other people's comments. Own
+                      comments don't surface Report/Block options (the
+                      viewer's own row with a Delete control lives via
+                      a different code path elsewhere). */}
+                  {!isOwnComment && (
+                    <button
+                      onClick={() => setMenuCommentId(c.id)}
+                      style={S.commentMenuBtn}
+                      aria-label="More options"
+                    >⋯</button>
+                  )}
                 </div>
               );
             })
@@ -4965,6 +5430,74 @@ function CommentSheet({ post, currentHandle, deviceId, onClose, onCountChange }:
             </button>
           )}
         </div>
+
+        {/* 3-dot action sheet for a comment row. Open state holds the
+            comment id; the matching comment is looked up below to feed
+            the Block/Report actions with the right handle/target. */}
+        {menuCommentId && (() => {
+          const target = comments.find((c) => c.id === menuCommentId);
+          if (!target) return null;
+          return (
+            <ActionSheet
+              onClose={() => setMenuCommentId(null)}
+              actions={[
+                {
+                  label: 'Report comment',
+                  onClick: () => {
+                    if (!currentHandle || !deviceId) {
+                      showToast('Claim a handle to report', 'error');
+                      return;
+                    }
+                    setReportComment(target);
+                  },
+                  destructive: true,
+                },
+                {
+                  label: `Block @${target.handle}`,
+                  onClick: async () => {
+                    if (!currentHandle || !deviceId) {
+                      showToast('Claim a handle to block', 'error');
+                      return;
+                    }
+                    const result = await apiBlock({
+                      blocker: currentHandle,
+                      blocked: target.handle,
+                      deviceId,
+                    });
+                    if (result.ok) {
+                      invalidateHiddenSet();
+                      // Immediately remove blocked user's comments from
+                      // the visible list so the sheet reflects the action.
+                      setComments((prev) =>
+                        prev.filter((c) => (c.handle || '').toLowerCase() !== target.handle.toLowerCase())
+                      );
+                      showToast(`Blocked @${target.handle}`, 'success');
+                    } else {
+                      showToast(result.reason || 'Block failed', 'error');
+                    }
+                  },
+                  destructive: true,
+                },
+              ]}
+            />
+          );
+        })()}
+
+        {/* Comment Report modal — opens when user picks Report from the
+            action sheet for a non-own comment. */}
+        {reportComment && currentHandle && deviceId && (
+          <ReportModal
+            targetType="comment"
+            targetId={reportComment.id}
+            handle={currentHandle}
+            deviceId={deviceId}
+            onClose={() => setReportComment(null)}
+            onReported={() => {
+              setReportComment(null);
+              showToast('Thanks — report sent', 'success');
+            }}
+          />
+        )}
       </div>
     </div>,
     document.body
@@ -5078,6 +5611,10 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
   const [followBusy, setFollowBusy] = useState(false);
   // Which handle-list sheet (if any) is open. null when closed.
   const [listSheet, setListSheet] = useState<'followers' | 'following' | null>(null);
+  // Block state — derived from the viewer's hidden set on mount.
+  // Toggling flips immediately and persists via apiBlock / apiUnblock.
+  const [isBlocked, setIsBlocked] = useState(false);
+  const [blockBusy, setBlockBusy] = useState(false);
 
   const isMe = !!currentHandle && currentHandle.toLowerCase() === profileHandle.toLowerCase();
 
@@ -5085,11 +5622,12 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
     let cancelled = false;
     (async () => {
       setLoading(true);
-      // Fetch badge stats + posts + follow status in parallel.
-      const [badgeData, handlePosts, fStatus] = await Promise.all([
+      // Fetch badge stats + posts + follow status + hidden set in parallel.
+      const [badgeData, handlePosts, fStatus, hidden] = await Promise.all([
         apiGetBadges(profileHandle),
         apiFetchPostsByHandle(profileHandle),
         apiFollowStatus({ target: profileHandle, handle: currentHandle }),
+        getHiddenSet(currentHandle),
       ]);
       if (cancelled) return;
       setStats({
@@ -5099,10 +5637,32 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
       });
       setPosts(handlePosts);
       setFollowStatus(fStatus);
+      setIsBlocked(hidden.has(profileHandle.toLowerCase()));
       setLoading(false);
     })();
     return () => { cancelled = true; };
   }, [profileHandle, currentHandle]);
+
+  // Toggle block — flips state, calls the appropriate API, invalidates
+  // the hidden-set cache so feeds reflect immediately. If a viewer
+  // blocks someone they're currently following, the follow row stays
+  // server-side (server doesn't auto-unfollow on block); the block
+  // alone is enough to hide their content.
+  const toggleBlock = async () => {
+    if (isMe || !currentHandle || !deviceId || blockBusy) return;
+    setBlockBusy(true);
+    const result = isBlocked
+      ? await apiUnblock({ blocker: currentHandle, blocked: profileHandle, deviceId })
+      : await apiBlock({ blocker: currentHandle, blocked: profileHandle, deviceId });
+    if (result.ok) {
+      invalidateHiddenSet();
+      setIsBlocked(!isBlocked);
+      showToast(isBlocked ? `Unblocked @${profileHandle}` : `Blocked @${profileHandle}`, 'success');
+    } else {
+      showToast(result.reason || 'Action failed', 'error');
+    }
+    setBlockBusy(false);
+  };
 
   // Toggle follow on the profile being viewed. Optimistic update — the
   // button flips immediately, counts adjust, and we revert if the
@@ -5239,6 +5799,19 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
         >
           Share Profile
         </button>
+        {/* Block / Unblock — only on other people's profiles. Visually
+            de-emphasized vs Follow so it doesn't dominate the row; this
+            is a destructive control most users never touch. */}
+        {!isMe && currentHandle && deviceId && (
+          <button
+            onClick={toggleBlock}
+            disabled={blockBusy}
+            style={S.profileBlockBtn}
+            aria-label={isBlocked ? 'Unblock user' : 'Block user'}
+          >
+            {isBlocked ? 'Unblock' : 'Block'}
+          </button>
+        )}
       </div>
 
       {/* Followers / Following list sheet — opens when a stat is tapped. */}
@@ -12219,5 +12792,232 @@ const S: Record<string, React.CSSProperties> = {
     fontFamily: 'inherit',
     borderRadius: 16,
     marginTop: 8,
+  },
+
+  // ---- Batch 2b: Action sheet, EULA, comment menu, profile block,
+  //                claim screen recovery + Apple stub, modal secondary ----
+
+  // Bottom-sheet action menu — slides up over content. Backdrop dims
+  // the rest; tap-to-dismiss. Used by SocialPostCard and CommentSheet
+  // for the 3-dot menu (Report / Block / Cancel).
+  actionSheetBackdrop: {
+    position: 'fixed' as const,
+    inset: 0,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+    zIndex: 10000,
+    display: 'flex',
+    flexDirection: 'column' as const,
+    justifyContent: 'flex-end',
+    transition: 'opacity 180ms ease',
+  },
+  actionSheet: {
+    backgroundColor: '#181818',
+    borderTopLeftRadius: 16,
+    borderTopRightRadius: 16,
+    padding: '8px 12px calc(env(safe-area-inset-bottom, 12px) + 12px)',
+    display: 'flex',
+    flexDirection: 'column' as const,
+    gap: 4,
+    transition: 'transform 180ms ease',
+  },
+  actionSheetTitle: {
+    color: '#888',
+    fontSize: 12,
+    textAlign: 'center' as const,
+    padding: '8px 4px 6px',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  actionSheetBtn: {
+    width: '100%',
+    backgroundColor: 'transparent',
+    color: '#F0EBE0',
+    border: 'none',
+    borderRadius: 10,
+    padding: '14px',
+    fontSize: 16,
+    fontWeight: 500,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+    textAlign: 'center' as const,
+  },
+  actionSheetBtnDestructive: {
+    width: '100%',
+    backgroundColor: 'transparent',
+    color: '#ff5a5a',
+    border: 'none',
+    borderRadius: 10,
+    padding: '14px',
+    fontSize: 16,
+    fontWeight: 600,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+    textAlign: 'center' as const,
+  },
+  actionSheetCancelBtn: {
+    width: '100%',
+    backgroundColor: '#0a0a0a',
+    color: '#F0EBE0',
+    border: 'none',
+    borderRadius: 10,
+    padding: '14px',
+    fontSize: 16,
+    fontWeight: 700,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+    textAlign: 'center' as const,
+    marginTop: 6,
+  },
+
+  // 3-dot menu on comment rows — smaller than postMenuBtn since the
+  // row is tighter. Matches comment-like btn for visual balance.
+  commentMenuBtn: {
+    color: '#888888',
+    fontSize: 18,
+    backgroundColor: 'transparent',
+    border: 'none',
+    padding: '4px 6px',
+    cursor: 'pointer',
+    lineHeight: 1,
+    alignSelf: 'flex-start' as const,
+  },
+
+  // EULA first-launch modal — full-screen, no close button, no escape.
+  eulaBackdrop: {
+    position: 'fixed' as const,
+    inset: 0,
+    backgroundColor: '#000',
+    zIndex: 20000,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 16,
+  },
+  eulaSheet: {
+    width: '100%',
+    maxWidth: 420,
+    maxHeight: '90vh',
+    backgroundColor: '#111',
+    border: '1px solid #2a2a2a',
+    borderRadius: 16,
+    padding: 20,
+    display: 'flex',
+    flexDirection: 'column' as const,
+    gap: 12,
+    overflow: 'hidden',
+  },
+  eulaTitle: {
+    color: '#F0EBE0',
+    fontSize: 20,
+    fontWeight: 800,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    textAlign: 'center' as const,
+  },
+  eulaBody: {
+    color: '#cccccc',
+    fontSize: 14,
+    lineHeight: 1.5,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    overflowY: 'auto' as const,
+    flex: 1,
+    paddingRight: 4,
+  },
+  eulaPara: {
+    margin: '0 0 10px 0',
+  },
+  eulaLink: {
+    color: '#7AB8FF',
+    textDecoration: 'underline',
+  },
+  eulaAcceptBtn: {
+    width: '100%',
+    backgroundColor: '#FFFFFF',
+    color: '#000',
+    border: 'none',
+    borderRadius: 10,
+    padding: '14px',
+    fontSize: 15,
+    fontWeight: 700,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+  },
+
+  // Block button on UserProfileView — sits in the same actions row as
+  // Follow / Share. Visually de-emphasized: outlined red rather than
+  // filled, so it doesn't shout.
+  profileBlockBtn: {
+    backgroundColor: 'transparent',
+    color: '#ff5a5a',
+    border: '1px solid #5a2222',
+    borderRadius: 8,
+    padding: '8px 14px',
+    fontSize: 13,
+    fontWeight: 600,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+    whiteSpace: 'nowrap' as const,
+  },
+
+  // Claim screen — OR divider + Apple Sign In button + Recover link.
+  dreadFeedClaimOrRow: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 10,
+    marginTop: 18,
+    marginBottom: 12,
+  },
+  dreadFeedClaimOrLine: {
+    flex: 1,
+    height: 1,
+    backgroundColor: '#2a2a2a',
+  },
+  dreadFeedClaimOrText: {
+    color: '#666',
+    fontSize: 12,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    textTransform: 'uppercase' as const,
+    letterSpacing: 1,
+  },
+  dreadFeedAppleBtn: {
+    width: '100%',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#000',
+    color: '#FFFFFF',
+    border: '1px solid #2a2a2a',
+    borderRadius: 10,
+    padding: '12px',
+    fontSize: 15,
+    fontWeight: 600,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+  },
+  dreadFeedRecoverLink: {
+    width: '100%',
+    backgroundColor: 'transparent',
+    color: '#7AB8FF',
+    border: 'none',
+    padding: '14px 8px 4px',
+    fontSize: 13,
+    fontWeight: 500,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+    textAlign: 'center' as const,
+    textDecoration: 'underline',
+  },
+
+  // Secondary modal button — used by RecoverAccountModal "Back" action.
+  modalBtnSecondary: {
+    width: '100%',
+    backgroundColor: 'transparent',
+    color: '#888',
+    border: '1px solid #2a2a2a',
+    borderRadius: 8,
+    padding: '12px',
+    fontSize: 14,
+    fontWeight: 500,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+    marginTop: 6,
   },
 };
