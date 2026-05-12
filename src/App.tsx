@@ -23,55 +23,16 @@ import leaderIconUrl from './assets/leader.png';
 import aboutIconUrl from './assets/about.png';
 import locationIconUrl from './assets/location.png';
 
-// Library avatar assets — 12 horror-themed SVG icons users can pick
-// as their profile avatar (alternative to uploading a custom photo).
-// IDs MUST stay in sync with the server's LIBRARY_AVATAR_IDS set in
-// handles.js — adding/removing here without updating the server will
-// cause the server to reject the chosen id.
-import avatarSkullUrl from './assets/avatars/avatar-skull.svg';
-import avatarPumpkinUrl from './assets/avatars/avatar-pumpkin.svg';
-import avatarGhostUrl from './assets/avatars/avatar-ghost.svg';
-import avatarCrowUrl from './assets/avatars/avatar-crow.svg';
-import avatarTombstoneUrl from './assets/avatars/avatar-tombstone.svg';
-import avatarMoonUrl from './assets/avatars/avatar-moon.svg';
-import avatarPentagramUrl from './assets/avatars/avatar-pentagram.svg';
-import avatarHandprintUrl from './assets/avatars/avatar-handprint.svg';
-import avatarSkeletonHandUrl from './assets/avatars/avatar-skeleton-hand.svg';
-import avatarCandleUrl from './assets/avatars/avatar-candle.svg';
-import avatarSpiderUrl from './assets/avatars/avatar-spider.svg';
-import avatarBatUrl from './assets/avatars/avatar-bat.svg';
-
-const LIBRARY_AVATARS: { id: string; label: string; url: string }[] = [
-  { id: 'skull',         label: 'Skull',         url: avatarSkullUrl },
-  { id: 'pumpkin',       label: 'Pumpkin',       url: avatarPumpkinUrl },
-  { id: 'ghost',         label: 'Ghost',         url: avatarGhostUrl },
-  { id: 'crow',          label: 'Crow',          url: avatarCrowUrl },
-  { id: 'tombstone',     label: 'Tombstone',     url: avatarTombstoneUrl },
-  { id: 'moon',          label: 'Moon',          url: avatarMoonUrl },
-  { id: 'pentagram',     label: 'Pentagram',     url: avatarPentagramUrl },
-  { id: 'handprint',     label: 'Handprint',     url: avatarHandprintUrl },
-  { id: 'skeleton-hand', label: 'Skeleton hand', url: avatarSkeletonHandUrl },
-  { id: 'candle',        label: 'Candle',        url: avatarCandleUrl },
-  { id: 'spider',        label: 'Spider',        url: avatarSpiderUrl },
-  { id: 'bat',           label: 'Bat',           url: avatarBatUrl },
-];
-const LIBRARY_AVATAR_BY_ID: Record<string, string> = LIBRARY_AVATARS.reduce(
-  (acc, a) => { acc[a.id] = a.url; return acc; },
-  {} as Record<string, string>,
-);
-
 // Resolve a server-returned avatarUrl string into a renderable URL.
-// Three input shapes:
-//   - null/undefined: caller falls back to default (exposureIconUrl)
-//   - 'library:<id>': mapped to the bundled SVG asset (no network hit)
-//   - 'https://...': returned as-is (custom upload from R2)
+// Two shapes the server may return:
+//   - null / undefined: caller falls back to default (exposureIconUrl)
+//   - 'https://...':    custom upload from R2 — returned as-is
+// We previously also supported 'library:<id>' for bundled SVG library
+// avatars, but Drew killed that path — uploads only.
 function resolveAvatarUrl(raw: string | null | undefined): string | null {
   if (!raw) return null;
-  if (raw.startsWith('library:')) {
-    const id = raw.slice('library:'.length);
-    return LIBRARY_AVATAR_BY_ID[id] || null;
-  }
-  return raw;
+  if (raw.startsWith('http')) return raw;
+  return null;
 }
 
 // Register the Living Hell font face once at module load.
@@ -236,20 +197,6 @@ async function apiClaimHandle(
 }
 
 // ---- Avatar APIs ----
-// Set a library avatar (one of the 12 bundled SVGs). Server validates
-// libraryId against its allow-list — invalid ids return 400.
-async function apiSetLibraryAvatar(args: { handle: string; deviceId: string; libraryId: string }):
-  Promise<{ ok: boolean; avatarUrl?: string | null; reason?: string }> {
-  try {
-    const res = await fetch(`${API_BASE}/handles/avatar/library`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(args),
-    });
-    return await res.json();
-  } catch { return { ok: false, reason: 'network error' }; }
-}
-
 // Upload a custom avatar photo. Server resizes to 256x256 JPEG, strips
 // EXIF, stores at avatars/{lowerHandle}.jpg in R2. Returns the new
 // avatarUrl with a cache-busting query param so the UI refreshes.
@@ -6686,14 +6633,13 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
 
 
 // ---------- Avatar Picker Modal ----------
-// Two-tab picker for changing a user's profile avatar. Tab 1 (Library)
-// shows the 12 bundled SVGs in a 3-column grid. Tab 2 (Upload) lets the
-// user pick a photo from their camera roll; the server resizes + crops
-// to 256x256 JPEG and stores it on R2.
+// Upload-only avatar picker. User taps "Choose photo", picks an image
+// from their camera roll, server resizes to 256x256 JPEG + strips EXIF
+// + stores in R2. "Reset to default" reverts to the placeholder.
 //
 // Calls onChanged(newServerUrl) on success — caller updates its avatar
-// state without a refetch. server URLs come back in the form
-// 'library:<id>' for picks or 'https://...' for uploads.
+// state without a refetch. Server URLs come back as full https://...
+// (custom upload) or null (default).
 function AvatarPickerModal({ handle, deviceId, currentAvatarUrl, onClose, onChanged }: {
   handle: string;
   deviceId: string;
@@ -6701,30 +6647,11 @@ function AvatarPickerModal({ handle, deviceId, currentAvatarUrl, onClose, onChan
   onClose: () => void;
   onChanged: (newUrl: string | null) => void;
 }) {
-  const [tab, setTab] = useState<'library' | 'upload'>('library');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Track which library id (if any) is currently active so the grid can
-  // highlight it.
-  const currentLibraryId = (currentAvatarUrl && currentAvatarUrl.startsWith('library:'))
-    ? currentAvatarUrl.slice('library:'.length)
-    : null;
-  const isCurrentUpload = !!(currentAvatarUrl && currentAvatarUrl.startsWith('http'));
-
-  const onPickLibrary = async (id: string) => {
-    if (busy) return;
-    setBusy(true);
-    setErr(null);
-    const r = await apiSetLibraryAvatar({ handle, deviceId, libraryId: id });
-    setBusy(false);
-    if (!r.ok) {
-      setErr(r.reason || 'Failed to set avatar.');
-      return;
-    }
-    onChanged(r.avatarUrl ?? null);
-  };
+  const hasCustom = !!(currentAvatarUrl && currentAvatarUrl.startsWith('http'));
 
   const onFilePicked = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files && e.target.files[0];
@@ -6765,61 +6692,29 @@ function AvatarPickerModal({ handle, deviceId, currentAvatarUrl, onClose, onChan
           <div style={{ width: 60 }} />
         </div>
 
-        <div style={S.avatarPickerTabs}>
-          <button
-            onClick={() => setTab('library')}
-            style={{ ...S.avatarPickerTab, ...(tab === 'library' ? S.avatarPickerTabActive : {}) }}
-          >Library</button>
-          <button
-            onClick={() => setTab('upload')}
-            style={{ ...S.avatarPickerTab, ...(tab === 'upload' ? S.avatarPickerTabActive : {}) }}
-          >Upload</button>
-        </div>
-
         {err && <div style={S.avatarPickerErr}>{err}</div>}
 
-        {tab === 'library' && (
-          <div style={S.avatarPickerGrid}>
-            {LIBRARY_AVATARS.map((a) => (
-              <button
-                key={a.id}
-                onClick={() => onPickLibrary(a.id)}
-                disabled={busy}
-                style={{
-                  ...S.avatarPickerCell,
-                  ...(a.id === currentLibraryId ? S.avatarPickerCellActive : {}),
-                }}
-                aria-label={a.label}
-              >
-                <img src={a.url} alt={a.label} style={S.avatarPickerCellImg} />
-              </button>
-            ))}
+        <div style={S.avatarPickerUploadPane}>
+          <div style={S.avatarPickerUploadHint}>
+            Pick a photo from your camera roll. We'll resize and crop it
+            to a square. Avatars are public — don't upload anything you
+            don't want others to see.
           </div>
-        )}
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            disabled={busy}
+            style={S.avatarPickerUploadBtn}
+          >{busy ? 'Uploading…' : 'Choose photo'}</button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            onChange={onFilePicked}
+            style={{ display: 'none' }}
+          />
+        </div>
 
-        {tab === 'upload' && (
-          <div style={S.avatarPickerUploadPane}>
-            <div style={S.avatarPickerUploadHint}>
-              Pick a photo from your camera roll. We'll resize and crop it
-              to a square. Avatars are public — don't upload anything you
-              don't want others to see.
-            </div>
-            <button
-              onClick={() => fileInputRef.current?.click()}
-              disabled={busy}
-              style={S.avatarPickerUploadBtn}
-            >{busy ? 'Uploading…' : 'Choose photo'}</button>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept="image/*"
-              onChange={onFilePicked}
-              style={{ display: 'none' }}
-            />
-          </div>
-        )}
-
-        {(currentLibraryId || isCurrentUpload) && (
+        {hasCustom && (
           <button
             onClick={onRemove}
             disabled={busy}
