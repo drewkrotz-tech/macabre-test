@@ -45,6 +45,62 @@ import { SINISTER_SITES as FALLBACK_SITES, SinisterSite } from './locations';
 // ---------- Production server URL ----------
 const API_BASE = 'https://dread.sinistertrivia.com';
 
+// ---------- Native: Sign in with Apple ----------
+// Wrapper around @capacitor-community/apple-sign-in. Dynamically imported
+// so a web/desktop preview where the plugin isn't installed doesn't crash
+// on module load — on iOS the plugin resolves and the native sheet opens.
+// On non-iOS or when the plugin isn't available, returns { ok: false }.
+//
+// Returns the raw Apple identityToken on success — we hand it to
+// /handles/sign-in-apple which verifies it against Apple's JWKS and
+// extracts the stable user id + email.
+async function nativeSignInWithApple(): Promise<
+  | { ok: true; identityToken: string; email: string | null; user: string }
+  | { ok: false; reason: string; cancelled?: boolean }
+> {
+  try {
+    const mod: any = await import('@capacitor-community/apple-sign-in').catch(() => null);
+    if (!mod || !mod.SignInWithApple) {
+      return { ok: false, reason: 'Sign in with Apple is only available on iOS' };
+    }
+    const options = {
+      clientId: 'com.sinistertrivia.macabretest',
+      // We only request what we need. Apple requires the scopes match
+      // what's configured in the App ID capability.
+      scopes: 'email name',
+      // redirectURI / state / nonce are only required for the web
+      // variant; the native plugin handles them internally.
+      redirectURI: '',
+      state: '',
+      nonce: '',
+    };
+    const result = await mod.SignInWithApple.authorize(options);
+    // result.response shape (per plugin docs):
+    //   { user, email?, givenName?, familyName?, identityToken, authorizationCode }
+    // Apple only returns email + name on FIRST sign-in for a given Apple ID
+    // per app. Subsequent sign-ins from the same Apple ID only give us
+    // user + identityToken. The server-side JWT verification can still
+    // extract email from the identityToken payload, so we don't need
+    // the top-level email field to be populated.
+    const r = result && result.response ? result.response : null;
+    if (!r || !r.identityToken || !r.user) {
+      return { ok: false, reason: 'Apple did not return a valid token' };
+    }
+    return {
+      ok: true,
+      identityToken: r.identityToken,
+      email: typeof r.email === 'string' ? r.email : null,
+      user: r.user,
+    };
+  } catch (err: any) {
+    // The plugin throws on user cancellation. The exact error shape varies
+    // by iOS version; check for common cancel signals.
+    const msg = err && err.message ? String(err.message) : 'Apple Sign In failed';
+    const cancelled = /cancel|user canceled|1001/i.test(msg);
+    return { ok: false, reason: msg, cancelled };
+  }
+}
+
 // ---------- Device identity (handle system) ----------
 // Auto-generated stable id stored on first launch. Used to prove ownership of
 // a claimed handle. Persists across app restarts; wipes on app reinstall.
@@ -109,23 +165,61 @@ async function apiCheckHandle(handle: string): Promise<HandleCheckResult> {
   } catch { return { available: false, reason: 'network error' }; }
 }
 
-async function apiClaimHandle(handle: string, deviceId: string): Promise<HandleClaimResult> {
+async function apiClaimHandle(
+  handle: string,
+  deviceId: string,
+  opts?: { appleUserId?: string; appleEmail?: string }
+): Promise<HandleClaimResult> {
   try {
+    const body: any = { handle, deviceId };
+    if (opts?.appleUserId) body.appleUserId = opts.appleUserId;
+    if (opts?.appleEmail) body.appleEmail = opts.appleEmail;
     const res = await fetch(`${API_BASE}/handles/claim`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ handle, deviceId }),
+      body: JSON.stringify(body),
     });
     return await res.json();
   } catch { return { ok: false, reason: 'network error' }; }
 }
 
-async function apiGetMyHandle(deviceId: string): Promise<string | null> {
+// ---- Email-path account creation (verified at claim time) ----
+// Two-step: start sends a 6-digit code to email, finish verifies and
+// atomically creates the handle. The server requires the same deviceId
+// for both calls.
+async function apiStartEmailClaim(args: { handle: string; email: string; deviceId: string }):
+  Promise<{ ok: boolean; reason?: string; existingHandle?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/handles/start-email-claim`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    return await res.json();
+  } catch (e: any) { return { ok: false, reason: e?.message || 'network error' }; }
+}
+
+async function apiFinishEmailClaim(args: { handle: string; code: string; deviceId: string }):
+  Promise<HandleClaimResult> {
+  try {
+    const res = await fetch(`${API_BASE}/handles/finish-email-claim`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    return await res.json();
+  } catch (e: any) { return { ok: false, reason: e?.message || 'network error' }; }
+}
+
+async function apiGetMyHandle(deviceId: string): Promise<{ handle: string | null; hasEmail: boolean }> {
   try {
     const res = await fetch(`${API_BASE}/handles/me?deviceId=${encodeURIComponent(deviceId)}`);
     const data = await res.json();
-    return data?.handle || null;
-  } catch { return null; }
+    return {
+      handle: data?.handle || null,
+      hasEmail: !!data?.hasEmail,
+    };
+  } catch { return { handle: null, hasEmail: false }; }
 }
 
 // ---------- Account management API ----------
@@ -1989,6 +2083,14 @@ export default function App() {
       return true;
     }
   });
+
+  // Email-migration prompt for grandfathered handles. Set true at app
+  // boot when /handles/me reports the user owns a handle but has no
+  // email on file. The modal blocks dismissal — they have to add an
+  // email (or sign in with Apple) to continue. Stops the "I lost my
+  // phone and now I'm locked out forever" Evan scenario for every
+  // future user.
+  const [showMigrateEmail, setShowMigrateEmail] = useState(false);
   // Sites are loaded from the server at startup. While the network call is
   // pending, we use the bundled FALLBACK_SITES so the app isn't empty.
   // After the fetch completes, `sites` is replaced with the live data.
@@ -2021,13 +2123,21 @@ export default function App() {
         const id = await getOrCreateDeviceId();
         if (cancelled) return;
         setDeviceId(id);
-        const myHandle = await apiGetMyHandle(id);
+        const me = await apiGetMyHandle(id);
         if (cancelled) return;
-        if (myHandle) {
-          setHandle(myHandle);
+        if (me.handle) {
+          setHandle(me.handle);
+          // If this is a grandfathered handle (claimed before email was
+          // required), surface the migration prompt. The prompt mounts
+          // at the App root and blocks the UI until the user adds an
+          // email (or signs in with Apple, which attaches Apple's
+          // verified email automatically).
+          if (!me.hasEmail) {
+            setShowMigrateEmail(true);
+          }
           // Load visit history so DetailView can show the visited state
           // immediately without a flash of the unclaimed button.
-          const siteIds = await apiGetMyVisits(myHandle);
+          const siteIds = await apiGetMyVisits(me.handle);
           if (cancelled) return;
           if (siteIds.size) setVisitedSiteIds(siteIds);
         }
@@ -2507,7 +2617,7 @@ export default function App() {
         ),
       };
     } else if (v.name === 'submit') {
-      return { key: 'submit', element: <SubmitView currentLocation={currentLocation} deviceId={deviceId} handle={handle} onHandleClaimed={setHandle} onBack={goHome} /> };
+      return { key: 'submit', element: <SubmitView currentLocation={currentLocation} deviceId={deviceId} handle={handle} onHandleClaimed={setHandle} onBack={goHome} onGoToSocial={goSocial} /> };
     } else if (v.name === 'about') {
       return { key: 'about', element: <AboutView onBack={goHome} /> };
     } else if (v.name === 'leaders') {
@@ -2844,6 +2954,16 @@ export default function App() {
             } catch { /* ignore — fine to re-prompt next launch */ }
             setShowEula(false);
           }}
+        />
+      )}
+      {/* Grandfathered-handle email migration. Only renders when EULA
+          is already accepted (so we never stack two full-screen gates).
+          Required to dismiss — no Skip button. */}
+      {!showEula && showMigrateEmail && handle && deviceId && (
+        <MigrateEmailModal
+          handle={handle}
+          deviceId={deviceId}
+          onDone={() => setShowMigrateEmail(false)}
         />
       )}
       {showAlwaysModal && (
@@ -3598,6 +3718,208 @@ function EulaModal({ onAccept }: { onAccept: () => void }) {
   );
 }
 
+// ---------- Email migration modal for grandfathered handles ----------
+// Shown on launch to handles that were claimed before email-at-signup
+// was required. Two paths:
+//   1. Sign in with Apple — links the Apple ID + email to the existing
+//      handle in one tap. (Server's handleSignInApple "existing user
+//      signing in" branch already handles the email-attach.)
+//   2. Add email manually — uses the existing /handles/add-email +
+//      /handles/verify-email flow (Drew's been able to do this in
+//      Settings; this just surfaces it on launch with no Skip).
+//
+// No close button — must complete one path. Once an email is on file,
+// the modal never shows again for this handle.
+function MigrateEmailModal({ handle, deviceId, onDone }: {
+  handle: string;
+  deviceId: string;
+  onDone: () => void;
+}) {
+  type Step = 'choose' | 'email-pick' | 'email-code';
+  const [step, setStep] = useState<Step>('choose');
+  const [email, setEmail] = useState('');
+  const [code, setCode] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const onApple = async () => {
+    if (busy) return;
+    setBusy(true);
+    setErr(null);
+    const native = await nativeSignInWithApple();
+    if (!native.ok) {
+      setBusy(false);
+      const fail = native as { ok: false; reason: string; cancelled?: boolean };
+      if (!fail.cancelled) setErr(fail.reason);
+      return;
+    }
+    const r = await apiSignInApple({ identityToken: native.identityToken, deviceId });
+    setBusy(false);
+    if (r.ok) {
+      // Server's existing-user branch attaches the email automatically.
+      // If r.handle doesn't match our current handle, that's a
+      // misconfiguration — surface it to the user.
+      if (r.handle && r.handle.toLowerCase() !== handle.toLowerCase()) {
+        setErr(`This Apple ID is linked to a different handle (${r.handle}). Please use the email path instead.`);
+        return;
+      }
+      onDone();
+    } else {
+      setErr(r.reason || 'Sign in with Apple failed.');
+    }
+  };
+
+  const onSend = async () => {
+    const trimmed = email.trim();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed) || busy) {
+      setErr('Please enter a valid email.');
+      return;
+    }
+    setBusy(true);
+    setErr(null);
+    const r = await apiAddEmail({ handle, deviceId, email: trimmed });
+    setBusy(false);
+    if (r.ok) {
+      setStep('email-code');
+    } else {
+      setErr(r.reason || 'Could not send code.');
+    }
+  };
+
+  const onVerify = async () => {
+    const cleanCode = code.trim();
+    if (!/^\d{6}$/.test(cleanCode) || busy) return;
+    setBusy(true);
+    setErr(null);
+    const r = await apiVerifyEmail({ handle, deviceId, code: cleanCode });
+    setBusy(false);
+    if (r.ok) {
+      onDone();
+    } else {
+      setErr(r.reason || 'Invalid code.');
+    }
+  };
+
+  return (
+    <div style={S.eulaBackdrop}>
+      <div style={S.eulaSheet}>
+        {step === 'choose' && (
+          <>
+            <div style={S.eulaTitle}>One more thing</div>
+            <div style={S.eulaBody}>
+              <p style={S.eulaPara}>
+                Welcome back, <strong>@{handle}</strong>. We need a recovery method on your account so you don't lose access if you lose your phone.
+              </p>
+              <p style={S.eulaPara}>
+                Pick one — it only takes a few seconds.
+              </p>
+            </div>
+            <button
+              onClick={onApple}
+              disabled={busy}
+              style={S.dreadFeedAppleBtn}
+            >
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="#FFFFFF" style={{ marginRight: 8 }}>
+                <path d="M17.05 20.28c-.98.95-2.05.8-3.08.35-1.09-.46-2.09-.48-3.24 0-1.44.62-2.2.44-3.06-.35C2.79 15.25 3.51 7.59 9.05 7.31c1.35.07 2.29.74 3.08.8 1.18-.24 2.31-.93 3.57-.84 1.51.12 2.65.72 3.4 1.8-3.12 1.87-2.38 5.98.48 7.13-.57 1.5-1.31 2.99-2.54 4.09zM12.03 7.25c-.15-2.23 1.66-4.07 3.74-4.25.29 2.58-2.34 4.5-3.74 4.25z" />
+              </svg>
+              {busy ? 'Connecting…' : 'Sign in with Apple'}
+            </button>
+            <div style={S.dreadFeedClaimOrRow}>
+              <div style={S.dreadFeedClaimOrLine} />
+              <span style={S.dreadFeedClaimOrText}>or</span>
+              <div style={S.dreadFeedClaimOrLine} />
+            </div>
+            <button
+              onClick={() => { setStep('email-pick'); setErr(null); }}
+              style={S.dreadFeedEmailBtn}
+            >
+              Add recovery email
+            </button>
+            {err && <div style={S.modalError}>{err}</div>}
+          </>
+        )}
+
+        {step === 'email-pick' && (
+          <>
+            <div style={S.eulaTitle}>Add recovery email</div>
+            <div style={S.eulaBody}>
+              <p style={S.eulaPara}>
+                We'll send a 6-digit code to verify your email.
+              </p>
+            </div>
+            <input
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="you@example.com"
+              autoCorrect="off"
+              autoCapitalize="off"
+              spellCheck={false}
+              inputMode="email"
+              style={S.modalInput}
+              disabled={busy}
+              autoFocus
+            />
+            <button
+              onClick={onSend}
+              disabled={busy || !email.trim()}
+              style={!busy && email.trim() ? S.modalBtnPrimary : S.modalBtnDisabled}
+            >
+              {busy ? 'Sending…' : 'Send code'}
+            </button>
+            <button
+              onClick={() => { setStep('choose'); setErr(null); }}
+              disabled={busy}
+              style={S.modalBtnSecondary}
+            >
+              Back
+            </button>
+            {err && <div style={S.modalError}>{err}</div>}
+          </>
+        )}
+
+        {step === 'email-code' && (
+          <>
+            <div style={S.eulaTitle}>Check your email</div>
+            <div style={S.eulaBody}>
+              <p style={S.eulaPara}>
+                We sent a 6-digit code to <strong>{email.trim()}</strong>.
+              </p>
+            </div>
+            <input
+              type="text"
+              inputMode="numeric"
+              pattern="\d{6}"
+              value={code}
+              onChange={(e) => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+              placeholder="123456"
+              maxLength={6}
+              style={{ ...S.modalInput, letterSpacing: 6, textAlign: 'center', fontSize: 22, fontFamily: 'monospace' }}
+              disabled={busy}
+              autoFocus
+            />
+            <button
+              onClick={onVerify}
+              disabled={busy || code.length !== 6}
+              style={!busy && code.length === 6 ? S.modalBtnPrimary : S.modalBtnDisabled}
+            >
+              {busy ? 'Verifying…' : 'Verify'}
+            </button>
+            <button
+              onClick={() => { setStep('email-pick'); setCode(''); setErr(null); }}
+              disabled={busy}
+              style={S.modalBtnSecondary}
+            >
+              Back
+            </button>
+            {err && <div style={S.modalError}>{err}</div>}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ---------- Recover Account Modal ----------
 // Two-step flow inside a CenteredModal:
 //   Step 1 — user types their handle, we POST /handles/request-recovery.
@@ -3905,21 +4227,42 @@ function DreadFeedClaimScreen({ deviceId, onClaimed }: {
   deviceId: string | null;
   onClaimed: (handle: string) => void;
 }) {
+  // Steps:
+  //   'entry'      — Apple button (primary) + "Use email instead" (secondary) + Recover link
+  //   'apple-pick' — Apple succeeded but the Apple ID isn't bound to a handle yet;
+  //                  ask the user to pick a username, then claim with appleUserId+appleEmail
+  //   'email-pick' — User chose email path. Ask for handle + email; on submit, server emails a code
+  //   'email-code' — Code entry; on submit, server verifies and claims
+  type Step = 'entry' | 'apple-pick' | 'email-pick' | 'email-code';
+  const [step, setStep] = useState<Step>('entry');
+
+  // Apple-state — populated when entry → apple-pick is triggered.
+  const [appleUserId, setAppleUserId] = useState<string | null>(null);
+  const [appleEmail, setAppleEmail] = useState<string | null>(null);
+  const [appleBusy, setAppleBusy] = useState(false);
+
+  // Shared username input + availability state, used by both apple-pick
+  // and email-pick.
   const [typed, setTyped] = useState('');
   const [status, setStatus] = useState<'idle' | 'checking' | 'available' | 'taken' | 'invalid'>('idle');
   const [statusMsg, setStatusMsg] = useState('');
   const [claiming, setClaiming] = useState(false);
   const [claimErr, setClaimErr] = useState<string | null>(null);
   const debounceRef = useRef<number | null>(null);
-  // Recover-account modal open state. Opens from the "Lost my phone?"
-  // link below the Create Account button.
+
+  // Email-path state.
+  const [email, setEmail] = useState('');
+  const [code, setCode] = useState('');
+  const [sending, setSending] = useState(false);
+  const [verifying, setVerifying] = useState(false);
+
+  // Recover-account modal — reachable from the entry step.
   const [recoverOpen, setRecoverOpen] = useState(false);
 
-  // Live availability check, debounced 350ms after the last keystroke.
-  // Same logic as ClaimHandleInline — kept inline here so we can render
-  // a custom IG-style layout around it without forcing ClaimHandleInline
-  // to grow extra "presentation mode" props.
+  // Live availability check, debounced 350ms. Active on the screens where
+  // the user types a username (apple-pick + email-pick).
   useEffect(() => {
+    if (step !== 'apple-pick' && step !== 'email-pick') return;
     if (debounceRef.current) {
       window.clearTimeout(debounceRef.current);
       debounceRef.current = null;
@@ -3948,22 +4291,7 @@ function DreadFeedClaimScreen({ deviceId, onClaimed }: {
     return () => {
       if (debounceRef.current) window.clearTimeout(debounceRef.current);
     };
-  }, [typed]);
-
-  const onClaim = async () => {
-    const trimmed = typed.trim();
-    if (!deviceId || !trimmed || status !== 'available' || claiming) return;
-    setClaiming(true);
-    setClaimErr(null);
-    const r = await apiClaimHandle(trimmed, deviceId);
-    setClaiming(false);
-    if (r.ok && r.handle) {
-      playPostShared(); // celebratory three-tone arpeggio on claim success
-      onClaimed(r.handle);
-    } else {
-      setClaimErr(r.reason || 'Claim failed.');
-    }
-  };
+  }, [typed, step]);
 
   const statusColor =
     status === 'available' ? '#5dd069' :
@@ -3971,85 +4299,321 @@ function DreadFeedClaimScreen({ deviceId, onClaimed }: {
     status === 'invalid' ? '#ffb648' :
     '#888888';
 
+  // ---- Apple path ----
+  const onAppleTap = async () => {
+    if (!deviceId || appleBusy) return;
+    setAppleBusy(true);
+    setClaimErr(null);
+    const native = await nativeSignInWithApple();
+    if (!native.ok) {
+      setAppleBusy(false);
+      const fail = native as { ok: false; reason: string; cancelled?: boolean };
+      if (!fail.cancelled) {
+        setClaimErr(fail.reason);
+      }
+      return;
+    }
+    // Hand the token to the server.
+    const r = await apiSignInApple({
+      identityToken: native.identityToken,
+      deviceId,
+    });
+    setAppleBusy(false);
+    if (!r.ok) {
+      setClaimErr(r.reason || 'Apple sign-in failed.');
+      return;
+    }
+    if (r.handle) {
+      // Existing Apple user — straight in.
+      playPostShared();
+      onClaimed(r.handle);
+      return;
+    }
+    // New Apple user — need to pick a handle.
+    setAppleUserId(r.appleUserId || null);
+    setAppleEmail(r.appleEmail || null);
+    setStep('apple-pick');
+    setTyped('');
+    setStatus('idle');
+    setStatusMsg('');
+  };
+
+  const onAppleClaim = async () => {
+    const trimmed = typed.trim();
+    if (!deviceId || !trimmed || status !== 'available' || claiming) return;
+    setClaiming(true);
+    setClaimErr(null);
+    const r = await apiClaimHandle(trimmed, deviceId, {
+      appleUserId: appleUserId || undefined,
+      appleEmail: appleEmail || undefined,
+    });
+    setClaiming(false);
+    if (r.ok && r.handle) {
+      playPostShared();
+      onClaimed(r.handle);
+    } else {
+      setClaimErr(r.reason || 'Claim failed.');
+    }
+  };
+
+  // ---- Email path ----
+  const onSendCode = async () => {
+    const trimmedHandle = typed.trim();
+    const trimmedEmail = email.trim();
+    if (!deviceId || !trimmedHandle || status !== 'available') return;
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmedEmail)) {
+      setClaimErr('Please enter a valid email.');
+      return;
+    }
+    if (sending) return;
+    setSending(true);
+    setClaimErr(null);
+    const r = await apiStartEmailClaim({
+      handle: trimmedHandle,
+      email: trimmedEmail,
+      deviceId,
+    });
+    setSending(false);
+    if (r.ok) {
+      setStep('email-code');
+    } else {
+      setClaimErr(r.reason || 'Could not send code.');
+    }
+  };
+
+  const onVerifyCode = async () => {
+    const trimmedHandle = typed.trim();
+    const cleanCode = code.trim();
+    if (!deviceId || !trimmedHandle || !/^\d{6}$/.test(cleanCode)) return;
+    if (verifying) return;
+    setVerifying(true);
+    setClaimErr(null);
+    const r = await apiFinishEmailClaim({
+      handle: trimmedHandle,
+      code: cleanCode,
+      deviceId,
+    });
+    setVerifying(false);
+    if (r.ok && r.handle) {
+      playPostShared();
+      onClaimed(r.handle);
+    } else {
+      setClaimErr(r.reason || 'Verification failed.');
+    }
+  };
+
+  // ---- Render ----
   return (
     <div style={S.dreadFeedClaimWrap}>
       <div style={S.dreadFeedClaimInner}>
-        <div style={S.dreadFeedClaimTitle}>Create your account</div>
-        <div style={S.dreadFeedClaimSubtitle}>
-          Pick a handle. This is your forever name on DreadFeed —
-          you can't change it later.
-        </div>
-        <input
-          type="text"
-          value={typed}
-          onChange={(e) => setTyped(e.target.value.replace(/[^A-Za-z0-9_]/g, ''))}
-          placeholder="username"
-          maxLength={20}
-          autoCorrect="off"
-          autoCapitalize="off"
-          spellCheck={false}
-          style={S.dreadFeedClaimInput}
-          disabled={claiming}
-        />
-        {statusMsg && (
-          <div style={{ ...S.dreadFeedClaimStatus, color: statusColor }}>
-            {status === 'available' ? '✓ ' :
-             status === 'taken' ? '✗ ' :
-             status === 'invalid' ? '⚠ ' : ''}{statusMsg}
-          </div>
+
+        {/* ============================================================
+            ENTRY STEP — Apple primary, email secondary, recover link.
+            ============================================================ */}
+        {step === 'entry' && (
+          <>
+            <div style={S.dreadFeedClaimTitle}>Create your account</div>
+            <div style={S.dreadFeedClaimSubtitle}>
+              Sign in with Apple to get started in one tap.
+            </div>
+
+            <button
+              onClick={onAppleTap}
+              disabled={appleBusy}
+              style={S.dreadFeedAppleBtn}
+              aria-label="Sign in with Apple"
+            >
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="#FFFFFF" style={{ marginRight: 8 }}>
+                <path d="M17.05 20.28c-.98.95-2.05.8-3.08.35-1.09-.46-2.09-.48-3.24 0-1.44.62-2.2.44-3.06-.35C2.79 15.25 3.51 7.59 9.05 7.31c1.35.07 2.29.74 3.08.8 1.18-.24 2.31-.93 3.57-.84 1.51.12 2.65.72 3.4 1.8-3.12 1.87-2.38 5.98.48 7.13-.57 1.5-1.31 2.99-2.54 4.09zM12.03 7.25c-.15-2.23 1.66-4.07 3.74-4.25.29 2.58-2.34 4.5-3.74 4.25z" />
+              </svg>
+              {appleBusy ? 'Connecting…' : 'Sign in with Apple'}
+            </button>
+
+            {claimErr && <div style={S.dreadFeedClaimError}>{claimErr}</div>}
+
+            <div style={S.dreadFeedClaimOrRow}>
+              <div style={S.dreadFeedClaimOrLine} />
+              <span style={S.dreadFeedClaimOrText}>or</span>
+              <div style={S.dreadFeedClaimOrLine} />
+            </div>
+
+            <button
+              onClick={() => {
+                setStep('email-pick');
+                setClaimErr(null);
+                setTyped('');
+                setEmail('');
+                setStatus('idle');
+                setStatusMsg('');
+              }}
+              style={S.dreadFeedEmailBtn}
+            >
+              Use email instead
+            </button>
+
+            <button
+              onClick={() => setRecoverOpen(true)}
+              style={S.dreadFeedRecoverLink}
+            >
+              Lost my phone? Recover account
+            </button>
+          </>
         )}
-        <button
-          onClick={onClaim}
-          disabled={status !== 'available' || claiming}
-          style={status === 'available' && !claiming ? S.dreadFeedClaimBtn : S.dreadFeedClaimBtnDisabled}
-        >
-          {claiming ? 'Creating…' : 'Create Account'}
-        </button>
-        {claimErr && <div style={S.dreadFeedClaimError}>{claimErr}</div>}
-        <div style={S.dreadFeedClaimFooter}>
-          3–20 characters. Letters, numbers, underscores.
-        </div>
 
-        {/* OR divider — visually separates the new-account flow from
-            the alternate-auth options below. */}
-        <div style={S.dreadFeedClaimOrRow}>
-          <div style={S.dreadFeedClaimOrLine} />
-          <span style={S.dreadFeedClaimOrText}>or</span>
-          <div style={S.dreadFeedClaimOrLine} />
-        </div>
+        {/* ============================================================
+            APPLE-PICK STEP — Apple succeeded, pick a handle.
+            ============================================================ */}
+        {step === 'apple-pick' && (
+          <>
+            <div style={S.dreadFeedClaimTitle}>Pick your handle</div>
+            <div style={S.dreadFeedClaimSubtitle}>
+              This is your forever name on DreadFeed — you can't change it later.
+            </div>
+            <input
+              type="text"
+              value={typed}
+              onChange={(e) => setTyped(e.target.value.replace(/[^A-Za-z0-9_]/g, ''))}
+              placeholder="username"
+              maxLength={20}
+              autoCorrect="off"
+              autoCapitalize="off"
+              spellCheck={false}
+              style={S.dreadFeedClaimInput}
+              disabled={claiming}
+              autoFocus
+            />
+            {statusMsg && (
+              <div style={{ ...S.dreadFeedClaimStatus, color: statusColor }}>
+                {status === 'available' ? '✓ ' :
+                 status === 'taken' ? '✗ ' :
+                 status === 'invalid' ? '⚠ ' : ''}{statusMsg}
+              </div>
+            )}
+            <button
+              onClick={onAppleClaim}
+              disabled={status !== 'available' || claiming}
+              style={status === 'available' && !claiming ? S.dreadFeedClaimBtn : S.dreadFeedClaimBtnDisabled}
+            >
+              {claiming ? 'Creating…' : 'Create Account'}
+            </button>
+            {claimErr && <div style={S.dreadFeedClaimError}>{claimErr}</div>}
+            <div style={S.dreadFeedClaimFooter}>
+              3–20 characters. Letters, numbers, underscores.
+            </div>
+            <button
+              onClick={() => { setStep('entry'); setClaimErr(null); }}
+              style={S.dreadFeedRecoverLink}
+            >
+              ← Use a different sign-in
+            </button>
+          </>
+        )}
 
-        {/* Sign in with Apple — STUB. Real implementation requires
-            Capacitor Sign in with Apple plugin + server-side JWT
-            verification (handles.js has the verification scaffolding,
-            but the client-side native call isn't wired yet). For now
-            we surface the button so the launch UX hints at the future
-            flow; tapping it shows a "coming soon" toast. */}
-        <button
-          onClick={() => {
-            showToast('Sign in with Apple coming soon', 'info');
-          }}
-          style={S.dreadFeedAppleBtn}
-          aria-label="Sign in with Apple"
-        >
-          {/* Apple logo SVG — single-color white per Apple's HIG. */}
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="#FFFFFF" style={{ marginRight: 8 }}>
-            <path d="M17.05 20.28c-.98.95-2.05.8-3.08.35-1.09-.46-2.09-.48-3.24 0-1.44.62-2.2.44-3.06-.35C2.79 15.25 3.51 7.59 9.05 7.31c1.35.07 2.29.74 3.08.8 1.18-.24 2.31-.93 3.57-.84 1.51.12 2.65.72 3.4 1.8-3.12 1.87-2.38 5.98.48 7.13-.57 1.5-1.31 2.99-2.54 4.09zM12.03 7.25c-.15-2.23 1.66-4.07 3.74-4.25.29 2.58-2.34 4.5-3.74 4.25z" />
-          </svg>
-          Sign in with Apple
-        </button>
+        {/* ============================================================
+            EMAIL-PICK STEP — Handle + email, server sends a code.
+            ============================================================ */}
+        {step === 'email-pick' && (
+          <>
+            <div style={S.dreadFeedClaimTitle}>Create your account</div>
+            <div style={S.dreadFeedClaimSubtitle}>
+              Pick a handle and add your email so you can recover your account if you lose your phone.
+            </div>
+            <input
+              type="text"
+              value={typed}
+              onChange={(e) => setTyped(e.target.value.replace(/[^A-Za-z0-9_]/g, ''))}
+              placeholder="username"
+              maxLength={20}
+              autoCorrect="off"
+              autoCapitalize="off"
+              spellCheck={false}
+              style={S.dreadFeedClaimInput}
+              disabled={sending}
+              autoFocus
+            />
+            {statusMsg && (
+              <div style={{ ...S.dreadFeedClaimStatus, color: statusColor }}>
+                {status === 'available' ? '✓ ' :
+                 status === 'taken' ? '✗ ' :
+                 status === 'invalid' ? '⚠ ' : ''}{statusMsg}
+              </div>
+            )}
+            <input
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="email"
+              autoCorrect="off"
+              autoCapitalize="off"
+              spellCheck={false}
+              inputMode="email"
+              style={{ ...S.dreadFeedClaimInput, marginTop: 10 }}
+              disabled={sending}
+            />
+            <button
+              onClick={onSendCode}
+              disabled={status !== 'available' || sending || !email.trim()}
+              style={status === 'available' && !sending && email.trim()
+                ? S.dreadFeedClaimBtn
+                : S.dreadFeedClaimBtnDisabled}
+            >
+              {sending ? 'Sending…' : 'Send verification code'}
+            </button>
+            {claimErr && <div style={S.dreadFeedClaimError}>{claimErr}</div>}
+            <div style={S.dreadFeedClaimFooter}>
+              We'll email you a 6-digit code to verify it's really you.
+            </div>
+            <button
+              onClick={() => { setStep('entry'); setClaimErr(null); }}
+              style={S.dreadFeedRecoverLink}
+            >
+              ← Use Sign in with Apple instead
+            </button>
+          </>
+        )}
 
-        {/* "Lost my phone?" recovery link — opens a modal that walks
-            through entering a handle and a 6-digit code that we email
-            to the address attached to that handle. */}
-        <button
-          onClick={() => setRecoverOpen(true)}
-          style={S.dreadFeedRecoverLink}
-        >
-          Lost my phone? Recover account
-        </button>
+        {/* ============================================================
+            EMAIL-CODE STEP — Type the 6-digit code.
+            ============================================================ */}
+        {step === 'email-code' && (
+          <>
+            <div style={S.dreadFeedClaimTitle}>Check your email</div>
+            <div style={S.dreadFeedClaimSubtitle}>
+              We sent a 6-digit code to <strong>{email.trim()}</strong>. Enter it below.
+            </div>
+            <input
+              type="text"
+              inputMode="numeric"
+              pattern="\d{6}"
+              value={code}
+              onChange={(e) => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+              placeholder="123456"
+              maxLength={6}
+              style={{ ...S.dreadFeedClaimInput, letterSpacing: 6, textAlign: 'center', fontSize: 22, fontFamily: 'monospace' }}
+              disabled={verifying}
+              autoFocus
+            />
+            <button
+              onClick={onVerifyCode}
+              disabled={code.length !== 6 || verifying}
+              style={code.length === 6 && !verifying
+                ? S.dreadFeedClaimBtn
+                : S.dreadFeedClaimBtnDisabled}
+            >
+              {verifying ? 'Verifying…' : 'Verify & create account'}
+            </button>
+            {claimErr && <div style={S.dreadFeedClaimError}>{claimErr}</div>}
+            <button
+              onClick={() => { setStep('email-pick'); setCode(''); setClaimErr(null); }}
+              style={S.dreadFeedRecoverLink}
+            >
+              ← Back
+            </button>
+          </>
+        )}
       </div>
 
-      {/* Recover-account modal */}
+      {/* Recover-account modal (Apple-or-email-recovery for existing handles) */}
       {recoverOpen && deviceId && (
         <RecoverAccountModal
           newDeviceId={deviceId}
@@ -9077,16 +9641,27 @@ function AddPhotoButton({ site, handle, deviceId, currentLocation, onPosted }: {
 
 // ---------- Inline handle claim UI for SubmitView ----------
 // If the user has a server-claimed handle, just shows it read-only. If not,
-// shows a small text input with live availability check + Claim button.
-// Once claimed, the parent's onClaimed() fires, App's `handle` state updates,
-// and on next render the field flips to the read-only display.
-function HandleField({ deviceId, handle, submitter, setSubmitter, onClaimed }: {
+// shows a CTA pointing them at the DreadFeed claim screen — that's the
+// canonical signup path now (Apple Sign In or email-verified handle). We
+// don't allow handle creation here anymore because it bypassed email
+// recovery, leaving users stranded on reinstall.
+function HandleField({ deviceId, handle, submitter, setSubmitter, onClaimed, onGoToClaim }: {
   deviceId: string | null;
   handle: string | null;
   submitter: string;
   setSubmitter: (v: string) => void;
   onClaimed: (h: string) => void;
+  // Optional — parent SubmitView passes a callback that navigates to the
+  // DreadFeed claim screen. If not provided we fall back to a static
+  // message (this path should be reached, hence the prop is optional for
+  // backward compat).
+  onGoToClaim?: () => void;
 }) {
+  // Marks unused props quiet for the linter — these stick around so the
+  // call-site doesn't change. Once everyone's on the new flow we can
+  // simplify the prop list.
+  void deviceId; void submitter; void setSubmitter; void onClaimed;
+
   // Read-only display path: user already owns a handle.
   if (handle) {
     return (
@@ -9104,16 +9679,38 @@ function HandleField({ deviceId, handle, submitter, setSubmitter, onClaimed }: {
     );
   }
 
-  // Claim path: user has no handle yet. Show input + live availability + Claim button.
-  // We use submitter state as the typed value so we don't need a second piece
-  // of state and the placeholder behaves naturally.
+  // No handle yet — point them at the DreadFeed claim screen.
   return (
-    <ClaimHandleInline
-      deviceId={deviceId}
-      typed={submitter}
-      onTypedChange={setSubmitter}
-      onClaimed={onClaimed}
-    />
+    <Field label="Your Handle" valid={false} hint="You need a handle to submit a site">
+      <div style={{
+        ...S.input,
+        display: 'flex', flexDirection: 'column', gap: 10,
+        padding: 14,
+      }}>
+        <div style={{ color: BONE, fontSize: 14, lineHeight: 1.4 }}>
+          You don't have a handle yet. Create one in DreadFeed — it takes one tap with Sign in with Apple, or you can use email.
+        </div>
+        {onGoToClaim && (
+          <button
+            type="button"
+            onClick={onGoToClaim}
+            style={{
+              ...S.input,
+              backgroundColor: SUBMIT_RED,
+              color: WHITE,
+              border: 'none',
+              fontWeight: 700,
+              cursor: 'pointer',
+              padding: '10px 16px',
+              borderRadius: 8,
+              alignSelf: 'flex-start',
+            }}
+          >
+            Go to DreadFeed →
+          </button>
+        )}
+      </div>
+    </Field>
   );
 }
 
@@ -9240,12 +9837,15 @@ function ClaimHandleInline({ deviceId, typed, onTypedChange, onClaimed }: {
 // Short Description field REMOVED. The server's `shortDescription` parameter is
 // derived from the first ~150 chars of the full description so the existing
 // /sites/submit endpoint still gets a value (it requires shortDescription).
-function SubmitView({ currentLocation, deviceId, handle, onHandleClaimed, onBack }: {
+function SubmitView({ currentLocation, deviceId, handle, onHandleClaimed, onBack, onGoToSocial }: {
   currentLocation: { lat: number; lng: number } | null;
   deviceId: string | null;
   handle: string | null;
   onHandleClaimed: (h: string) => void;
   onBack: () => void;
+  // Used by HandleField when the user has no handle yet — sends them to
+  // the DreadFeed claim screen, which is the canonical signup path now.
+  onGoToSocial?: () => void;
 }) {
   const [title, setTitle] = useState('');
   const [fullDesc, setFullDesc] = useState('');
@@ -9502,6 +10102,7 @@ function SubmitView({ currentLocation, deviceId, handle, onHandleClaimed, onBack
           submitter={submitter}
           setSubmitter={setSubmitter}
           onClaimed={(h) => { setSubmitter(h); onHandleClaimed(h); }}
+          onGoToClaim={onGoToSocial}
         />
 
         {errorMsg && <div style={S.errorBox}>⚠ {errorMsg}</div>}
@@ -12989,6 +13590,21 @@ const S: Record<string, React.CSSProperties> = {
     padding: '12px',
     fontSize: 15,
     fontWeight: 600,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+  },
+  dreadFeedEmailBtn: {
+    width: '100%',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'transparent',
+    color: '#F0EBE0',
+    border: '1px solid #3a3a3a',
+    borderRadius: 10,
+    padding: '12px',
+    fontSize: 15,
+    fontWeight: 500,
     fontFamily: 'system-ui, -apple-system, sans-serif',
     cursor: 'pointer',
   },
