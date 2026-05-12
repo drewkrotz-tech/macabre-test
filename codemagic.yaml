@@ -3,6 +3,10 @@
 # Signed TestFlight workflow + unsigned smoke test.
 # Injects iOS Info.plist permission strings (location + camera) automatically
 # after Capacitor scaffolds the iOS project, before the build runs.
+# Also writes the App.entitlements file with Sign in with Apple capability
+# and wires it into the Xcode project (Capacitor doesn't ship one by default
+# and the Apple Sign In plugin requires it — without it, the runtime auth call
+# fails with AuthorizationError 1000).
 # =============================================================================
 workflows:
   ios-unsigned-build:
@@ -41,6 +45,63 @@ workflows:
           plutil -insert UIBackgroundModes.1 -string fetch "$PLIST" 2>/dev/null || true
           echo "--- Final Info.plist ---"
           plutil -p "$PLIST"
+      - name: Write App.entitlements (Sign in with Apple)
+        script: |
+          ENT="ios/App/App/App.entitlements"
+          cat > "$ENT" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>com.apple.developer.applesignin</key>
+              <array>
+                  <string>Default</string>
+              </array>
+          </dict>
+          </plist>
+          EOF
+          echo "--- App.entitlements ---"
+          plutil -p "$ENT"
+          # Wire the entitlements file into the Xcode project so the build uses it.
+          # Without CODE_SIGN_ENTITLEMENTS set in build settings, the file exists
+          # on disk but the .app bundle ships without the entitlement, and Sign
+          # in with Apple fails at runtime with AuthorizationError 1000.
+          PROJ="ios/App/App.xcodeproj/project.pbxproj"
+          if ! grep -q "CODE_SIGN_ENTITLEMENTS = App/App.entitlements" "$PROJ"; then
+            # Insert CODE_SIGN_ENTITLEMENTS into every build configuration's
+            # buildSettings block. The pattern matches buildSettings = { ...
+            # which appears in each Debug and Release config for the App target.
+            python3 <<'PY'
+          import re
+          path = "ios/App/App.xcodeproj/project.pbxproj"
+          with open(path, "r") as f:
+              content = f.read()
+          # Find every buildSettings block for the App target (PRODUCT_NAME = App)
+          # and insert CODE_SIGN_ENTITLEMENTS if not already present.
+          def inject(m):
+              block = m.group(0)
+              if "CODE_SIGN_ENTITLEMENTS" in block:
+                  return block
+              # Insert right after the opening buildSettings = {
+              return block.replace(
+                  "buildSettings = {",
+                  "buildSettings = {\n\t\t\t\tCODE_SIGN_ENTITLEMENTS = App/App.entitlements;",
+                  1
+              )
+          # Match buildSettings blocks that belong to the App target
+          # (identified by PRODUCT_NAME = App; inside the block).
+          pattern = re.compile(
+              r"buildSettings = \{[^}]*?PRODUCT_NAME = App;[^}]*?\};",
+              re.DOTALL
+          )
+          new_content = pattern.sub(inject, content)
+          with open(path, "w") as f:
+              f.write(new_content)
+          print("Injected CODE_SIGN_ENTITLEMENTS into project.pbxproj")
+          PY
+          else
+            echo "CODE_SIGN_ENTITLEMENTS already set in project.pbxproj"
+          fi
       - name: Sync Capacitor to iOS
         script: |
           npx cap sync ios
@@ -112,6 +173,57 @@ workflows:
           plutil -insert UIBackgroundModes.1 -string fetch "$PLIST" 2>/dev/null || true
           echo "--- Final Info.plist ---"
           plutil -p "$PLIST"
+      - name: Write App.entitlements (Sign in with Apple)
+        script: |
+          ENT="ios/App/App/App.entitlements"
+          cat > "$ENT" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>com.apple.developer.applesignin</key>
+              <array>
+                  <string>Default</string>
+              </array>
+              <key>aps-environment</key>
+              <string>production</string>
+          </dict>
+          </plist>
+          EOF
+          echo "--- App.entitlements ---"
+          plutil -p "$ENT"
+          # Wire the entitlements file into the Xcode project so the build uses it.
+          # Without CODE_SIGN_ENTITLEMENTS set in build settings, the file exists
+          # on disk but the .app bundle ships without the entitlement, and Sign
+          # in with Apple fails at runtime with AuthorizationError 1000.
+          PROJ="ios/App/App.xcodeproj/project.pbxproj"
+          if ! grep -q "CODE_SIGN_ENTITLEMENTS = App/App.entitlements" "$PROJ"; then
+            python3 <<'PY'
+          import re
+          path = "ios/App/App.xcodeproj/project.pbxproj"
+          with open(path, "r") as f:
+              content = f.read()
+          def inject(m):
+              block = m.group(0)
+              if "CODE_SIGN_ENTITLEMENTS" in block:
+                  return block
+              return block.replace(
+                  "buildSettings = {",
+                  "buildSettings = {\n\t\t\t\tCODE_SIGN_ENTITLEMENTS = App/App.entitlements;",
+                  1
+              )
+          pattern = re.compile(
+              r"buildSettings = \{[^}]*?PRODUCT_NAME = App;[^}]*?\};",
+              re.DOTALL
+          )
+          new_content = pattern.sub(inject, content)
+          with open(path, "w") as f:
+              f.write(new_content)
+          print("Injected CODE_SIGN_ENTITLEMENTS into project.pbxproj")
+          PY
+          else
+            echo "CODE_SIGN_ENTITLEMENTS already set in project.pbxproj"
+          fi
       - name: Sync Capacitor to iOS
         script: |
           npx cap sync ios
