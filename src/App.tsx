@@ -244,6 +244,20 @@ type SocialPost = {
   createdAt: string;
   approvedAt: string;
   likeCount: number;
+  // Cached comment count — server denormalizes this onto the post so
+  // the feed can render the count without joining comments.json. Server
+  // may omit it on older records, so the post card defaults to 0.
+  commentCount?: number;
+};
+
+// One comment on a post. Returned by GET /comments/post/:postId.
+type SocialComment = {
+  id: string;
+  postId: string;
+  handle: string;
+  body: string;
+  createdAt: string;
+  likeCount: number;
 };
 
 type FeedPage = { posts: SocialPost[]; nextBefore: string | null };
@@ -310,6 +324,76 @@ async function apiLikeStatus(args: { postId: string; handle: string | null }): P
     const data = await res.json();
     return { liked: !!data?.liked, count: typeof data?.count === 'number' ? data.count : 0 };
   } catch { return { liked: false, count: 0 }; }
+}
+
+// ---- Comment API ----
+// All comment endpoints live in the dedicated server module comments.js.
+// Auto-approved at creation; flat structure (no nested replies in v1).
+
+// Fetch all approved comments for a post, oldest first.
+async function apiFetchComments(postId: string): Promise<SocialComment[]> {
+  try {
+    const res = await fetch(`${API_BASE}/comments/post/${encodeURIComponent(postId)}`);
+    const data = await res.json();
+    return Array.isArray(data?.comments) ? data.comments : [];
+  } catch { return []; }
+}
+
+// Create a new comment on a post. Server auto-approves and updates the
+// parent post's cached commentCount.
+async function apiCreateComment(args: { postId: string; handle: string; deviceId: string; body: string }): Promise<{ ok: boolean; comment?: SocialComment; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/comments`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    const data = await res.json();
+    if (!res.ok) return { ok: false, reason: data?.error || `HTTP ${res.status}` };
+    return { ok: true, comment: data?.comment };
+  } catch (e: any) {
+    return { ok: false, reason: e?.message || 'network error' };
+  }
+}
+
+// Toggle a heart on a single comment. Mirrors apiToggleLike for posts.
+async function apiToggleCommentLike(args: { commentId: string; handle: string; deviceId: string }): Promise<{ ok: boolean; liked?: boolean; count?: number; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/comments/like/${encodeURIComponent(args.commentId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ handle: args.handle, deviceId: args.deviceId }),
+    });
+    const data = await res.json();
+    if (!res.ok) return { ok: false, reason: data?.error || `HTTP ${res.status}` };
+    return { ok: true, liked: !!data?.liked, count: typeof data?.count === 'number' ? data.count : 0 };
+  } catch (e: any) { return { ok: false, reason: e?.message || 'network error' }; }
+}
+
+// Check whether the current user has liked a comment + the total count.
+async function apiCommentLikeStatus(args: { commentId: string; handle: string | null }): Promise<{ liked: boolean; count: number }> {
+  try {
+    const url = args.handle
+      ? `${API_BASE}/comments/likes/${encodeURIComponent(args.commentId)}?handle=${encodeURIComponent(args.handle)}`
+      : `${API_BASE}/comments/likes/${encodeURIComponent(args.commentId)}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    return { liked: !!data?.liked, count: typeof data?.count === 'number' ? data.count : 0 };
+  } catch { return { liked: false, count: 0 }; }
+}
+
+// Author-delete their own comment.
+async function apiDeleteComment(args: { commentId: string; handle: string; deviceId: string }): Promise<{ ok: boolean; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/comments/delete/${encodeURIComponent(args.commentId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ handle: args.handle, deviceId: args.deviceId }),
+    });
+    const data = await res.json();
+    if (!res.ok) return { ok: false, reason: data?.error || `HTTP ${res.status}` };
+    return { ok: true };
+  } catch (e: any) { return { ok: false, reason: e?.message || 'network error' }; }
 }
 
 // Create a post via multipart/form-data. Photo must be a Blob/File from
@@ -2643,7 +2727,7 @@ function HomeBottomBar({ onSubmit, onList, onAbout, onSocial }: {
         className="sinister-icon-btn" style={S.homeBarBtn}
         onClick={() => { playSubDrop(); onAbout(); }}
       >
-        <img src={aboutIconUrl} alt="" style={S.homeBarIcon} />
+        <img src={aboutIconUrl} alt="" style={{ ...S.homeBarIcon, ...S.homeBarIconLarge }} />
         <span style={S.homeBarLabel}>About</span>
       </button>
     </div>
@@ -3352,6 +3436,13 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap 
   const [liked, setLiked] = useState(false);
   const [likeCount, setLikeCount] = useState(post.likeCount || 0);
   const [likeBusy, setLikeBusy] = useState(false);
+  // Local copy of the comment count so we can optimistically bump it
+  // when the user posts a new comment from the sheet without round-
+  // tripping back to the feed endpoint. Server is still the source of
+  // truth — we sync on sheet open via apiFetchComments.length.
+  const [commentCount, setCommentCount] = useState(post.commentCount || 0);
+  // Whether the IG-style comment sheet is open over this post.
+  const [commentsOpen, setCommentsOpen] = useState(false);
 
   // Fetch authoritative like state on mount. Server is the source of
   // truth — the post.likeCount cached on the feed is just a starting
@@ -3449,14 +3540,17 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap 
           )}
         </button>
         <button
-          style={{ ...S.postIconBtn, opacity: 0.4 }}
-          aria-label="Comment (coming soon)"
-          disabled
+          onClick={() => setCommentsOpen(true)}
+          style={S.postIconBtn}
+          aria-label="View comments"
         >
-          {/* Comment bubble — disabled placeholder until comments ship */}
+          {/* Comment bubble — taps open the IG-style sheet. */}
           <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#F0EBE0" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
             <path d="M21 11.5a8.38 8.38 0 0 1-8.5 8.5 8.5 8.5 0 0 1-3.8-.9L3 21l1.9-5.7A8.38 8.38 0 0 1 4 11.5 8.5 8.5 0 0 1 12.5 3a8.38 8.38 0 0 1 8.5 8.5z" />
           </svg>
+          {commentCount > 0 && (
+            <span style={S.postIconBtnCount}>{commentCount}</span>
+          )}
         </button>
         <button
           onClick={async () => {
@@ -3506,9 +3600,384 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap 
         <button onClick={onHandleTap} style={S.postCaptionHandle}>{post.handle}</button>
         <span style={S.postCaptionText}> {post.caption}</span>
       </div>
+
+      {/* "View all N comments" link, IG-style — appears below the
+          caption when there's at least one comment. Tapping opens the
+          same sheet as the comment-icon button. */}
+      {commentCount > 0 && (
+        <button onClick={() => setCommentsOpen(true)} style={S.postViewCommentsBtn}>
+          View {commentCount === 1 ? '1 comment' : `all ${commentCount} comments`}
+        </button>
+      )}
+
+      {/* IG-style bottom-sheet comments. Rendered conditionally so the
+          DOM stays small until the user actually taps. The sheet itself
+          portals to body so it overlays everything. */}
+      {commentsOpen && (
+        <CommentSheet
+          post={post}
+          currentHandle={currentHandle}
+          deviceId={deviceId}
+          onClose={() => setCommentsOpen(false)}
+          onCountChange={(n) => setCommentCount(n)}
+        />
+      )}
     </div>
   );
 }
+
+// ---------- Comment Sheet ----------
+// IG-style bottom sheet that slides up over the post when the user taps
+// the comment icon. Renders a scrollable list of comments (oldest first),
+// an emoji quick-react row, and an input field at the bottom. Slides
+// down on backdrop tap, drag handle pull-down, or X button.
+//
+// Visual style: black/white/grey, IG-neutral — NOT the app's purple/red
+// horror palette. Drew specifically asked for IG visual parity here so
+// the sheet feels familiar to users coming from Instagram. The only
+// horror-app touch is the skull avatar, which we reuse from elsewhere
+// since per-handle avatars don't exist yet.
+function CommentSheet({ post, currentHandle, deviceId, onClose, onCountChange }: {
+  post: SocialPost;
+  currentHandle: string | null;
+  deviceId: string | null;
+  onClose: () => void;
+  // Called after every successful add/delete so the parent's cached
+  // count badge stays in sync without a full feed reload.
+  onCountChange: (n: number) => void;
+}) {
+  const [comments, setComments] = useState<SocialComment[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [draft, setDraft] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  // Track per-comment like state in a Map keyed by comment id. Server
+  // syncs on sheet open via apiCommentLikeStatus, then toggleLike below
+  // optimistically updates and reverts on failure.
+  const [commentLikes, setCommentLikes] = useState<Map<string, { liked: boolean; count: number }>>(new Map());
+  // Drag-to-dismiss tracking. When the user touches the drag handle and
+  // pulls down, we translate the sheet to follow their finger. Release
+  // past the threshold = dismiss; release before = snap back.
+  const [dragY, setDragY] = useState(0);
+  const dragStartYRef = useRef<number | null>(null);
+  // Track entrance animation. Sheet starts at translateY(100%) and
+  // animates to translateY(0) on mount via a CSS transition + a
+  // requestAnimationFrame state flip.
+  const [mounted, setMounted] = useState(false);
+  // Track exit animation. When the user taps backdrop / X / drags past
+  // threshold, we flip `closing` true → CSS transitions back down → on
+  // transitionend we call onClose to actually unmount.
+  const [closing, setClosing] = useState(false);
+
+  // Mount transition — set `mounted` true on next frame so the
+  // translateY(100%) initial style gets a chance to commit before the
+  // browser sees the transition target of translateY(0).
+  useEffect(() => {
+    const id = requestAnimationFrame(() => setMounted(true));
+    return () => cancelAnimationFrame(id);
+  }, []);
+
+  // Initial load — fetch comments and seed the parent's count.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      const list = await apiFetchComments(post.id);
+      if (cancelled) return;
+      setComments(list);
+      setLoading(false);
+      onCountChange(list.length);
+
+      // Fetch like status for each comment in parallel. Skip silently
+      // if there's no handle (anonymous viewer).
+      if (currentHandle && list.length > 0) {
+        const results = await Promise.all(
+          list.map((c) => apiCommentLikeStatus({ commentId: c.id, handle: currentHandle }))
+        );
+        if (cancelled) return;
+        const map = new Map<string, { liked: boolean; count: number }>();
+        list.forEach((c, i) => {
+          map.set(c.id, { liked: results[i].liked, count: results[i].count });
+        });
+        setCommentLikes(map);
+      } else {
+        // No handle — seed counts from the comment records themselves.
+        const map = new Map<string, { liked: boolean; count: number }>();
+        list.forEach((c) => map.set(c.id, { liked: false, count: c.likeCount || 0 }));
+        setCommentLikes(map);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [post.id, currentHandle]);
+
+  // Animated close — flip `closing`, wait for transition, then unmount.
+  const animateClose = () => {
+    if (closing) return;
+    setClosing(true);
+    setTimeout(() => onClose(), 260); // matches CSS transition duration
+  };
+
+  // Touch handlers for drag-to-dismiss on the top handle area.
+  const onTouchStartHandle = (e: React.TouchEvent) => {
+    if (e.touches.length !== 1) return;
+    dragStartYRef.current = e.touches[0].clientY;
+  };
+  const onTouchMoveHandle = (e: React.TouchEvent) => {
+    if (dragStartYRef.current === null || e.touches.length !== 1) return;
+    const dy = e.touches[0].clientY - dragStartYRef.current;
+    // Only drag downward (positive dy). Cap so the sheet can't go up.
+    if (dy > 0) setDragY(dy);
+  };
+  const onTouchEndHandle = () => {
+    const dy = dragY;
+    dragStartYRef.current = null;
+    setDragY(0);
+    if (dy > 120) {
+      // Past dismiss threshold — animate close.
+      animateClose();
+    }
+  };
+
+  // Send a new comment to the server. Optimistically prepends to the
+  // local list, rolls back on failure.
+  const submit = async () => {
+    const body = draft.trim();
+    if (!body || !currentHandle || !deviceId || submitting) return;
+    setSubmitting(true);
+    const tempId = `temp_${Date.now()}`;
+    const optimistic: SocialComment = {
+      id: tempId,
+      postId: post.id,
+      handle: currentHandle,
+      body,
+      createdAt: new Date().toISOString(),
+      likeCount: 0,
+    };
+    setComments((prev) => [...prev, optimistic]);
+    setCommentLikes((prev) => {
+      const next = new Map(prev);
+      next.set(tempId, { liked: false, count: 0 });
+      return next;
+    });
+    setDraft('');
+
+    const result = await apiCreateComment({
+      postId: post.id,
+      handle: currentHandle,
+      deviceId,
+      body,
+    });
+    setSubmitting(false);
+
+    if (!result.ok || !result.comment) {
+      // Roll back optimistic insert.
+      setComments((prev) => prev.filter((c) => c.id !== tempId));
+      setCommentLikes((prev) => {
+        const next = new Map(prev);
+        next.delete(tempId);
+        return next;
+      });
+      showToast(`Comment failed: ${result.reason || 'unknown'}`, 'error');
+      setDraft(body); // restore the user's text so they don't retype
+      return;
+    }
+
+    // Swap the temp comment for the server's real one (real id, etc).
+    const real = result.comment;
+    setComments((prev) => prev.map((c) => (c.id === tempId ? real : c)));
+    setCommentLikes((prev) => {
+      const next = new Map(prev);
+      next.delete(tempId);
+      next.set(real.id, { liked: false, count: 0 });
+      return next;
+    });
+    onCountChange(comments.length + 1);
+  };
+
+  // Toggle a heart on a single comment.
+  const toggleCommentLike = async (commentId: string) => {
+    if (!currentHandle || !deviceId) {
+      showToast('Claim a handle to like comments', 'error');
+      return;
+    }
+    const current = commentLikes.get(commentId);
+    const prevLiked = !!current?.liked;
+    const prevCount = current?.count || 0;
+    // Optimistic
+    setCommentLikes((prev) => {
+      const next = new Map(prev);
+      next.set(commentId, { liked: !prevLiked, count: prevCount + (prevLiked ? -1 : 1) });
+      return next;
+    });
+    const result = await apiToggleCommentLike({ commentId, handle: currentHandle, deviceId });
+    if (!result.ok) {
+      // Revert
+      setCommentLikes((prev) => {
+        const next = new Map(prev);
+        next.set(commentId, { liked: prevLiked, count: prevCount });
+        return next;
+      });
+      showToast(result.reason || 'Like failed', 'error');
+    } else if (typeof result.count === 'number') {
+      setCommentLikes((prev) => {
+        const next = new Map(prev);
+        next.set(commentId, { liked: !!result.liked, count: result.count });
+        return next;
+      });
+    }
+  };
+
+  // Quick emoji row above the input. Tapping inserts the emoji into the
+  // draft at the cursor position (or end if no cursor — simpler).
+  const QUICK_EMOJIS = ['❤️', '🙌', '🔥', '👏', '😢', '😍', '😮', '😂'];
+  const insertEmoji = (emoji: string) => setDraft((prev) => prev + emoji);
+
+  // Body of the sheet. Combines backdrop + sliding panel. The backdrop
+  // catches taps outside the panel for dismiss.
+  const isAuthor = (handle: string) => handle.toLowerCase() === post.handle.toLowerCase();
+
+  // Build the inline transform — start at 100% off-screen, slide in, then
+  // track drag if user is pulling down, then animate to 100% on close.
+  const translateY = closing
+    ? '100%'
+    : mounted
+      ? `${dragY}px`
+      : '100%';
+
+  return createPortal(
+    <div style={S.commentSheetOverlay}>
+      {/* Backdrop — tap dismisses */}
+      <div
+        style={S.commentSheetBackdrop}
+        onClick={animateClose}
+      />
+      {/* Sliding panel */}
+      <div
+        style={{
+          ...S.commentSheetPanel,
+          transform: `translateY(${translateY})`,
+          transition: dragStartYRef.current === null ? 'transform 0.26s cubic-bezier(0.32, 0.72, 0, 1)' : 'none',
+        }}
+      >
+        {/* Drag handle area — also where the touchstart/move/end land */}
+        <div
+          style={S.commentSheetHandleArea}
+          onTouchStart={onTouchStartHandle}
+          onTouchMove={onTouchMoveHandle}
+          onTouchEnd={onTouchEndHandle}
+        >
+          <div style={S.commentSheetHandlePill} />
+        </div>
+
+        {/* Header — title centered, share icon on right (placeholder, no
+            handler yet — present for visual parity with IG) */}
+        <div style={S.commentSheetHeader}>
+          <div style={{ width: 40 }} />
+          <div style={S.commentSheetTitle}>Comments</div>
+          <button onClick={animateClose} style={S.commentSheetCloseBtn} aria-label="Close">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <line x1="22" y1="2" x2="11" y2="13" />
+              <polygon points="22 2 15 22 11 13 2 9 22 2" />
+            </svg>
+          </button>
+        </div>
+
+        {/* Scrollable comment list */}
+        <div style={S.commentSheetList}>
+          {loading ? (
+            <div style={S.commentSheetEmpty}>Loading…</div>
+          ) : comments.length === 0 ? (
+            <div style={S.commentSheetEmpty}>
+              No comments yet.
+              <br />
+              <span style={{ opacity: 0.6, fontSize: 13 }}>Be the first to comment.</span>
+            </div>
+          ) : (
+            comments.map((c) => {
+              const likeState = commentLikes.get(c.id) || { liked: false, count: c.likeCount || 0 };
+              return (
+                <div key={c.id} style={S.commentRow}>
+                  <img src={exposureIconUrl} alt="" style={S.commentAvatar} />
+                  <div style={S.commentBodyCol}>
+                    <div style={S.commentMetaLine}>
+                      <span style={S.commentHandle}>{c.handle}</span>
+                      <span style={S.commentTime}>{formatTimeAgoShort(c.createdAt)}</span>
+                      {isAuthor(c.handle) && (
+                        <span style={S.commentAuthorBadge}>Author</span>
+                      )}
+                    </div>
+                    <div style={S.commentBodyText}>{c.body}</div>
+                  </div>
+                  <button
+                    onClick={() => toggleCommentLike(c.id)}
+                    style={S.commentLikeBtn}
+                    aria-label={likeState.liked ? 'Unlike comment' : 'Like comment'}
+                  >
+                    {likeState.liked ? (
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="#FF3B5C" stroke="#FF3B5C" strokeWidth="1.8" strokeLinejoin="round">
+                        <path d="M12 21s-7.5-4.6-9.5-9.5C1 7.5 4 4 7.5 4c2 0 3.4 1 4.5 2.5C13.1 5 14.5 4 16.5 4 20 4 23 7.5 21.5 11.5 19.5 16.4 12 21 12 21Z" />
+                      </svg>
+                    ) : (
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#888888" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M12 21s-7.5-4.6-9.5-9.5C1 7.5 4 4 7.5 4c2 0 3.4 1 4.5 2.5C13.1 5 14.5 4 16.5 4 20 4 23 7.5 21.5 11.5 19.5 16.4 12 21 12 21Z" />
+                      </svg>
+                    )}
+                    {likeState.count > 0 && (
+                      <span style={S.commentLikeCount}>{likeState.count}</span>
+                    )}
+                  </button>
+                </div>
+              );
+            })
+          )}
+        </div>
+
+        {/* Emoji quick-react row */}
+        <div style={S.commentSheetEmojiRow}>
+          {QUICK_EMOJIS.map((emoji) => (
+            <button
+              key={emoji}
+              onClick={() => insertEmoji(emoji)}
+              style={S.commentSheetEmojiBtn}
+            >
+              {emoji}
+            </button>
+          ))}
+        </div>
+
+        {/* Composer row — avatar + input + Post button */}
+        <div style={S.commentSheetComposer}>
+          <img src={exposureIconUrl} alt="" style={S.commentSheetComposerAvatar} />
+          <input
+            type="text"
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            placeholder={currentHandle ? `Add a comment for ${post.handle}...` : 'Claim a handle to comment'}
+            disabled={!currentHandle || submitting}
+            maxLength={500}
+            style={S.commentSheetComposerInput}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                submit();
+              }
+            }}
+          />
+          {draft.trim().length > 0 && (
+            <button
+              onClick={submit}
+              disabled={submitting}
+              style={S.commentSheetComposerPostBtn}
+            >
+              {submitting ? '...' : 'Post'}
+            </button>
+          )}
+        </div>
+      </div>
+    </div>,
+    document.body
+  );
+}
+
 
 // Instagram-style compact relative-time formatter. "5m" / "3h" / "1d" /
 // "2w". No "ago" suffix, no spelling out — just unit-letter pairs.
@@ -5379,6 +5848,13 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
   const userAnnotationRef = useRef<any>(null);
   const siteAnnotationsRef = useRef<any[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
+  // State flag that flips true once the MapKit map object exists on
+  // mapRef. Several effects that touch the map need to re-run after
+  // it's ready — without a state flag, they'd race the async map
+  // creation and bail with `if (!map) return`, then never fire again
+  // because their actual data deps haven't changed. This is the root
+  // cause of the "pins don't appear until I touch the radius" bug.
+  const [mapReady, setMapReady] = useState(false);
   const [livePos, setLivePos] = useState<{ lat: number; lng: number } | null>(currentLocation);
   // Currently-tapped pin's site + distance. When non-null, a slide-up
   // preview card renders over the bottom of the map. Tapping the map
@@ -5499,6 +5975,9 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
           });
         };
         mapRef.current = map;
+        // Flip the state flag so dependent effects (annotation rebuild,
+        // initial center, etc.) re-run now that the map is real.
+        setMapReady(true);
       })
       .catch((err) => {
         if (cancelled) return;
@@ -5589,7 +6068,7 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
       map.addAnnotation(dot);
       userAnnotationRef.current = dot;
     }
-  }, [livePos, pinCenter]);
+  }, [livePos, pinCenter, mapReady]);
 
   // Drag-end handler — when the user releases the dragged dot, capture
   // the new coordinate as pinCenter. MapKit's drag-end fires on the
@@ -5614,7 +6093,7 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
       try { dot.removeEventListener('drag-end', onDragEnd); } catch { /* silent */ }
       dragHandlerBoundRef.current = false;
     };
-  }, [livePos]); // re-evaluate after first livePos arrives (when dot gets created)
+  }, [livePos, mapReady]); // re-evaluate after first livePos arrives (when dot gets created)
 
   // Recolor the user dot to reflect dragged vs. at-real-location state.
   // Red = you've dragged it to search a different area. Blue = at your
@@ -5632,7 +6111,7 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
       dot.color = '#2a8aff';
       dot.title = 'Drag me to search elsewhere';
     }
-  }, [pinCenter, livePos]);
+  }, [pinCenter, livePos, mapReady]);
 
   // Re-zoom the visible region only when the USER changes something —
   // a radius chip tap, or a drag-end on the user dot (which updates
@@ -5797,7 +6276,7 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
       try { map.removeEventListener('select', onSelect); } catch { /* silent */ }
       try { map.removeEventListener('single-tap', onMapTap); } catch { /* silent */ }
     };
-  }, [nearbySites, pinCenter]);
+  }, [nearbySites, pinCenter, mapReady]);
 
   // Directions helper — same geo: scheme + Google Maps web fallback that
   // DetailView's Get Directions button uses. Lets the slide-up card route
@@ -8067,6 +8546,18 @@ const S: Record<string, React.CSSProperties> = {
     height: 60,
     margin: 5,
   },
+  // Visual-balance override for icons whose source PNG art has EXTRA
+  // padding inside the canvas (currently just About — the cracked-skull-
+  // question-mark sits with ~10% black padding around it, while DreadFeed's
+  // skull-and-crossbones fills its canvas to the edges). Renders About
+  // bigger so the visible artwork matches DreadFeed's visible artwork
+  // size. Negative margin pulls the bigger image back inside the button's
+  // bounds without changing the slot width.
+  homeBarIconLarge: {
+    width: 80,
+    height: 80,
+    margin: -5,
+  },
   homeBarLabel: {
     // Slightly larger label to match the bigger icons — bumped from 11
     // to 12. Stays tight enough to fit "List View" / "DreadFeed" on a
@@ -8687,6 +9178,252 @@ const S: Record<string, React.CSSProperties> = {
     color: '#F0EBE0',
     fontSize: 14,
     fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  // Small numeric badge next to the comment icon — shows the comment
+  // count when > 0. Sits to the right of the icon inside the same
+  // button so it taps as a single target.
+  postIconBtnCount: {
+    color: '#F0EBE0',
+    fontSize: 14,
+    fontWeight: 600,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    marginLeft: 6,
+  },
+  // "View all N comments" button below the caption, IG-style. Plain
+  // grey text, no chrome, opens the comment sheet on tap.
+  postViewCommentsBtn: {
+    display: 'block',
+    padding: '0 14px 8px 14px',
+    color: '#888888',
+    fontSize: 14,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    backgroundColor: 'transparent',
+    border: 'none',
+    cursor: 'pointer',
+    textAlign: 'left' as const,
+  },
+  // ---- Comment Sheet (IG-style bottom sheet) ----
+  // Full-viewport overlay that catches taps for backdrop dismiss.
+  commentSheetOverlay: {
+    position: 'fixed' as const,
+    top: 0, left: 0, right: 0, bottom: 0,
+    zIndex: 200,
+    display: 'flex',
+    alignItems: 'flex-end',
+    justifyContent: 'center',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  // Backdrop layer — sits behind the sheet, tap to dismiss. Pure
+  // transparent black; the post photo above still shows through dimly.
+  commentSheetBackdrop: {
+    position: 'absolute' as const,
+    top: 0, left: 0, right: 0, bottom: 0,
+    backgroundColor: 'rgba(0,0,0,0.4)',
+  },
+  // The sliding panel itself. Black background, rounded top corners,
+  // takes 78% of viewport height (per IG). Transform is set inline on
+  // the element so we can drive the slide animation.
+  commentSheetPanel: {
+    position: 'relative' as const,
+    width: '100%',
+    maxWidth: 600,
+    height: '78vh',
+    backgroundColor: '#000000',
+    borderTopLeftRadius: 14,
+    borderTopRightRadius: 14,
+    display: 'flex',
+    flexDirection: 'column' as const,
+    boxShadow: '0 -8px 28px rgba(0,0,0,0.6)',
+    overflow: 'hidden' as const,
+  },
+  // The drag-handle "grab area" at the very top. Larger than the visible
+  // pill so the touch target is friendly (44px tall).
+  commentSheetHandleArea: {
+    width: '100%',
+    height: 22,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingTop: 8,
+    paddingBottom: 4,
+    cursor: 'grab',
+    touchAction: 'none' as const,
+  },
+  // The visible grey pill inside the handle area.
+  commentSheetHandlePill: {
+    width: 40,
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: '#555555',
+  },
+  // Header — "Comments" centered, share icon right.
+  commentSheetHeader: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: '6px 14px 10px 14px',
+    borderBottom: '1px solid #1a1a1a',
+  },
+  commentSheetTitle: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: 700,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  commentSheetCloseBtn: {
+    width: 40,
+    height: 32,
+    backgroundColor: 'transparent',
+    border: 'none',
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 0,
+  },
+  // Scrollable list region.
+  commentSheetList: {
+    flex: 1,
+    overflowY: 'auto' as const,
+    padding: '8px 0 12px 0',
+    WebkitOverflowScrolling: 'touch' as any,
+  },
+  commentSheetEmpty: {
+    textAlign: 'center' as const,
+    padding: '60px 24px',
+    color: '#888888',
+    fontSize: 15,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  // Per-comment row: avatar | body column | like column.
+  commentRow: {
+    display: 'flex',
+    alignItems: 'flex-start',
+    gap: 10,
+    padding: '10px 14px',
+  },
+  commentAvatar: {
+    width: 36,
+    height: 36,
+    minWidth: 36,
+    borderRadius: '50%',
+    objectFit: 'cover' as const,
+    pointerEvents: 'none' as const,
+  },
+  commentBodyCol: {
+    flex: 1,
+    display: 'flex',
+    flexDirection: 'column' as const,
+    gap: 2,
+    minWidth: 0,
+  },
+  commentMetaLine: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 6,
+    flexWrap: 'wrap' as const,
+  },
+  commentHandle: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: 600,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  commentTime: {
+    color: '#888888',
+    fontSize: 12,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  // Pinned "Author" badge on the post author's own comments.
+  commentAuthorBadge: {
+    color: '#888888',
+    fontSize: 11,
+    fontWeight: 600,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    padding: '1px 6px',
+    border: '1px solid #444',
+    borderRadius: 6,
+    letterSpacing: '0.05em',
+  },
+  commentBodyText: {
+    color: '#FFFFFF',
+    fontSize: 14,
+    lineHeight: 1.35,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    wordBreak: 'break-word' as const,
+  },
+  // Like button column on each comment row.
+  commentLikeBtn: {
+    display: 'flex',
+    flexDirection: 'column' as const,
+    alignItems: 'center',
+    gap: 2,
+    backgroundColor: 'transparent',
+    border: 'none',
+    cursor: 'pointer',
+    padding: '6px 4px',
+    minWidth: 30,
+  },
+  commentLikeCount: {
+    color: '#888888',
+    fontSize: 11,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  // Quick-emoji row above the input. 8 buttons spread evenly.
+  commentSheetEmojiRow: {
+    display: 'flex',
+    justifyContent: 'space-around',
+    alignItems: 'center',
+    padding: '10px 8px 8px 8px',
+    borderTop: '1px solid #1a1a1a',
+  },
+  commentSheetEmojiBtn: {
+    backgroundColor: 'transparent',
+    border: 'none',
+    cursor: 'pointer',
+    fontSize: 24,
+    padding: 4,
+    lineHeight: 1,
+  },
+  // Composer row at the bottom: avatar + input + Post button.
+  // Uses safe-area-inset-bottom so it doesn't collide with the iOS
+  // home indicator.
+  commentSheetComposer: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 10,
+    padding: '8px 14px 8px 14px',
+    paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 8px)' as any,
+    borderTop: '1px solid #1a1a1a',
+    backgroundColor: '#000000',
+  },
+  commentSheetComposerAvatar: {
+    width: 28,
+    height: 28,
+    minWidth: 28,
+    borderRadius: '50%',
+    objectFit: 'cover' as const,
+    pointerEvents: 'none' as const,
+  },
+  commentSheetComposerInput: {
+    flex: 1,
+    backgroundColor: 'transparent',
+    border: 'none',
+    outline: 'none',
+    color: '#FFFFFF',
+    fontSize: 14,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    padding: '8px 0',
+  } as any,
+  commentSheetComposerPostBtn: {
+    backgroundColor: 'transparent',
+    border: 'none',
+    color: '#3897F0',                       // IG blue
+    fontSize: 14,
+    fontWeight: 700,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+    padding: '8px 4px',
   },
   // ---- Deprecated post styles (kept for backwards compat in case other
   // code references them; not used by the current SocialPostCard) ----
