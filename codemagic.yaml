@@ -4,9 +4,9 @@
 # Injects iOS Info.plist permission strings (location + camera) automatically
 # after Capacitor scaffolds the iOS project, before the build runs.
 # Also writes the App.entitlements file with Sign in with Apple capability
-# and wires it into the Xcode project (Capacitor doesn't ship one by default
-# and the Apple Sign In plugin requires it — without it, the runtime auth call
-# fails with AuthorizationError 1000).
+# and patches project.pbxproj to point at it via CODE_SIGN_ENTITLEMENTS.
+# Uses sed targeted at the bundle-ID line so it only matches the real App
+# target configs (Debug + Release), never Pods or test targets.
 # =============================================================================
 workflows:
   ios-unsigned-build:
@@ -60,48 +60,22 @@ workflows:
           </dict>
           </plist>
           EOF
-          echo "--- App.entitlements ---"
+          echo "--- App.entitlements written ---"
           plutil -p "$ENT"
-          # Wire the entitlements file into the Xcode project so the build uses it.
-          # Without CODE_SIGN_ENTITLEMENTS set in build settings, the file exists
-          # on disk but the .app bundle ships without the entitlement, and Sign
-          # in with Apple fails at runtime with AuthorizationError 1000.
+      - name: Patch Xcode project to use entitlements file
+        script: |
           PROJ="ios/App/App.xcodeproj/project.pbxproj"
-          if ! grep -q "CODE_SIGN_ENTITLEMENTS = App/App.entitlements" "$PROJ"; then
-            # Insert CODE_SIGN_ENTITLEMENTS into every build configuration's
-            # buildSettings block. The pattern matches buildSettings = { ...
-            # which appears in each Debug and Release config for the App target.
-            python3 <<'PY'
-          import re
-          path = "ios/App/App.xcodeproj/project.pbxproj"
-          with open(path, "r") as f:
-              content = f.read()
-          # Find every buildSettings block for the App target (PRODUCT_NAME = App)
-          # and insert CODE_SIGN_ENTITLEMENTS if not already present.
-          def inject(m):
-              block = m.group(0)
-              if "CODE_SIGN_ENTITLEMENTS" in block:
-                  return block
-              # Insert right after the opening buildSettings = {
-              return block.replace(
-                  "buildSettings = {",
-                  "buildSettings = {\n\t\t\t\tCODE_SIGN_ENTITLEMENTS = App/App.entitlements;",
-                  1
-              )
-          # Match buildSettings blocks that belong to the App target
-          # (identified by PRODUCT_NAME = App; inside the block).
-          pattern = re.compile(
-              r"buildSettings = \{[^}]*?PRODUCT_NAME = App;[^}]*?\};",
-              re.DOTALL
-          )
-          new_content = pattern.sub(inject, content)
-          with open(path, "w") as f:
-              f.write(new_content)
-          print("Injected CODE_SIGN_ENTITLEMENTS into project.pbxproj")
-          PY
-          else
-            echo "CODE_SIGN_ENTITLEMENTS already set in project.pbxproj"
-          fi
+          echo "--- BEFORE: count of CODE_SIGN_ENTITLEMENTS ---"
+          grep -c "CODE_SIGN_ENTITLEMENTS" "$PROJ" || echo "0"
+          # Use sed to add CODE_SIGN_ENTITLEMENTS after every PRODUCT_BUNDLE_IDENTIFIER
+          # line for our specific bundle ID. This hits only the App target configs.
+          sed -i '' '/PRODUCT_BUNDLE_IDENTIFIER = com\.sinistertrivia\.macabretest;/a\
+\				CODE_SIGN_ENTITLEMENTS = App/App.entitlements;
+' "$PROJ"
+          echo "--- AFTER: count of CODE_SIGN_ENTITLEMENTS ---"
+          grep -c "CODE_SIGN_ENTITLEMENTS" "$PROJ" || echo "0"
+          echo "--- CONFIRM (should show CODE_SIGN_ENTITLEMENTS lines) ---"
+          grep -B1 -A1 "CODE_SIGN_ENTITLEMENTS = App/App.entitlements" "$PROJ" | head -30
       - name: Sync Capacitor to iOS
         script: |
           npx cap sync ios
@@ -190,40 +164,22 @@ workflows:
           </dict>
           </plist>
           EOF
-          echo "--- App.entitlements ---"
+          echo "--- App.entitlements written ---"
           plutil -p "$ENT"
-          # Wire the entitlements file into the Xcode project so the build uses it.
-          # Without CODE_SIGN_ENTITLEMENTS set in build settings, the file exists
-          # on disk but the .app bundle ships without the entitlement, and Sign
-          # in with Apple fails at runtime with AuthorizationError 1000.
+      - name: Patch Xcode project to use entitlements file
+        script: |
           PROJ="ios/App/App.xcodeproj/project.pbxproj"
-          if ! grep -q "CODE_SIGN_ENTITLEMENTS = App/App.entitlements" "$PROJ"; then
-            python3 <<'PY'
-          import re
-          path = "ios/App/App.xcodeproj/project.pbxproj"
-          with open(path, "r") as f:
-              content = f.read()
-          def inject(m):
-              block = m.group(0)
-              if "CODE_SIGN_ENTITLEMENTS" in block:
-                  return block
-              return block.replace(
-                  "buildSettings = {",
-                  "buildSettings = {\n\t\t\t\tCODE_SIGN_ENTITLEMENTS = App/App.entitlements;",
-                  1
-              )
-          pattern = re.compile(
-              r"buildSettings = \{[^}]*?PRODUCT_NAME = App;[^}]*?\};",
-              re.DOTALL
-          )
-          new_content = pattern.sub(inject, content)
-          with open(path, "w") as f:
-              f.write(new_content)
-          print("Injected CODE_SIGN_ENTITLEMENTS into project.pbxproj")
-          PY
-          else
-            echo "CODE_SIGN_ENTITLEMENTS already set in project.pbxproj"
-          fi
+          echo "--- BEFORE: count of CODE_SIGN_ENTITLEMENTS ---"
+          grep -c "CODE_SIGN_ENTITLEMENTS" "$PROJ" || echo "0"
+          # Use sed to add CODE_SIGN_ENTITLEMENTS after every PRODUCT_BUNDLE_IDENTIFIER
+          # line for our specific bundle ID. This hits only the App target configs.
+          sed -i '' '/PRODUCT_BUNDLE_IDENTIFIER = com\.sinistertrivia\.macabretest;/a\
+\				CODE_SIGN_ENTITLEMENTS = App/App.entitlements;
+' "$PROJ"
+          echo "--- AFTER: count of CODE_SIGN_ENTITLEMENTS ---"
+          grep -c "CODE_SIGN_ENTITLEMENTS" "$PROJ" || echo "0"
+          echo "--- CONFIRM (should show CODE_SIGN_ENTITLEMENTS lines) ---"
+          grep -B1 -A1 "CODE_SIGN_ENTITLEMENTS = App/App.entitlements" "$PROJ" | head -30
       - name: Sync Capacitor to iOS
         script: |
           npx cap sync ios
