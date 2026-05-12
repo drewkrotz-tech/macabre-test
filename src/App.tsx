@@ -128,6 +128,130 @@ async function apiGetMyHandle(deviceId: string): Promise<string | null> {
   } catch { return null; }
 }
 
+// ---------- Account management API ----------
+// All the endpoints added in Batch 1: account deletion, email recovery,
+// Apple Sign In, content reporting, user blocking.
+
+async function apiSignInApple(args: { identityToken: string; deviceId: string }):
+  Promise<{ ok: boolean; handle: string | null; appleUserId?: string; appleEmail?: string | null; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/handles/sign-in-apple`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    return await res.json();
+  } catch (e: any) { return { ok: false, handle: null, reason: e?.message || 'network error' }; }
+}
+
+async function apiAddEmail(args: { handle: string; deviceId: string; email: string }): Promise<{ ok: boolean; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/handles/add-email`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    return await res.json();
+  } catch (e: any) { return { ok: false, reason: e?.message || 'network error' }; }
+}
+
+async function apiVerifyEmail(args: { handle: string; deviceId: string; code: string }): Promise<{ ok: boolean; email?: string; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/handles/verify-email`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    return await res.json();
+  } catch (e: any) { return { ok: false, reason: e?.message || 'network error' }; }
+}
+
+async function apiRequestRecovery(handle: string): Promise<{ ok: boolean; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/handles/request-recovery`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ handle }),
+    });
+    return await res.json();
+  } catch (e: any) { return { ok: false, reason: e?.message || 'network error' }; }
+}
+
+async function apiRecover(args: { handle: string; code: string; newDeviceId: string }):
+  Promise<{ ok: boolean; handle?: string; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/handles/recover`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    return await res.json();
+  } catch (e: any) { return { ok: false, reason: e?.message || 'network error' }; }
+}
+
+async function apiDeleteAccount(args: { handle: string; deviceId: string }): Promise<{ ok: boolean; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/handles/delete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    return await res.json();
+  } catch (e: any) { return { ok: false, reason: e?.message || 'network error' }; }
+}
+
+// ---- Reports ----
+type ReportReason = 'spam' | 'harassment' | 'hate' | 'violence' | 'sexual' | 'illegal' | 'off-topic' | 'other';
+
+async function apiReport(args: { type: 'post' | 'comment'; targetId: string; reason: ReportReason; note?: string; handle: string; deviceId: string }):
+  Promise<{ ok: boolean; alreadyReported?: boolean; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/reports`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    const data = await res.json();
+    if (!res.ok) return { ok: false, reason: data?.error || `HTTP ${res.status}` };
+    return { ok: true, alreadyReported: !!data?.alreadyReported };
+  } catch (e: any) { return { ok: false, reason: e?.message || 'network error' }; }
+}
+
+// ---- Blocks ----
+async function apiBlock(args: { blocker: string; blocked: string; deviceId: string }): Promise<{ ok: boolean; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/blocks/block`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    const data = await res.json();
+    if (!res.ok) return { ok: false, reason: data?.error || `HTTP ${res.status}` };
+    return { ok: true };
+  } catch (e: any) { return { ok: false, reason: e?.message || 'network error' }; }
+}
+
+async function apiUnblock(args: { blocker: string; blocked: string; deviceId: string }): Promise<{ ok: boolean; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/blocks/unblock`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    const data = await res.json();
+    if (!res.ok) return { ok: false, reason: data?.error || `HTTP ${res.status}` };
+    return { ok: true };
+  } catch (e: any) { return { ok: false, reason: e?.message || 'network error' }; }
+}
+
+async function apiBlockedList(handle: string): Promise<{ handle: string; createdAt: string }[]> {
+  try {
+    const res = await fetch(`${API_BASE}/blocks/list/${encodeURIComponent(handle)}`);
+    const data = await res.json();
+    return Array.isArray(data?.blocked) ? data.blocked : [];
+  } catch { return []; }
+}
+
 // ---------- Visit-claim API ----------
 // POST /visits — server checks (handle, deviceId) ownership, verifies the
 // reported lat/lng is within 100m of the site's coords, dedupes (one visit
@@ -1749,7 +1873,8 @@ type View =
   | { name: 'list' }
   | { name: 'social' }
   | { name: 'userProfile'; handle: string }
-  | { name: 'post'; postId: string; postList?: string[]; preloadedPosts?: SocialPost[] };
+  | { name: 'post'; postId: string; postList?: string[]; preloadedPosts?: SocialPost[] }
+  | { name: 'settings' };
 
 export default function App() {
   const [view, _setViewRaw] = useState<View>({ name: 'home' });
@@ -2374,6 +2499,7 @@ export default function App() {
             onSelectHandle={(h) => setView({ name: 'userProfile', handle: h })}
             onSelectPost={(postId, postList, preloadedPosts) => setView({ name: 'post', postId, postList, preloadedPosts })}
             onHandleClaimed={setHandle}
+            onSelectSettings={() => setView({ name: 'settings' })}
           />
         ),
       };
@@ -2424,6 +2550,28 @@ export default function App() {
               setView({ name: 'social' });
             }}
             onBack={goHome}
+          />
+        ),
+      };
+    } else if (v.name === 'settings') {
+      return {
+        key: 'settings',
+        element: (
+          <SettingsView
+            handle={handle}
+            deviceId={deviceId}
+            onBack={() => {
+              // Settings is only entered from your own profile, so back
+              // returns there via SocialView with profile sub-tab restored.
+              _exposureSubTabMemory = 'profile';
+              setView({ name: 'social' });
+            }}
+            onSignedOut={() => {
+              // After account deletion the local handle state must clear
+              // so we don't re-render screens with a stale handle.
+              setHandle(null);
+              setView({ name: 'home' });
+            }}
           />
         ),
       };
@@ -2632,7 +2780,8 @@ export default function App() {
           Showing both bars stacks them and confuses navigation. */}
       {view.name !== 'nearby' && view.name !== 'detail' && view.name !== 'submit'
         && view.name !== 'social' && view.name !== 'userProfile'
-        && view.name !== 'post' && view.name !== 'badges' && (
+        && view.name !== 'post' && view.name !== 'badges'
+        && view.name !== 'settings' && (
         <HomeBottomBar
           onSubmit={goSubmit}
           onList={goList}
@@ -2948,6 +3097,501 @@ function HomeBottomBar({ onSubmit, onList, onAbout, onSocial }: {
 type _ExposureSubTab = 'feed' | 'search' | 'post' | 'profile';
 let _exposureSubTabMemory: _ExposureSubTab = 'feed';
 
+// ---------- Settings View ----------
+// Reached from a gear icon on your own DreadFeed profile. Centralizes
+// the account management surface that App Store guideline 5.1.1(v)
+// requires to be reachable and discoverable:
+//   - Add / verify a recovery email
+//   - View blocked users
+//   - View terms / privacy
+//   - Delete account (with confirmation)
+//
+// Visually matches the DreadFeed aesthetic — black background, white
+// text, system-ui sans-serif, IG-style rows with a chevron.
+function SettingsView({ handle, deviceId, onBack, onSignedOut }: {
+  handle: string | null;
+  deviceId: string | null;
+  onBack: () => void;
+  onSignedOut: () => void;
+}) {
+  // Modal states. Only one open at a time.
+  const [emailModalOpen, setEmailModalOpen] = useState(false);
+  const [verifyModalOpen, setVerifyModalOpen] = useState(false);
+  const [pendingEmail, setPendingEmail] = useState('');
+  const [blockedModalOpen, setBlockedModalOpen] = useState(false);
+  const [deleteModalOpen, setDeleteModalOpen] = useState(false);
+
+  if (!handle || !deviceId) {
+    return (
+      <div style={S.settingsWrap}>
+        <SettingsHeader title="Settings" onBack={onBack} />
+        <div style={S.settingsEmpty}>You need a handle to manage settings.</div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={S.settingsWrap}>
+      <SettingsHeader title="Settings" onBack={onBack} />
+
+      <div style={S.settingsSectionLabel}>Account</div>
+      <SettingsRow
+        label="Add recovery email"
+        sublabel="Required to recover your account if you lose your phone"
+        onClick={() => setEmailModalOpen(true)}
+      />
+      <SettingsRow
+        label="Blocked users"
+        sublabel="Manage who you've blocked"
+        onClick={() => setBlockedModalOpen(true)}
+      />
+
+      <div style={S.settingsSectionLabel}>Legal</div>
+      <SettingsRow
+        label="Terms of Service"
+        onClick={() => {
+          // Open external link to terms page. Will be a hosted page on
+          // sinistertrivia.com once Drew writes them — placeholder for now.
+          try { (window as any).open?.('https://sinistertrivia.com/terms', '_blank'); }
+          catch { showToast('Opening terms…', 'default'); }
+        }}
+      />
+      <SettingsRow
+        label="Privacy Policy"
+        onClick={() => {
+          try { (window as any).open?.('https://sinistertrivia.com/privacy', '_blank'); }
+          catch { showToast('Opening privacy policy…', 'default'); }
+        }}
+      />
+
+      <div style={S.settingsSectionLabel}>Danger zone</div>
+      <SettingsRow
+        label="Delete account"
+        sublabel="Permanently delete your handle, posts, comments, follows"
+        destructive
+        onClick={() => setDeleteModalOpen(true)}
+      />
+
+      <div style={S.settingsFooter}>
+        @{handle} · The Dread Directory
+      </div>
+
+      {emailModalOpen && (
+        <AddEmailModal
+          handle={handle}
+          deviceId={deviceId}
+          onClose={() => setEmailModalOpen(false)}
+          onCodeSent={(email) => {
+            setPendingEmail(email);
+            setEmailModalOpen(false);
+            setVerifyModalOpen(true);
+          }}
+        />
+      )}
+      {verifyModalOpen && (
+        <VerifyEmailModal
+          handle={handle}
+          deviceId={deviceId}
+          email={pendingEmail}
+          onClose={() => setVerifyModalOpen(false)}
+          onVerified={() => {
+            setVerifyModalOpen(false);
+            showToast('Email verified — you can now recover your account', 'success');
+          }}
+        />
+      )}
+      {blockedModalOpen && (
+        <BlockedListModal
+          handle={handle}
+          deviceId={deviceId}
+          onClose={() => setBlockedModalOpen(false)}
+        />
+      )}
+      {deleteModalOpen && (
+        <DeleteAccountModal
+          handle={handle}
+          deviceId={deviceId}
+          onClose={() => setDeleteModalOpen(false)}
+          onDeleted={() => {
+            setDeleteModalOpen(false);
+            showToast('Account deleted', 'success');
+            onSignedOut();
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function SettingsHeader({ title, onBack }: { title: string; onBack: () => void }) {
+  return (
+    <div style={S.settingsHeaderBar}>
+      <button onClick={onBack} style={S.settingsBackBtn} aria-label="Back">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <polyline points="15 18 9 12 15 6" />
+        </svg>
+      </button>
+      <div style={S.settingsHeaderTitle}>{title}</div>
+      <div style={{ width: 36 }} />
+    </div>
+  );
+}
+
+function SettingsRow({ label, sublabel, onClick, destructive }: {
+  label: string;
+  sublabel?: string;
+  onClick: () => void;
+  destructive?: boolean;
+}) {
+  return (
+    <button onClick={onClick} style={S.settingsRow}>
+      <div style={S.settingsRowTextCol}>
+        <div style={{ ...S.settingsRowLabel, color: destructive ? '#ff6b6b' : '#FFFFFF' }}>{label}</div>
+        {sublabel && <div style={S.settingsRowSublabel}>{sublabel}</div>}
+      </div>
+      <div style={S.settingsRowChevron}>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#666" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <polyline points="9 18 15 12 9 6" />
+        </svg>
+      </div>
+    </button>
+  );
+}
+
+// ---------- Add Email Modal ----------
+// Modal that takes an email address and triggers a server send of the
+// 6-digit verification code. On success it closes and opens the verify
+// modal. Centered modal sheet, IG-style.
+function AddEmailModal({ handle, deviceId, onClose, onCodeSent }: {
+  handle: string;
+  deviceId: string;
+  onClose: () => void;
+  onCodeSent: (email: string) => void;
+}) {
+  const [email, setEmail] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const submit = async () => {
+    const trimmed = email.trim();
+    if (!trimmed || busy) return;
+    setBusy(true);
+    setErr(null);
+    const result = await apiAddEmail({ handle, deviceId, email: trimmed });
+    setBusy(false);
+    if (result.ok) {
+      onCodeSent(trimmed);
+    } else {
+      setErr(result.reason || 'Could not send verification code');
+    }
+  };
+
+  return (
+    <CenteredModal title="Add recovery email" onClose={onClose}>
+      <div style={S.modalBody}>
+        <div style={S.modalText}>
+          Enter your email. We'll send a 6-digit code to confirm.
+        </div>
+        <input
+          type="email"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          placeholder="you@example.com"
+          autoCorrect="off"
+          autoCapitalize="off"
+          spellCheck={false}
+          style={S.modalInput}
+          disabled={busy}
+        />
+        {err && <div style={S.modalError}>{err}</div>}
+        <button
+          onClick={submit}
+          disabled={busy || !email.trim()}
+          style={busy || !email.trim() ? S.modalBtnDisabled : S.modalBtnPrimary}
+        >
+          {busy ? 'Sending…' : 'Send code'}
+        </button>
+      </div>
+    </CenteredModal>
+  );
+}
+
+// ---------- Verify Email Modal ----------
+function VerifyEmailModal({ handle, deviceId, email, onClose, onVerified }: {
+  handle: string;
+  deviceId: string;
+  email: string;
+  onClose: () => void;
+  onVerified: () => void;
+}) {
+  const [code, setCode] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const submit = async () => {
+    if (!/^\d{6}$/.test(code.trim()) || busy) return;
+    setBusy(true);
+    setErr(null);
+    const result = await apiVerifyEmail({ handle, deviceId, code: code.trim() });
+    setBusy(false);
+    if (result.ok) {
+      onVerified();
+    } else {
+      setErr(result.reason || 'Invalid code');
+    }
+  };
+
+  return (
+    <CenteredModal title="Verify your email" onClose={onClose}>
+      <div style={S.modalBody}>
+        <div style={S.modalText}>
+          Enter the 6-digit code we sent to <strong>{email}</strong>. Code expires in 15 minutes.
+        </div>
+        <input
+          type="text"
+          inputMode="numeric"
+          value={code}
+          onChange={(e) => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+          placeholder="000000"
+          maxLength={6}
+          style={{ ...S.modalInput, textAlign: 'center', letterSpacing: '0.4em', fontSize: 20 }}
+          disabled={busy}
+        />
+        {err && <div style={S.modalError}>{err}</div>}
+        <button
+          onClick={submit}
+          disabled={busy || code.length !== 6}
+          style={busy || code.length !== 6 ? S.modalBtnDisabled : S.modalBtnPrimary}
+        >
+          {busy ? 'Verifying…' : 'Verify'}
+        </button>
+      </div>
+    </CenteredModal>
+  );
+}
+
+// ---------- Blocked List Modal ----------
+function BlockedListModal({ handle, deviceId, onClose }: {
+  handle: string;
+  deviceId: string;
+  onClose: () => void;
+}) {
+  const [list, setList] = useState<{ handle: string; createdAt: string }[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      const data = await apiBlockedList(handle);
+      if (cancelled) return;
+      setList(data);
+      setLoading(false);
+    })();
+    return () => { cancelled = true; };
+  }, [handle]);
+
+  const unblock = async (target: string) => {
+    const result = await apiUnblock({ blocker: handle, blocked: target, deviceId });
+    if (result.ok) {
+      setList((prev) => prev.filter((b) => b.handle.toLowerCase() !== target.toLowerCase()));
+      showToast(`Unblocked ${target}`, 'success');
+    } else {
+      showToast(result.reason || 'Unblock failed', 'error');
+    }
+  };
+
+  return (
+    <CenteredModal title="Blocked users" onClose={onClose}>
+      <div style={S.modalBody}>
+        {loading ? (
+          <div style={S.modalText}>Loading…</div>
+        ) : list.length === 0 ? (
+          <div style={S.modalText}>You haven't blocked anyone.</div>
+        ) : (
+          list.map((b) => (
+            <div key={b.handle} style={S.blockedRow}>
+              <div style={S.blockedHandle}>{b.handle}</div>
+              <button onClick={() => unblock(b.handle)} style={S.blockedUnblockBtn}>
+                Unblock
+              </button>
+            </div>
+          ))
+        )}
+      </div>
+    </CenteredModal>
+  );
+}
+
+// ---------- Delete Account Modal ----------
+function DeleteAccountModal({ handle, deviceId, onClose, onDeleted }: {
+  handle: string;
+  deviceId: string;
+  onClose: () => void;
+  onDeleted: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [confirmText, setConfirmText] = useState('');
+  const [err, setErr] = useState<string | null>(null);
+  // User must type DELETE before the button activates. Standard
+  // confirmation pattern for destructive actions.
+  const canSubmit = confirmText.trim().toUpperCase() === 'DELETE' && !busy;
+
+  const submit = async () => {
+    if (!canSubmit) return;
+    setBusy(true);
+    setErr(null);
+    const result = await apiDeleteAccount({ handle, deviceId });
+    setBusy(false);
+    if (result.ok) {
+      onDeleted();
+    } else {
+      setErr(result.reason || 'Delete failed');
+    }
+  };
+
+  return (
+    <CenteredModal title="Delete account" onClose={onClose}>
+      <div style={S.modalBody}>
+        <div style={S.modalText}>
+          This permanently deletes your handle <strong>@{handle}</strong>, all your posts,
+          comments, follows, and visits. <strong>This cannot be undone.</strong>
+        </div>
+        <div style={{ ...S.modalText, marginTop: 8 }}>
+          Type <strong>DELETE</strong> below to confirm.
+        </div>
+        <input
+          type="text"
+          value={confirmText}
+          onChange={(e) => setConfirmText(e.target.value)}
+          placeholder="DELETE"
+          style={S.modalInput}
+          disabled={busy}
+        />
+        {err && <div style={S.modalError}>{err}</div>}
+        <button
+          onClick={submit}
+          disabled={!canSubmit}
+          style={canSubmit ? S.modalBtnDanger : S.modalBtnDisabled}
+        >
+          {busy ? 'Deleting…' : 'Permanently delete account'}
+        </button>
+      </div>
+    </CenteredModal>
+  );
+}
+
+// ---------- Centered Modal (shared chrome) ----------
+function CenteredModal({ title, onClose, children }: {
+  title: string;
+  onClose: () => void;
+  children: React.ReactNode;
+}) {
+  return createPortal(
+    <div style={S.modalOverlay}>
+      <div style={S.modalBackdrop} onClick={onClose} />
+      <div style={S.modalPanel}>
+        <div style={S.modalHeader}>
+          <div style={{ width: 32 }} />
+          <div style={S.modalTitle}>{title}</div>
+          <button onClick={onClose} style={S.modalCloseBtn} aria-label="Close">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <line x1="18" y1="6" x2="6" y2="18" />
+              <line x1="6" y1="6" x2="18" y2="18" />
+            </svg>
+          </button>
+        </div>
+        {children}
+      </div>
+    </div>,
+    document.body
+  );
+}
+
+// ---------- Report Modal ----------
+// Opened from a "Report" option on post / comment menus. Lets the user
+// pick a reason and add an optional note. App Store 1.2 compliance.
+function ReportModal({ targetType, targetId, handle, deviceId, onClose, onReported }: {
+  targetType: 'post' | 'comment';
+  targetId: string;
+  handle: string;
+  deviceId: string;
+  onClose: () => void;
+  onReported: () => void;
+}) {
+  const [reason, setReason] = useState<ReportReason | null>(null);
+  const [note, setNote] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const reasons: { value: ReportReason; label: string }[] = [
+    { value: 'spam', label: 'Spam' },
+    { value: 'harassment', label: 'Harassment or bullying' },
+    { value: 'hate', label: 'Hate speech' },
+    { value: 'violence', label: 'Violence or threats' },
+    { value: 'sexual', label: 'Sexual content' },
+    { value: 'illegal', label: 'Illegal activity' },
+    { value: 'off-topic', label: 'Off-topic' },
+    { value: 'other', label: 'Other' },
+  ];
+
+  const submit = async () => {
+    if (!reason || busy) return;
+    setBusy(true);
+    setErr(null);
+    const result = await apiReport({
+      type: targetType,
+      targetId,
+      reason,
+      note: note.trim() || undefined,
+      handle,
+      deviceId,
+    });
+    setBusy(false);
+    if (result.ok) {
+      onReported();
+    } else {
+      setErr(result.reason || 'Report failed');
+    }
+  };
+
+  return (
+    <CenteredModal title={`Report ${targetType}`} onClose={onClose}>
+      <div style={S.modalBody}>
+        <div style={S.modalText}>Why are you reporting this {targetType}?</div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 8 }}>
+          {reasons.map((r) => (
+            <button
+              key={r.value}
+              onClick={() => setReason(r.value)}
+              style={reason === r.value ? S.reasonBtnActive : S.reasonBtn}
+            >
+              {r.label}
+            </button>
+          ))}
+        </div>
+        <textarea
+          value={note}
+          onChange={(e) => setNote(e.target.value.slice(0, 500))}
+          placeholder="Add a note (optional)"
+          rows={3}
+          style={{ ...S.modalInput, resize: 'none' as const, marginTop: 10 }}
+          disabled={busy}
+        />
+        {err && <div style={S.modalError}>{err}</div>}
+        <button
+          onClick={submit}
+          disabled={!reason || busy}
+          style={!reason || busy ? S.modalBtnDisabled : S.modalBtnPrimary}
+        >
+          {busy ? 'Submitting…' : 'Submit report'}
+        </button>
+      </div>
+    </CenteredModal>
+  );
+}
+
+
 // ---------- DreadFeed Claim Screen ----------
 // IG-style "Create your account" screen that lives in the Profile sub-tab
 // when the user has no handle claimed. Previously this slot just told the
@@ -3069,7 +3713,7 @@ function DreadFeedClaimScreen({ deviceId, onClaimed }: {
 }
 
 
-function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, onBack, onSelectHandle, onSelectPost, onHandleClaimed }: {
+function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, onBack, onSelectHandle, onSelectPost, onHandleClaimed, onSelectSettings }: {
   handle: string | null;
   deviceId: string | null;
   sites: SinisterSite[];
@@ -3083,6 +3727,9 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
   // into its top-level `handle` state so subsequent likes/comments/
   // follows immediately work without a refresh.
   onHandleClaimed: (h: string) => void;
+  // Opens the Settings screen, plumbed down to the embedded
+  // UserProfileView's gear icon.
+  onSelectSettings: () => void;
 }) {
   // Sub-tab inside eXposure. The static black bottom bar switches
   // between four sub-screens: 'feed' (the post feed, eXposure home),
@@ -3357,6 +4004,7 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
             onSelectSite={onSelectSite}
             onSelectBadges={(h) => { /* tab-bound; ignore deep link */ void h; }}
             onSelectPost={onSelectPost}
+            onSelectSettings={onSelectSettings}
             onBack={() => setSubTab('feed')}
             embedded
           />
@@ -4401,7 +5049,7 @@ function ExposureBrandHeader() {
 //   - GET /badges/:handle for visit count
 //   - GET /posts/handle/:handle for the grid (new server endpoint —
 //     replaces the old "fetch full feed and filter client-side" trick)
-function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSelectSite, onSelectBadges, onSelectPost, onSelectExposureTab, onBack, embedded }: {
+function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSelectSite, onSelectBadges, onSelectPost, onSelectExposureTab, onSelectSettings, onBack, embedded }: {
   profileHandle: string;
   currentHandle: string | null;
   deviceId: string | null;
@@ -4413,6 +5061,10 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
   // route (e.g. tapped @handle from a feed card). Embedded inside the
   // DreadFeed profile tab, the parent SocialView handles tab nav itself.
   onSelectExposureTab?: (tab: 'feed' | 'search' | 'post' | 'profile') => void;
+  // Optional — opens the Settings screen from a gear icon shown only on
+  // the current user's own profile. Plumbed through SocialView when
+  // embedded; not used on standalone profile views.
+  onSelectSettings?: () => void;
   onBack: () => void;
   embedded?: boolean;
 }) {
@@ -4498,6 +5150,25 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
       {/* Brand header only when standalone — when embedded inside the
           eXposure tab, SocialView already renders it above. */}
       {!embedded && <ExposureBrandHeader />}
+
+      {/* Settings gear — only shown on YOUR OWN profile and only when
+          this view is embedded in the DreadFeed Profile tab (settings
+          isn't reachable from a standalone profile view because that
+          flow is for viewing others). */}
+      {isMe && embedded && onSelectSettings && (
+        <div style={S.profileSettingsBar}>
+          <button
+            onClick={onSelectSettings}
+            style={S.profileSettingsBtn}
+            aria-label="Settings"
+          >
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="12" cy="12" r="3" />
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
+            </svg>
+          </button>
+        </div>
+      )}
 
       {/* ---- IG-style profile row: big avatar + stats ---- */}
       <div style={S.profileTopRow}>
@@ -9591,6 +10262,286 @@ const S: Record<string, React.CSSProperties> = {
     textAlign: 'center' as const,
     marginTop: 16,
     letterSpacing: '0.03em',
+  },
+  // ---- Gear icon bar above profile (own profile only) ----
+  // Sits as a small right-aligned strip above the profileTopRow when
+  // viewing your own profile, so the settings entry is obvious and
+  // reachable without sacrificing the IG-style stats layout below.
+  profileSettingsBar: {
+    display: 'flex',
+    justifyContent: 'flex-end',
+    padding: '8px 12px 0 12px',
+    backgroundColor: 'rgba(10,10,10,0.5)',
+  },
+  profileSettingsBtn: {
+    width: 40,
+    height: 40,
+    backgroundColor: 'transparent',
+    border: 'none',
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 0,
+  },
+  // ---- Settings screen ----
+  settingsWrap: {
+    minHeight: '100vh',
+    backgroundColor: '#000',
+    paddingBottom: 40,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  settingsHeaderBar: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: 'calc(env(safe-area-inset-top, 44px) + 12px) 14px 12px 14px' as any,
+    borderBottom: '1px solid #1a1a1a',
+    backgroundColor: '#000',
+    position: 'sticky' as const,
+    top: 0,
+    zIndex: 5,
+  },
+  settingsBackBtn: {
+    width: 36,
+    height: 36,
+    backgroundColor: 'transparent',
+    border: 'none',
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 0,
+  },
+  settingsHeaderTitle: {
+    color: '#FFFFFF',
+    fontSize: 17,
+    fontWeight: 600,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  settingsSectionLabel: {
+    color: '#666',
+    fontSize: 12,
+    letterSpacing: '0.1em',
+    textTransform: 'uppercase' as const,
+    padding: '20px 16px 8px 16px',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  settingsRow: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    width: '100%',
+    padding: '14px 16px',
+    backgroundColor: 'transparent',
+    border: 'none',
+    borderTop: '1px solid #1a1a1a',
+    borderBottom: '1px solid #1a1a1a',
+    cursor: 'pointer',
+    textAlign: 'left' as const,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  settingsRowTextCol: {
+    display: 'flex',
+    flexDirection: 'column' as const,
+    gap: 2,
+    flex: 1,
+    minWidth: 0,
+  },
+  settingsRowLabel: {
+    color: '#FFFFFF',
+    fontSize: 15,
+    fontWeight: 500,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  settingsRowSublabel: {
+    color: '#888',
+    fontSize: 12,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  settingsRowChevron: {
+    marginLeft: 12,
+    display: 'flex',
+    alignItems: 'center',
+  },
+  settingsEmpty: {
+    padding: 40,
+    textAlign: 'center' as const,
+    color: '#888',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  settingsFooter: {
+    padding: '32px 16px 16px',
+    textAlign: 'center' as const,
+    color: '#444',
+    fontSize: 11,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  // ---- Centered Modal (shared by add-email, verify, blocked, delete, report) ----
+  modalOverlay: {
+    position: 'fixed' as const,
+    top: 0, left: 0, right: 0, bottom: 0,
+    zIndex: 250,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 16,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  modalBackdrop: {
+    position: 'absolute' as const,
+    top: 0, left: 0, right: 0, bottom: 0,
+    backgroundColor: 'rgba(0,0,0,0.6)',
+  },
+  modalPanel: {
+    position: 'relative' as const,
+    width: '100%',
+    maxWidth: 400,
+    backgroundColor: '#0c0c0c',
+    border: '1px solid #2a2a2a',
+    borderRadius: 14,
+    overflow: 'hidden' as const,
+    boxShadow: '0 20px 50px rgba(0,0,0,0.6)',
+  },
+  modalHeader: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: '10px 12px',
+    borderBottom: '1px solid #1a1a1a',
+  },
+  modalTitle: {
+    color: '#FFFFFF',
+    fontSize: 15,
+    fontWeight: 600,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  modalCloseBtn: {
+    width: 32,
+    height: 32,
+    backgroundColor: 'transparent',
+    border: 'none',
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 0,
+  },
+  modalBody: {
+    padding: '14px 16px 16px 16px',
+    display: 'flex',
+    flexDirection: 'column' as const,
+    gap: 12,
+  },
+  modalText: {
+    color: '#F0EBE0',
+    fontSize: 14,
+    lineHeight: 1.4,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  modalInput: {
+    width: '100%',
+    backgroundColor: '#0f0f0f',
+    color: '#FFFFFF',
+    border: '1px solid #333',
+    borderRadius: 8,
+    padding: '12px 14px',
+    fontSize: 15,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    outline: 'none',
+    boxSizing: 'border-box' as const,
+  } as any,
+  modalBtnPrimary: {
+    width: '100%',
+    backgroundColor: '#FFFFFF',
+    color: '#000',
+    border: 'none',
+    borderRadius: 8,
+    padding: '12px',
+    fontSize: 14,
+    fontWeight: 700,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+  },
+  modalBtnDisabled: {
+    width: '100%',
+    backgroundColor: '#1a1a1a',
+    color: '#666',
+    border: 'none',
+    borderRadius: 8,
+    padding: '12px',
+    fontSize: 14,
+    fontWeight: 700,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'default',
+  },
+  modalBtnDanger: {
+    width: '100%',
+    backgroundColor: '#a02828',
+    color: '#FFFFFF',
+    border: 'none',
+    borderRadius: 8,
+    padding: '12px',
+    fontSize: 14,
+    fontWeight: 700,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+  },
+  modalError: {
+    color: '#ff6b6b',
+    fontSize: 13,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  // ---- Blocked-list row inside the modal ----
+  blockedRow: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 10,
+    padding: '8px 0',
+    borderBottom: '1px solid #1a1a1a',
+  },
+  blockedHandle: {
+    color: '#FFFFFF',
+    fontSize: 14,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  blockedUnblockBtn: {
+    backgroundColor: 'transparent',
+    color: '#FFFFFF',
+    border: '1px solid #333',
+    borderRadius: 6,
+    padding: '6px 12px',
+    fontSize: 13,
+    fontWeight: 600,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+  },
+  // ---- Report-modal reason buttons ----
+  reasonBtn: {
+    width: '100%',
+    textAlign: 'left' as const,
+    backgroundColor: '#0f0f0f',
+    color: '#F0EBE0',
+    border: '1px solid #2a2a2a',
+    borderRadius: 8,
+    padding: '10px 12px',
+    fontSize: 14,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+  },
+  reasonBtnActive: {
+    width: '100%',
+    textAlign: 'left' as const,
+    backgroundColor: '#1a1a1a',
+    color: '#FFFFFF',
+    border: '1px solid #FFFFFF',
+    borderRadius: 8,
+    padding: '10px 12px',
+    fontSize: 14,
+    fontWeight: 600,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
   },
   // Row inside the followers / following bottom sheet. Avatar on left,
   // handle column on right, tap navigates / closes the sheet.
