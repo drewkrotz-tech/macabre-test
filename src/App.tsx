@@ -5393,6 +5393,539 @@ function ExposureBottomBar({ active, onSelect }: {
   );
 }
 
+// ---------- ExposurePostEditor ----------
+// Photo editing screen that sits between 'pick' and 'caption' in the
+// IG-style composer. Lets the user:
+//   - Toggle a filmstrip border overlay (on by default)
+//   - Drag 12 horror SVG stickers onto the photo
+//   - Add a single freeform text caption (Jolly Lodger) draggable to position
+//
+// When the user taps "Next", we bake every layer into a flat JPEG via
+// canvas and hand the resulting File back to the parent. The server-side
+// pipeline (Sharp resize + EXIF strip + R2 upload) doesn't change.
+
+// ---- Sticker library ----
+// 12 horror stickers as inline SVG path strings. Drawing via
+// <svg><path d="..."/></svg> at runtime, baked to canvas at save time
+// via a Path2D pass for each placed sticker.
+//
+// Each sticker gets a viewBox 100x100, a single fill color (defaults
+// red #DC2626 with some opacity variation), and an OPTIONAL stroke
+// for outlines on lighter shapes. Drawing the SVG to canvas uses an
+// <img> + data: URL pattern that works cleanly on iOS Safari.
+type HorrorSticker = {
+  id: string;
+  name: string;
+  // Full SVG markup, sized 100x100. Rendered as an Image source for canvas.
+  svg: string;
+};
+
+const HORROR_STICKERS: HorrorSticker[] = [
+  {
+    id: 'skull',
+    name: 'Skull',
+    svg: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><path fill="#E5E5E5" d="M50 8C28 8 14 24 14 44c0 12 6 22 14 28v10c0 3 3 6 6 6h6v-8h4v8h12v-8h4v8h6c3 0 6-3 6-6V72c8-6 14-16 14-28C86 24 72 8 50 8z"/><circle cx="36" cy="44" r="8" fill="#1a1a1a"/><circle cx="64" cy="44" r="8" fill="#1a1a1a"/><path fill="#1a1a1a" d="M44 62l6-10 6 10-3 6h-6z"/><rect x="38" y="74" width="3" height="8" fill="#1a1a1a"/><rect x="48.5" y="74" width="3" height="8" fill="#1a1a1a"/><rect x="59" y="74" width="3" height="8" fill="#1a1a1a"/></svg>`,
+  },
+  {
+    id: 'ghost',
+    name: 'Ghost',
+    svg: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><path fill="#F5F5F5" d="M50 6C32 6 18 20 18 38v48l10-8 10 8 10-8 10 8 10-8 10 8 4-2V38C82 20 68 6 50 6z"/><circle cx="38" cy="36" r="6" fill="#1a1a1a"/><circle cx="62" cy="36" r="6" fill="#1a1a1a"/><ellipse cx="50" cy="56" rx="6" ry="8" fill="#1a1a1a"/></svg>`,
+  },
+  {
+    id: 'pumpkin',
+    name: 'Jack-o-lantern',
+    svg: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><path fill="#3a2a1a" d="M48 14h4v10h-4z"/><path fill="#2d5016" d="M52 16l8-6 2 4-6 6z"/><ellipse cx="50" cy="56" rx="38" ry="32" fill="#E07A1F"/><ellipse cx="22" cy="56" rx="14" ry="30" fill="#C5651A"/><ellipse cx="78" cy="56" rx="14" ry="30" fill="#C5651A"/><path fill="#1a0a00" d="M28 46l12 10-12 4z"/><path fill="#1a0a00" d="M72 46L60 56l12 4z"/><path fill="#1a0a00" d="M50 60l-6 10h12z"/><path fill="#1a0a00" d="M30 74q20-10 40 0v6q-20-6-40 0z"/><path fill="#1a0a00" d="M38 76l4 6M50 76v8M58 76l-4 6"/></svg>`,
+  },
+  {
+    id: 'bat',
+    name: 'Bat',
+    svg: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><path fill="#1a1a1a" d="M50 34c-4-4-8-6-14-6l-4 8q-12-8-26-2 8 8 14 18-6 0-12 6 14 4 22 14l8-10 4 8h16l4-8 8 10c8-10 22-14 22-14-6-6-12-6-12-6 6-10 14-18 14-18-14-6-26 2-26 2l-4-8c-6 0-10 2-14 6z"/><circle cx="44" cy="42" r="2" fill="#DC2626"/><circle cx="56" cy="42" r="2" fill="#DC2626"/></svg>`,
+  },
+  {
+    id: 'candle',
+    name: 'Candle',
+    svg: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><path fill="#FFC83A" d="M50 8c-4 6-8 10-8 16 0 5 4 8 8 8s8-3 8-8c0-6-4-10-8-16z"/><path fill="#FFE08A" d="M50 14c-2 4-4 6-4 10 0 3 2 4 4 4s4-1 4-4c0-4-2-6-4-10z"/><rect x="38" y="34" width="24" height="48" fill="#F0EBE0"/><rect x="38" y="34" width="24" height="3" fill="#D5D0C0"/><path fill="#F0EBE0" d="M36 78h28v4l-4 6H40l-4-6z"/><path fill="#D5D0C0" d="M40 38l-2 14 2 2 2-14z" opacity="0.6"/></svg>`,
+  },
+  {
+    id: 'handprint',
+    name: 'Bloody handprint',
+    svg: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><path fill="#8B0000" d="M30 50q0-8 8-8t8 8v-30q0-6 6-6t6 6v32q0-8 8-8t8 8v8q0-6 6-6t6 6v18q0 16-16 26l-26-2q-14-2-16-14l-6-22q-2-6 4-8t8 4l6 8z"/><circle cx="42" cy="22" r="2" fill="#8B0000" opacity="0.7"/><circle cx="50" cy="14" r="2" fill="#8B0000" opacity="0.5"/><circle cx="62" cy="20" r="2" fill="#8B0000" opacity="0.6"/></svg>`,
+  },
+  {
+    id: 'pentagram',
+    name: 'Pentagram',
+    svg: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle cx="50" cy="50" r="42" fill="none" stroke="#DC2626" stroke-width="3"/><path d="M50 10 L62 46 L98 46 L68 68 L80 100 L50 78 L20 100 L32 68 L2 46 L38 46 Z" transform="scale(0.7) translate(22 6)" fill="none" stroke="#DC2626" stroke-width="3" stroke-linejoin="round"/></svg>`,
+  },
+  {
+    id: 'tombstone',
+    name: 'RIP tombstone',
+    svg: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><path fill="#6B6B6B" d="M22 92V42q0-26 28-26t28 26v50z"/><path fill="#4B4B4B" d="M22 92V88h56v4z"/><text x="50" y="56" text-anchor="middle" font-family="serif" font-weight="700" font-size="20" fill="#1a1a1a">R.I.P</text><path fill="#1a1a1a" d="M44 64h12v2H44z"/><path fill="#1a1a1a" d="M40 70h20v2H40z"/></svg>`,
+  },
+  {
+    id: 'eyeball',
+    name: 'Eyeball',
+    svg: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle cx="50" cy="50" r="40" fill="#F5F5F5"/><circle cx="50" cy="50" r="40" fill="none" stroke="#DC2626" stroke-width="2"/><circle cx="50" cy="50" r="22" fill="#8B0000"/><circle cx="50" cy="50" r="12" fill="#1a1a1a"/><circle cx="46" cy="46" r="4" fill="#F5F5F5"/><path d="M30 30 Q20 50 30 70 M70 30 Q80 50 70 70" stroke="#DC2626" stroke-width="2" fill="none" opacity="0.5"/></svg>`,
+  },
+  {
+    id: 'raven',
+    name: 'Raven',
+    svg: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><path fill="#1a1a1a" d="M30 56q-8-4-8-14t10-14q4-2 10-2t10 2q4-4 12-4t14 4q8 4 8 12-2 8-8 12 6 4 6 12-2 10-12 14l-22 4q-14 0-18-10-2-8 0-14z"/><path fill="#FFC83A" d="M76 50l10-2-8 6z"/><circle cx="68" cy="46" r="2" fill="#DC2626"/></svg>`,
+  },
+  {
+    id: 'claws',
+    name: 'Claw marks',
+    svg: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><path fill="#8B0000" d="M18 18q4-4 8 0l30 70q2 4-4 4t-8-4z"/><path fill="#8B0000" d="M36 14q4-4 8 0l28 76q2 4-4 4t-8-4z"/><path fill="#8B0000" d="M56 16q4-4 8 0l24 72q2 4-4 4t-8-4z"/></svg>`,
+  },
+  {
+    id: 'spider',
+    name: 'Spider',
+    svg: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><path stroke="#1a1a1a" stroke-width="3" fill="none" stroke-linecap="round" d="M50 50L20 30M50 50L20 50M50 50L20 70M50 50L30 90M50 50L80 30M50 50L80 50M50 50L80 70M50 50L70 90"/><ellipse cx="50" cy="54" rx="16" ry="20" fill="#1a1a1a"/><circle cx="50" cy="42" r="10" fill="#1a1a1a"/><circle cx="46" cy="40" r="2" fill="#DC2626"/><circle cx="54" cy="40" r="2" fill="#DC2626"/></svg>`,
+  },
+];
+
+// Layers placed on the photo. Position is normalized (0-1) so layers
+// rescale with the preview vs the final baked canvas. Scale is a multiplier
+// of base size (stickers: 80px on preview). Rotation in degrees.
+type StickerLayer = {
+  kind: 'sticker';
+  id: string;          // local instance id
+  stickerId: string;   // index into HORROR_STICKERS
+  x: number;           // 0..1 normalized center
+  y: number;           // 0..1 normalized center
+  scale: number;       // 1.0 = base
+  rotation: number;    // degrees
+};
+
+type TextLayer = {
+  kind: 'text';
+  id: string;
+  text: string;
+  x: number;
+  y: number;
+  scale: number;       // font scaling
+  rotation: number;
+};
+
+type EditorLayer = StickerLayer | TextLayer;
+
+function makeLayerId() {
+  return 'l_' + Math.random().toString(36).slice(2, 10);
+}
+
+// Bake the photo + filmstrip + layers into a JPEG File. canvasSize
+// determines output resolution — we target 1200px short edge to match
+// the server's Sharp resize so we don't waste bandwidth.
+async function bakePostImage(opts: {
+  sourceFile: File;
+  filmstripOn: boolean;
+  layers: EditorLayer[];
+  stickers: HorrorSticker[];
+}): Promise<File> {
+  const { sourceFile, filmstripOn, layers, stickers } = opts;
+
+  // Load source image
+  const sourceImg = await new Promise<HTMLImageElement>((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = (e) => reject(new Error('source image load failed'));
+    img.src = URL.createObjectURL(sourceFile);
+  });
+
+  // Compute output dimensions — keep aspect ratio, longest side 1200.
+  const maxDim = 1200;
+  let outW = sourceImg.naturalWidth;
+  let outH = sourceImg.naturalHeight;
+  if (outW > outH && outW > maxDim) {
+    outH = Math.round(outH * (maxDim / outW));
+    outW = maxDim;
+  } else if (outH > maxDim) {
+    outW = Math.round(outW * (maxDim / outH));
+    outH = maxDim;
+  }
+
+  const canvas = document.createElement('canvas');
+  canvas.width = outW;
+  canvas.height = outH;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('canvas 2d unavailable');
+
+  // 1) Draw source photo
+  ctx.drawImage(sourceImg, 0, 0, outW, outH);
+
+  // 2) Filmstrip border overlay
+  if (filmstripOn) {
+    const barH = Math.round(outH * 0.06);
+    // Top + bottom black bars
+    ctx.fillStyle = '#0a0a0a';
+    ctx.fillRect(0, 0, outW, barH);
+    ctx.fillRect(0, outH - barH, outW, barH);
+
+    // Sprocket holes — rounded rects evenly spaced
+    const holeW = Math.round(barH * 0.5);
+    const holeH = Math.round(barH * 0.55);
+    const holeY1 = Math.round((barH - holeH) / 2);
+    const holeY2 = outH - barH + holeY1;
+    const gap = Math.round(holeW * 1.6);
+    const totalStep = holeW + gap;
+    const startX = Math.round((outW % totalStep) / 2);
+
+    ctx.fillStyle = '#F5EFE0';
+    for (let x = startX; x + holeW < outW; x += totalStep) {
+      // Rounded-rect via path
+      const r = Math.min(holeW, holeH) * 0.25;
+      const drawHole = (yPos: number) => {
+        ctx.beginPath();
+        ctx.moveTo(x + r, yPos);
+        ctx.lineTo(x + holeW - r, yPos);
+        ctx.arcTo(x + holeW, yPos, x + holeW, yPos + r, r);
+        ctx.lineTo(x + holeW, yPos + holeH - r);
+        ctx.arcTo(x + holeW, yPos + holeH, x + holeW - r, yPos + holeH, r);
+        ctx.lineTo(x + r, yPos + holeH);
+        ctx.arcTo(x, yPos + holeH, x, yPos + holeH - r, r);
+        ctx.lineTo(x, yPos + r);
+        ctx.arcTo(x, yPos, x + r, yPos, r);
+        ctx.closePath();
+        ctx.fill();
+      };
+      drawHole(holeY1);
+      drawHole(holeY2);
+    }
+  }
+
+  // 3) Draw layers (stickers + text) in order
+  // Sticker base size = 16% of short edge
+  const stickerBase = Math.round(Math.min(outW, outH) * 0.16);
+
+  // Pre-load all sticker SVGs as Image objects
+  const stickerImgs = new Map<string, HTMLImageElement>();
+  await Promise.all(
+    Array.from(new Set(
+      layers.filter((l): l is StickerLayer => l.kind === 'sticker').map((l) => l.stickerId)
+    )).map(async (sid) => {
+      const def = stickers.find((s) => s.id === sid);
+      if (!def) return;
+      const blob = new Blob([def.svg], { type: 'image/svg+xml' });
+      const url = URL.createObjectURL(blob);
+      const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+        const im = new Image();
+        im.onload = () => resolve(im);
+        im.onerror = () => reject(new Error('sticker svg load failed: ' + sid));
+        im.src = url;
+      });
+      stickerImgs.set(sid, img);
+    })
+  );
+
+  for (const layer of layers) {
+    ctx.save();
+    const cx = layer.x * outW;
+    const cy = layer.y * outH;
+    ctx.translate(cx, cy);
+    ctx.rotate((layer.rotation * Math.PI) / 180);
+
+    if (layer.kind === 'sticker') {
+      const img = stickerImgs.get(layer.stickerId);
+      if (img) {
+        const size = stickerBase * layer.scale;
+        ctx.drawImage(img, -size / 2, -size / 2, size, size);
+      }
+    } else if (layer.kind === 'text') {
+      const fontSize = Math.round(stickerBase * 0.45 * layer.scale);
+      ctx.font = `700 ${fontSize}px "Jolly Lodger", serif`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      // Red shadow drop for visibility against any background
+      ctx.shadowColor = '#DC2626';
+      ctx.shadowBlur = Math.round(fontSize * 0.15);
+      ctx.shadowOffsetX = Math.round(fontSize * 0.06);
+      ctx.shadowOffsetY = Math.round(fontSize * 0.06);
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillText(layer.text, 0, 0);
+    }
+
+    ctx.restore();
+  }
+
+  // 4) Export to JPEG File
+  const blob = await new Promise<Blob | null>((resolve) => {
+    canvas.toBlob((b) => resolve(b), 'image/jpeg', 0.92);
+  });
+  if (!blob) throw new Error('canvas toBlob failed');
+
+  // Reuse the original filename root if available, force .jpg extension.
+  const origName = sourceFile.name || 'post';
+  const baseName = origName.replace(/\.[^.]+$/, '');
+  return new File([blob], `${baseName}.jpg`, { type: 'image/jpeg' });
+}
+
+// ---- The editor screen ----
+function ExposurePostEditor({ photoFile, onBack, onNext }: {
+  photoFile: File;
+  onBack: () => void;
+  onNext: (editedFile: File) => void;
+}) {
+  const [filmstripOn, setFilmstripOn] = useState(true);
+  const [layers, setLayers] = useState<EditorLayer[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [tray, setTray] = useState<'stickers' | 'text' | null>(null);
+  const [textInput, setTextInput] = useState('');
+  const [baking, setBaking] = useState(false);
+
+  // Preview area ref for hit-testing and drag math
+  const previewRef = useRef<HTMLDivElement | null>(null);
+  const previewUrl = useMemo(() => URL.createObjectURL(photoFile), [photoFile]);
+  useEffect(() => () => URL.revokeObjectURL(previewUrl), [previewUrl]);
+
+  const addSticker = (stickerId: string) => {
+    setLayers((prev) => [
+      ...prev,
+      { kind: 'sticker', id: makeLayerId(), stickerId, x: 0.5, y: 0.5, scale: 1, rotation: 0 },
+    ]);
+    setTray(null);
+  };
+
+  const addText = () => {
+    const trimmed = textInput.trim();
+    if (!trimmed) return;
+    setLayers((prev) => [
+      ...prev,
+      { kind: 'text', id: makeLayerId(), text: trimmed, x: 0.5, y: 0.5, scale: 1, rotation: 0 },
+    ]);
+    setTextInput('');
+    setTray(null);
+  };
+
+  const deleteSelected = () => {
+    if (!selectedId) return;
+    setLayers((prev) => prev.filter((l) => l.id !== selectedId));
+    setSelectedId(null);
+  };
+
+  // Drag handler — pointer events normalize touch/mouse on iOS.
+  const onLayerPointerDown = (e: React.PointerEvent, layerId: string) => {
+    e.stopPropagation();
+    setSelectedId(layerId);
+    const target = e.currentTarget as HTMLElement;
+    target.setPointerCapture(e.pointerId);
+    const rect = previewRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const move = (ev: PointerEvent) => {
+      const nx = (ev.clientX - rect.left) / rect.width;
+      const ny = (ev.clientY - rect.top) / rect.height;
+      setLayers((prev) => prev.map((l) =>
+        l.id === layerId ? { ...l, x: Math.max(0, Math.min(1, nx)), y: Math.max(0, Math.min(1, ny)) } : l
+      ));
+    };
+    const up = () => {
+      target.removeEventListener('pointermove', move as any);
+      target.removeEventListener('pointerup', up as any);
+      target.removeEventListener('pointercancel', up as any);
+    };
+    target.addEventListener('pointermove', move as any);
+    target.addEventListener('pointerup', up as any);
+    target.addEventListener('pointercancel', up as any);
+  };
+
+  const adjustScale = (delta: number) => {
+    if (!selectedId) return;
+    setLayers((prev) => prev.map((l) =>
+      l.id === selectedId ? { ...l, scale: Math.max(0.3, Math.min(3, l.scale + delta)) } : l
+    ));
+  };
+  const adjustRotation = (delta: number) => {
+    if (!selectedId) return;
+    setLayers((prev) => prev.map((l) =>
+      l.id === selectedId ? { ...l, rotation: (l.rotation + delta) % 360 } : l
+    ));
+  };
+
+  const onConfirm = async () => {
+    if (baking) return;
+    setBaking(true);
+    try {
+      const baked = await bakePostImage({
+        sourceFile: photoFile,
+        filmstripOn,
+        layers,
+        stickers: HORROR_STICKERS,
+      });
+      onNext(baked);
+    } catch (err) {
+      showToast('Could not save edits — try again', 'error');
+      setBaking(false);
+    }
+  };
+
+  return (
+    <>
+      {/* Header — back / Edit / Next */}
+      <div style={S.igComposerHeader}>
+        <button onClick={onBack} style={S.igComposerHeaderBtn} aria-label="Back" disabled={baking}>‹</button>
+        <div style={S.igComposerHeaderTitle}>Edit</div>
+        <button
+          onClick={onConfirm}
+          disabled={baking}
+          style={{ ...S.igComposerHeaderNext, color: baking ? '#1B4F7A' : '#3B9DFF', cursor: baking ? 'default' : 'pointer' }}
+        >
+          {baking ? '...' : 'Next'}
+        </button>
+      </div>
+
+      {/* Preview area with layers overlaid */}
+      <div
+        ref={previewRef}
+        style={S.editorPreviewWrap}
+        onPointerDown={() => setSelectedId(null)}
+      >
+        <img src={previewUrl} alt="" style={S.editorPreviewImg} />
+
+        {/* Filmstrip visual overlay (purely cosmetic — actual bars are drawn at bake time) */}
+        {filmstripOn && (
+          <>
+            <div style={S.editorFilmstripBarTop}>
+              {Array.from({ length: 14 }).map((_, i) => (
+                <div key={i} style={S.editorFilmstripHole} />
+              ))}
+            </div>
+            <div style={S.editorFilmstripBarBottom}>
+              {Array.from({ length: 14 }).map((_, i) => (
+                <div key={i} style={S.editorFilmstripHole} />
+              ))}
+            </div>
+          </>
+        )}
+
+        {/* Layers */}
+        {layers.map((layer) => {
+          const isSel = layer.id === selectedId;
+          const transform = `translate(-50%, -50%) rotate(${layer.rotation}deg) scale(${layer.scale})`;
+          const wrapStyle: React.CSSProperties = {
+            position: 'absolute',
+            left: `${layer.x * 100}%`,
+            top: `${layer.y * 100}%`,
+            transform,
+            transformOrigin: 'center',
+            touchAction: 'none',
+            cursor: 'grab',
+            outline: isSel ? '2px dashed #3B9DFF' : 'none',
+            outlineOffset: 4,
+            padding: 4,
+          };
+          if (layer.kind === 'sticker') {
+            const def = HORROR_STICKERS.find((s) => s.id === layer.stickerId);
+            if (!def) return null;
+            return (
+              <div
+                key={layer.id}
+                style={wrapStyle}
+                onPointerDown={(e) => onLayerPointerDown(e, layer.id)}
+                dangerouslySetInnerHTML={{ __html: def.svg.replace('<svg ', '<svg width="80" height="80" ') }}
+              />
+            );
+          }
+          return (
+            <div
+              key={layer.id}
+              style={{
+                ...wrapStyle,
+                fontFamily: 'Jolly Lodger, serif',
+                fontWeight: 700,
+                fontSize: 36,
+                color: '#FFFFFF',
+                textShadow: '2px 2px 0 #DC2626, 0 0 6px rgba(220,38,38,0.6)',
+                whiteSpace: 'nowrap',
+                userSelect: 'none',
+              }}
+              onPointerDown={(e) => onLayerPointerDown(e, layer.id)}
+            >
+              {layer.text}
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Layer controls — appear when a layer is selected */}
+      {selectedId && (
+        <div style={S.editorLayerControls}>
+          <button style={S.editorLayerBtn} onClick={() => adjustScale(-0.15)} aria-label="Shrink">−</button>
+          <button style={S.editorLayerBtn} onClick={() => adjustScale(0.15)} aria-label="Grow">+</button>
+          <button style={S.editorLayerBtn} onClick={() => adjustRotation(-15)} aria-label="Rotate left">↺</button>
+          <button style={S.editorLayerBtn} onClick={() => adjustRotation(15)} aria-label="Rotate right">↻</button>
+          <button style={{ ...S.editorLayerBtn, color: '#FF4D4D' }} onClick={deleteSelected} aria-label="Delete">🗑</button>
+        </div>
+      )}
+
+      {/* Tray panels */}
+      {tray === 'stickers' && (
+        <div style={S.editorTray}>
+          <div style={S.editorTrayHeader}>
+            <span style={S.editorTrayTitle}>Stickers</span>
+            <button onClick={() => setTray(null)} style={S.editorTrayClose}>✕</button>
+          </div>
+          <div style={S.editorStickerGrid}>
+            {HORROR_STICKERS.map((s) => (
+              <button
+                key={s.id}
+                style={S.editorStickerCell}
+                onClick={() => addSticker(s.id)}
+                aria-label={s.name}
+                dangerouslySetInnerHTML={{ __html: s.svg.replace('<svg ', '<svg width="48" height="48" ') }}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+
+      {tray === 'text' && (
+        <div style={S.editorTray}>
+          <div style={S.editorTrayHeader}>
+            <span style={S.editorTrayTitle}>Add text</span>
+            <button onClick={() => setTray(null)} style={S.editorTrayClose}>✕</button>
+          </div>
+          <div style={{ padding: 12, display: 'flex', gap: 8 }}>
+            <input
+              autoFocus
+              value={textInput}
+              onChange={(e) => setTextInput(e.target.value.slice(0, 40))}
+              placeholder="Type text..."
+              style={S.editorTextInput}
+              onKeyDown={(e) => { if (e.key === 'Enter') addText(); }}
+            />
+            <button onClick={addText} style={S.editorTextAddBtn} disabled={!textInput.trim()}>
+              Add
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Bottom toolbar */}
+      <div style={S.editorToolbar}>
+        <button
+          style={{ ...S.editorToolBtn, color: filmstripOn ? '#FF3B5C' : '#888' }}
+          onClick={() => setFilmstripOn((v) => !v)}
+        >
+          <span style={S.editorToolIcon}>▤</span>
+          <span style={S.editorToolLabel}>Frame</span>
+        </button>
+        <button
+          style={{ ...S.editorToolBtn, color: tray === 'stickers' ? '#FF3B5C' : '#FFF' }}
+          onClick={() => setTray((t) => (t === 'stickers' ? null : 'stickers'))}
+        >
+          <span style={S.editorToolIcon}>💀</span>
+          <span style={S.editorToolLabel}>Stickers</span>
+        </button>
+        <button
+          style={{ ...S.editorToolBtn, color: tray === 'text' ? '#FF3B5C' : '#FFF' }}
+          onClick={() => setTray((t) => (t === 'text' ? null : 'text'))}
+        >
+          <span style={S.editorToolIcon}>Aa</span>
+          <span style={S.editorToolLabel}>Text</span>
+        </button>
+      </div>
+    </>
+  );
+}
+
 // Search sub-screen inside eXposure. Text input filters loaded posts by
 // caption / handle. Below the input, a horizontal chip strip lets users
 // filter by category. AND'd — both filters apply. Empty results show a
@@ -5416,16 +5949,23 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
   const [photoPreview, setPhotoPreview] = useState<string | null>(null);
   const [caption, setCaption] = useState('');
   const [submitting, setSubmitting] = useState(false);
-  // Two-stage state: 'pick' while no photo or user is choosing one,
-  // 'caption' once a photo is selected. Tapping Next on stage 1 (only
-  // active when photoFile exists) advances; tapping back on stage 2
-  // returns to stage 1 with the photo cleared.
-  type Stage = 'pick' | 'caption';
+  // Three-stage flow: pick photo → edit (filmstrip/stickers/text) →
+  // caption. The 'edit' stage stores the baked, flattened JPEG so
+  // the original picked file is never sent — only the user's edited
+  // output goes to the server. Back from 'caption' returns to 'edit'
+  // (preserving the bake), back from 'edit' returns to 'pick'.
+  type Stage = 'pick' | 'edit' | 'caption';
   const [stage, setStage] = useState<Stage>('pick');
+  // The file we'll actually upload — the baked version from the editor.
+  // Falls back to the picked file if the editor is somehow skipped.
+  const [editedFile, setEditedFile] = useState<File | null>(null);
+  // Preview URL for the *edited* image — used on the caption screen so
+  // the user sees what they're about to share, not the unedited original.
+  const [editedPreview, setEditedPreview] = useState<string | null>(null);
 
   const captionTrim = caption.trim();
   // Server enforces 1-280 char caption.
-  const canShare = !!photoFile && captionTrim.length >= 1 && captionTrim.length <= 280 && !submitting && !!handle && !!deviceId;
+  const canShare = !!editedFile && captionTrim.length >= 1 && captionTrim.length <= 280 && !submitting && !!handle && !!deviceId;
 
   const onPhotoChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files && e.target.files[0];
@@ -5441,19 +5981,33 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
 
   const onNext = () => {
     if (!photoFile) return;
+    setStage('edit');
+  };
+
+  const onEditorBack = () => {
+    if (submitting) return;
+    setStage('pick');
+  };
+
+  // Editor calls this with the baked JPEG. Save it, build a preview URL,
+  // and advance to caption.
+  const onEditorNext = (baked: File) => {
+    if (editedPreview) URL.revokeObjectURL(editedPreview);
+    setEditedFile(baked);
+    setEditedPreview(URL.createObjectURL(baked));
     setStage('caption');
   };
 
   const onBackFromCaption = () => {
     if (submitting) return;
-    setStage('pick');
+    setStage('edit');
   };
 
   const onShare = async () => {
-    if (!canShare || !photoFile || !handle || !deviceId) return;
+    if (!canShare || !editedFile || !handle || !deviceId) return;
     setSubmitting(true);
     const result = await apiCreatePost({
-      photo: photoFile,
+      photo: editedFile,
       handle,
       deviceId,
       caption: captionTrim,
@@ -5554,6 +6108,14 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
         </>
       )}
 
+      {stage === 'edit' && photoFile && (
+        <ExposurePostEditor
+          photoFile={photoFile}
+          onBack={onEditorBack}
+          onNext={onEditorNext}
+        />
+      )}
+
       {stage === 'caption' && (
         <>
           {/* Top bar — ← | New post | (no right button) */}
@@ -5566,8 +6128,8 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
           {/* Smaller centered preview + caption field below */}
           <div style={S.igCaptionBody}>
             <div style={S.igCaptionPreviewRow}>
-              {photoPreview && (
-                <img src={photoPreview} alt="" style={S.igCaptionPreviewImg} />
+              {editedPreview && (
+                <img src={editedPreview} alt="" style={S.igCaptionPreviewImg} />
               )}
               <textarea
                 value={caption}
@@ -14139,6 +14701,181 @@ const S: Record<string, React.CSSProperties> = {
     fontWeight: 700,
     fontFamily: 'system-ui, -apple-system, sans-serif',
     letterSpacing: 0,
+  },
+
+  // ---- DreadFeed Post Editor (between pick and caption) ----
+  // Filmstrip overlay bars are drawn at the top/bottom of the preview at
+  // 6% of preview height — same proportion the canvas-bake uses. Sprocket
+  // holes are flex children for cheap responsive spacing.
+  editorPreviewWrap: {
+    flex: 1,
+    position: 'relative' as const,
+    backgroundColor: '#000',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    overflow: 'hidden' as const,
+    touchAction: 'none' as const,
+  },
+  editorPreviewImg: {
+    maxWidth: '100%',
+    maxHeight: '100%',
+    objectFit: 'contain' as const,
+    display: 'block',
+    userSelect: 'none' as const,
+    pointerEvents: 'none' as const,
+  },
+  editorFilmstripBarTop: {
+    position: 'absolute' as const,
+    top: 0, left: 0, right: 0,
+    height: '6%',
+    backgroundColor: '#0a0a0a',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-around' as const,
+    pointerEvents: 'none' as const,
+  },
+  editorFilmstripBarBottom: {
+    position: 'absolute' as const,
+    bottom: 0, left: 0, right: 0,
+    height: '6%',
+    backgroundColor: '#0a0a0a',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-around' as const,
+    pointerEvents: 'none' as const,
+  },
+  editorFilmstripHole: {
+    width: 10,
+    height: 14,
+    backgroundColor: '#F5EFE0',
+    borderRadius: 3,
+  },
+  editorLayerControls: {
+    position: 'absolute' as const,
+    bottom: 96,
+    left: 12,
+    right: 12,
+    display: 'flex',
+    justifyContent: 'center',
+    gap: 6,
+    zIndex: 5,
+  },
+  editorLayerBtn: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: 'rgba(0,0,0,0.78)',
+    border: '1px solid rgba(255,255,255,0.18)',
+    color: '#FFFFFF',
+    fontSize: 18,
+    fontWeight: 700,
+    cursor: 'pointer',
+    backdropFilter: 'blur(8px)',
+  },
+  editorToolbar: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-around' as const,
+    padding: '10px 12px 14px',
+    backgroundColor: '#000',
+    borderTop: '1px solid #1a1a1a',
+  },
+  editorToolBtn: {
+    display: 'flex',
+    flexDirection: 'column' as const,
+    alignItems: 'center',
+    gap: 3,
+    padding: '6px 10px',
+    backgroundColor: 'transparent',
+    border: 'none',
+    color: '#FFFFFF',
+    cursor: 'pointer',
+    minWidth: 70,
+  },
+  editorToolIcon: {
+    fontSize: 22,
+    lineHeight: 1,
+  },
+  editorToolLabel: {
+    fontSize: 11,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    letterSpacing: '0.04em',
+    textTransform: 'uppercase' as const,
+  },
+  editorTray: {
+    position: 'absolute' as const,
+    bottom: 64,
+    left: 0,
+    right: 0,
+    backgroundColor: '#0c0c0c',
+    borderTop: '1px solid #1a1a1a',
+    maxHeight: '50%',
+    overflowY: 'auto' as const,
+    zIndex: 6,
+  },
+  editorTrayHeader: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between' as const,
+    padding: '10px 14px',
+    borderBottom: '1px solid #1a1a1a',
+  },
+  editorTrayTitle: {
+    color: '#F0EBE0',
+    fontSize: 13,
+    fontWeight: 700,
+    letterSpacing: '0.12em',
+    textTransform: 'uppercase' as const,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  editorTrayClose: {
+    width: 30,
+    height: 30,
+    border: 'none',
+    backgroundColor: 'transparent',
+    color: '#BBB',
+    fontSize: 16,
+    cursor: 'pointer',
+  },
+  editorStickerGrid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(4, 1fr)',
+    gap: 8,
+    padding: 12,
+  },
+  editorStickerCell: {
+    aspectRatio: '1',
+    backgroundColor: 'rgba(255,255,255,0.04)',
+    border: '1px solid rgba(255,255,255,0.08)',
+    borderRadius: 10,
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 8,
+  },
+  editorTextInput: {
+    flex: 1,
+    padding: '10px 12px',
+    backgroundColor: '#1a1a1a',
+    border: '1px solid #2a2a2a',
+    borderRadius: 8,
+    color: '#F0EBE0',
+    fontSize: 15,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    outline: 'none',
+  },
+  editorTextAddBtn: {
+    padding: '10px 16px',
+    backgroundColor: '#3B5BFF',
+    border: 'none',
+    borderRadius: 8,
+    color: '#FFF',
+    fontSize: 14,
+    fontWeight: 700,
+    cursor: 'pointer',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
   },
   postComposerSubmitDisabled: {
     flex: 1.4,
