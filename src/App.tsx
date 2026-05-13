@@ -241,6 +241,40 @@ async function apiGetAvatar(handle: string): Promise<string | null> {
   } catch { return null; }
 }
 
+// ---- Profile (displayName / bio / link) ----
+type ProfileFields = {
+  handle: string;
+  displayName: string;
+  bio: string;
+  link: string;
+  avatarUrl: string | null;
+};
+
+async function apiGetProfile(handle: string): Promise<ProfileFields | null> {
+  try {
+    const res = await fetch(`${API_BASE}/handles/profile/${encodeURIComponent(handle)}`);
+    if (!res.ok) return null;
+    return await res.json();
+  } catch { return null; }
+}
+
+async function apiUpdateProfile(args: {
+  handle: string;
+  deviceId: string;
+  displayName?: string;
+  bio?: string;
+  link?: string;
+}): Promise<{ ok: boolean; reason?: string; profile?: ProfileFields }> {
+  try {
+    const res = await fetch(`${API_BASE}/handles/profile/update`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    return await res.json();
+  } catch { return { ok: false, reason: 'network error' }; }
+}
+
 // ---- Email-path account creation (verified at claim time) ----
 // Two-step: start sends a 6-digit code to email, finish verifies and
 // atomically creates the handle. The server requires the same deviceId
@@ -1193,6 +1227,32 @@ function playSubDrop() {
 // low-freq weight and stay in the 600-1500Hz pleasant range with quick
 // envelopes. All three share the same getAudioCtx() singleton so they
 // inherit the iOS resume/unlock pattern.
+
+// haptic — fires a short native haptic tap when available. Order:
+//   1) Capacitor Haptics plugin (native iOS — real haptic engine)
+//   2) navigator.vibrate (older Android browsers)
+//   3) silent no-op (modern iOS Safari, desktop)
+// Wrapped in try/catch and runtime-resolved so we don't take a build
+// dependency on @capacitor/haptics — if the plugin isn't installed yet,
+// we silently fall through. Three intensities matching iOS's
+// UIImpactFeedbackGenerator styles.
+function haptic(style: 'light' | 'medium' | 'heavy' = 'light') {
+  try {
+    const cap = (window as any).Capacitor;
+    const Haptics = cap?.Plugins?.Haptics;
+    if (Haptics && typeof Haptics.impact === 'function') {
+      // Native: matches iOS's UIImpactFeedbackGenerator styles exactly.
+      Haptics.impact({ style: style.toUpperCase() });
+      return;
+    }
+  } catch { /* fall through */ }
+  try {
+    if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
+      const ms = style === 'heavy' ? 18 : style === 'medium' ? 12 : 8;
+      navigator.vibrate(ms);
+    }
+  } catch { /* silent */ }
+}
 
 // playLikeBlip — short "tap" for double-tap-style like reactions. A
 // quick sine pulse at 900Hz, ~70ms total. Bright enough to be felt as
@@ -4973,6 +5033,11 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
   const [pullDistance, setPullDistance] = useState(0);
   const [refreshing, setRefreshing] = useState(false);
   const _pullStartY = useRef<number | null>(null);
+  // True once the current drag has crossed PULL_THRESHOLD_PX. Used to
+  // fire the haptic tap exactly once per drag (when crossing the line)
+  // rather than continuously while held past threshold. Resets on touch
+  // start so the next drag fires fresh.
+  const _pullCrossedThreshold = useRef<boolean>(false);
 
   // Refresh = reload from the top. Called by pull-to-refresh on release
   // past threshold. Replaces the entire feed since we're back to the
@@ -5070,6 +5135,7 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
         // top of the page. Anywhere mid-scroll, this is a normal scroll.
         if (window.scrollY > 0 || refreshing) return;
         _pullStartY.current = e.touches[0].clientY;
+        _pullCrossedThreshold.current = false;
       }}
       onTouchMove={(e) => {
         if (_pullStartY.current === null || refreshing) return;
@@ -5083,6 +5149,13 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
         const eased = dy < PULL_THRESHOLD_PX
           ? dy
           : PULL_THRESHOLD_PX + (dy - PULL_THRESHOLD_PX) * 0.5;
+        // Fire a single light haptic tap the moment the user crosses
+        // the trigger line, matching IG's pattern: it confirms "release
+        // now and the feed will refresh" without buzzing continuously.
+        if (!_pullCrossedThreshold.current && eased >= PULL_THRESHOLD_PX) {
+          _pullCrossedThreshold.current = true;
+          haptic('light');
+        }
         setPullDistance(Math.min(eased, PULL_MAX_PX));
       }}
       onTouchEnd={() => {
@@ -6536,19 +6609,25 @@ function ExposureBrandHeader({ unreadCount, onTapBell }: {
 } = {}) {
   return (
     <div style={S.exposureBrandHeader}>
-      {/* Same VHS-glitch effect as the home page "Dread Directory" title —
+      {/* Title is rendered in an absolutely-positioned, full-width row
+          so it always sits at the true horizontal center of the header
+          regardless of the bell button on the right. Bell stays absolute
+          on the right and overlaps the title's transparent right side
+          without shifting the title's visual center.
+          Same VHS-glitch effect as the home page "Dread Directory" —
           red and cyan channel ghosts animate over the white text in
           rare bursts. Class + data-text are both required (the CSS
           pseudo-elements read data-text to render the ghost layers). */}
-      <div
-        style={S.exposureBrandTitle}
-        className="sinister-glitch"
-        data-text="DreadFeed"
-      >
-        DreadFeed
+      <div style={S.exposureBrandTitleRow}>
+        <div
+          style={S.exposureBrandTitle}
+          className="sinister-glitch"
+          data-text="DreadFeed"
+        >
+          DreadFeed
+        </div>
       </div>
-      {/* Bell sits in the top-right corner of the header. Absolute
-          positioning keeps the existing centered title layout intact. */}
+      {/* Bell sits in the top-right corner of the header. */}
       {onTapBell && (
         <button
           onClick={onTapBell}
@@ -6619,6 +6698,13 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
   // time. Fetched on mount and refreshed when the user (if it's their
   // own profile) picks a new avatar from the picker.
   const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
+  // Display name / bio / link — IG-style profile fields. Fetched on
+  // mount alongside the avatar via /handles/profile/:handle. Editable
+  // on own profile via EditProfileModal.
+  const [displayName, setDisplayName] = useState<string>('');
+  const [bio, setBio] = useState<string>('');
+  const [link, setLink] = useState<string>('');
+  const [editProfileOpen, setEditProfileOpen] = useState(false);
   // Follow status: follower count, following count, and whether the
   // current user follows the profile being viewed. Loaded from
   // /follows/status/:target on mount.
@@ -6639,14 +6725,14 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
     let cancelled = false;
     (async () => {
       setLoading(true);
-      // Fetch badge stats + posts + follow status + hidden set + avatar
-      // in parallel.
-      const [badgeData, handlePosts, fStatus, hidden, avatar] = await Promise.all([
+      // Fetch badge stats + posts + follow status + hidden set + profile
+      // (which carries displayName, bio, link, avatarUrl) in parallel.
+      const [badgeData, handlePosts, fStatus, hidden, profile] = await Promise.all([
         apiGetBadges(profileHandle),
         apiFetchPostsByHandle(profileHandle),
         apiFollowStatus({ target: profileHandle, handle: currentHandle }),
         getHiddenSet(currentHandle),
-        apiGetAvatar(profileHandle),
+        apiGetProfile(profileHandle),
       ]);
       if (cancelled) return;
       setStats({
@@ -6657,7 +6743,12 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
       setPosts(handlePosts);
       setFollowStatus(fStatus);
       setIsBlocked(hidden.has(profileHandle.toLowerCase()));
-      setAvatarUrl(avatar);
+      if (profile) {
+        setAvatarUrl(profile.avatarUrl);
+        setDisplayName(profile.displayName || '');
+        setBio(profile.bio || '');
+        setLink(profile.link || '');
+      }
       setLoading(false);
     })();
     return () => { cancelled = true; };
@@ -6750,31 +6841,36 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
         </div>
       )}
 
-      {/* ---- IG-style profile row: big avatar + stats ---- */}
+      {/* ---- IG-style profile row: big avatar + stats ----
+          Avatar is wrapped in profileAvatarWrap (no overflow clipping)
+          so the +badge can poke outside the circle. The actual clipped
+          circle is profileAvatarCircle inside. Badge sits as a sibling
+          of the circle so it's not clipped. */}
       <div style={S.profileTopRow}>
         <div style={S.profileAvatarWrap}>
           {isMe ? (
-            // Own profile: tapping the avatar opens the picker so users
-            // can pick a library icon or upload a photo. Camera-icon
-            // overlay hints that it's editable.
             <button
               onClick={() => setAvatarPickerOpen(true)}
               style={S.profileAvatarEditBtn}
               aria-label="Change avatar"
             >
+              <div style={S.profileAvatarCircle}>
+                <img
+                  src={resolveAvatarUrl(avatarUrl) || exposureIconUrl}
+                  alt=""
+                  style={S.profileAvatarImg}
+                />
+              </div>
+              <span style={S.profileAvatarEditBadge}>＋</span>
+            </button>
+          ) : (
+            <div style={S.profileAvatarCircle}>
               <img
                 src={resolveAvatarUrl(avatarUrl) || exposureIconUrl}
                 alt=""
                 style={S.profileAvatarImg}
               />
-              <span style={S.profileAvatarEditBadge}>＋</span>
-            </button>
-          ) : (
-            <img
-              src={resolveAvatarUrl(avatarUrl) || exposureIconUrl}
-              alt=""
-              style={S.profileAvatarImg}
-            />
+            </div>
           )}
         </div>
         <div style={S.profileStatsCluster}>
@@ -6806,16 +6902,40 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
       </div>
 
       {/* ---- Display name / bio (placeholder until handles get bios) ---- */}
+      {/* ---- Display name / bio / link block ---- */}
       <div style={S.profileBioWrap}>
-        <div style={S.profileDisplayName}>{profileHandle}</div>
-        {/* Future: bio text goes here. Empty for now. */}
+        {/* Display name — falls back to the handle if not set. Always
+            renders so the layout doesn't jump when an empty profile
+            saves its first display name. */}
+        <div style={S.profileDisplayName}>{displayName || profileHandle}</div>
+        {/* Bio — only renders if present. Multi-line, preserves
+            newlines via whitespace: pre-wrap. */}
+        {bio && <div style={S.profileBio}>{bio}</div>}
+        {/* Link — only renders if present. Opens externally. */}
+        {link && (
+          <a
+            href={link}
+            target="_blank"
+            rel="noopener noreferrer"
+            style={S.profileLink}
+          >
+            {link.replace(/^https?:\/\/(www\.)?/, '')}
+          </a>
+        )}
       </div>
 
       {/* ---- Action button row (IG-style) ---- */}
-      {/* For your own profile: Share Profile button.
-          For someone else's: Follow / Following toggle + Share Profile. */}
+      {/* For your own profile: Edit profile + Share Profile side by side.
+          For someone else's: Follow / Following toggle + Share Profile + Block. */}
       <div style={S.profileActionsRow}>
-        {!isMe && (
+        {isMe ? (
+          <button
+            onClick={() => setEditProfileOpen(true)}
+            style={{ ...S.profileActionBtn, flex: 1 }}
+          >
+            Edit profile
+          </button>
+        ) : (
           <button
             onClick={toggleFollow}
             disabled={followBusy}
@@ -6947,6 +7067,28 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
             setAvatarUrl(newUrl);
             setAvatarPickerOpen(false);
             showToast('Avatar updated', 'success');
+          }}
+        />
+      )}
+
+      {/* Edit profile modal — only mounted when the user taps Edit profile
+          on their own profile. Saves displayName/bio/link; on success
+          the local state updates immediately so the view reflects the
+          change without a refetch. */}
+      {editProfileOpen && isMe && currentHandle && deviceId && (
+        <EditProfileModal
+          handle={currentHandle}
+          deviceId={deviceId}
+          initialDisplayName={displayName}
+          initialBio={bio}
+          initialLink={link}
+          onClose={() => setEditProfileOpen(false)}
+          onSaved={(p) => {
+            setDisplayName(p.displayName);
+            setBio(p.bio);
+            setLink(p.link);
+            setEditProfileOpen(false);
+            showToast('Profile updated', 'success');
           }}
         />
       )}
@@ -7165,6 +7307,109 @@ function NotificationRow({ item, onSelectHandle, onSelectPost }: {
         <img src={item.postThumbUrl} alt="" style={S.notifThumb} />
       )}
     </button>
+  );
+}
+
+// ---------- Edit Profile Modal ----------
+// Three editable fields: display name, bio, link. Each maps 1:1 to
+// the server's /handles/profile/update endpoint. Cancel discards
+// unsaved changes; Save validates client-side then submits. Server
+// also validates — client validation is just for fast feedback.
+function EditProfileModal({ handle, deviceId, initialDisplayName, initialBio, initialLink, onClose, onSaved }: {
+  handle: string;
+  deviceId: string;
+  initialDisplayName: string;
+  initialBio: string;
+  initialLink: string;
+  onClose: () => void;
+  onSaved: (p: { displayName: string; bio: string; link: string }) => void;
+}) {
+  const DISPLAY_NAME_MAX = 30;
+  const BIO_MAX = 150;
+
+  const [displayName, setDisplayName] = useState(initialDisplayName);
+  const [bio, setBio] = useState(initialBio);
+  const [link, setLink] = useState(initialLink);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const onSave = async () => {
+    if (busy) return;
+    setBusy(true);
+    setErr(null);
+    const r = await apiUpdateProfile({
+      handle,
+      deviceId,
+      displayName,
+      bio,
+      link,
+    });
+    setBusy(false);
+    if (!r.ok || !r.profile) {
+      setErr(r.reason || 'Save failed.');
+      return;
+    }
+    onSaved({
+      displayName: r.profile.displayName,
+      bio: r.profile.bio,
+      link: r.profile.link,
+    });
+  };
+
+  return createPortal(
+    <div style={S.editProfileBackdrop} onClick={onClose}>
+      <div style={S.editProfileSheet} onClick={(e) => e.stopPropagation()}>
+        <div style={S.editProfileHeader}>
+          <button onClick={onClose} style={S.editProfileCancelBtn}>Cancel</button>
+          <div style={S.editProfileTitle}>Edit profile</div>
+          <button onClick={onSave} disabled={busy} style={S.editProfileSaveBtn}>
+            {busy ? 'Saving…' : 'Save'}
+          </button>
+        </div>
+
+        {err && <div style={S.editProfileErr}>{err}</div>}
+
+        <div style={S.editProfileBody}>
+          <div style={S.editProfileFieldLabel}>Display name</div>
+          <input
+            type="text"
+            value={displayName}
+            onChange={(e) => setDisplayName(e.target.value.slice(0, DISPLAY_NAME_MAX))}
+            placeholder="Your name"
+            style={S.editProfileInput}
+            maxLength={DISPLAY_NAME_MAX}
+          />
+          <div style={S.editProfileCounter}>{displayName.length} / {DISPLAY_NAME_MAX}</div>
+
+          <div style={S.editProfileFieldLabel}>Bio</div>
+          <textarea
+            value={bio}
+            onChange={(e) => setBio(e.target.value.slice(0, BIO_MAX))}
+            placeholder="Tell people about yourself"
+            style={S.editProfileTextarea}
+            rows={4}
+            maxLength={BIO_MAX}
+          />
+          <div style={S.editProfileCounter}>{bio.length} / {BIO_MAX}</div>
+
+          <div style={S.editProfileFieldLabel}>Link</div>
+          <input
+            type="url"
+            value={link}
+            onChange={(e) => setLink(e.target.value)}
+            placeholder="youtube.com/@yourchannel"
+            style={S.editProfileInput}
+            autoCapitalize="none"
+            autoCorrect="off"
+            spellCheck={false}
+          />
+          <div style={S.editProfileHint}>
+            We'll add https:// if you leave it off.
+          </div>
+        </div>
+      </div>
+    </div>,
+    document.body
   );
 }
 
@@ -11788,6 +12033,18 @@ const S: Record<string, React.CSSProperties> = {
     borderBottom: `1px solid #FFFFFF44`,
     boxShadow: '0 2px 12px rgba(0,0,0,0.6)',
   },
+  // Full-width row that holds the brand title, centered. By making this
+  // row span the entire header width and centering its content, the
+  // DreadFeed title is anchored to the true horizontal center of the
+  // header — the absolutely-positioned bell button on the right
+  // doesn't shift it.
+  exposureBrandTitleRow: {
+    width: '100%',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    pointerEvents: 'none' as const,
+  },
   exposureBrandTitle: {
     color: '#FFFFFF',
     // LivingHell to match the home page "Dread Directory" title — keeps
@@ -12049,10 +12306,22 @@ const S: Record<string, React.CSSProperties> = {
     gap: 16,
     backgroundColor: 'rgba(10,10,10,0.5)',
   },
+  // Outer wrap — does NOT clip overflow so the +badge can poke outside
+  // the circle. Sized to the same 86x86 as the visible circle since
+  // there's no extra space needed; the badge sits in negative-coords
+  // territory.
   profileAvatarWrap: {
     width: 86,
     height: 86,
     minWidth: 86,
+    position: 'relative' as const,
+  },
+  // Inner element that actually does the circle clipping. Holds the
+  // avatar image. The previous overflow:hidden on the outer wrap was
+  // clipping the +badge — moved here so the badge can sit outside.
+  profileAvatarCircle: {
+    width: 86,
+    height: 86,
     borderRadius: '50%',
     overflow: 'hidden',
     border: `2px solid #FFFFFF`,
@@ -12072,8 +12341,10 @@ const S: Record<string, React.CSSProperties> = {
     WebkitTouchCallout: 'none' as const,
   },
   // Wraps the big profile avatar when it's tappable (own profile only).
-  // Removes default button chrome; positioning relative so the edit
-  // badge can sit absolutely in the bottom-right corner.
+  // The wrap itself doesn't clip — the inner circle does — so this
+  // button is just a transparent click target the same size as the
+  // outer wrap. The +badge inside it sits as a sibling of the inner
+  // circle, positioned to poke outside the bottom-right edge.
   profileAvatarEditBtn: {
     width: '100%',
     height: '100%',
@@ -12085,25 +12356,28 @@ const S: Record<string, React.CSSProperties> = {
     position: 'relative' as const,
     display: 'block',
   },
-  // Small "+" badge in the bottom-right corner of the editable avatar.
-  // Hints to the user that the avatar is tappable to change.
+  // IG-style "+" badge — sits OUTSIDE the bottom-right of the avatar
+  // circle, like Instagram's add-story button. White border separates
+  // it from the dark profile background visually so it reads as a
+  // distinct floating button rather than glued to the circle.
   profileAvatarEditBadge: {
     position: 'absolute' as const,
-    right: -2,
-    bottom: -2,
-    width: 24,
-    height: 24,
+    right: -4,
+    bottom: -4,
+    width: 28,
+    height: 28,
     borderRadius: '50%',
     background: '#FF3B5C',
     color: '#FFFFFF',
     fontSize: 18,
-    lineHeight: '22px',
+    lineHeight: '24px',
     fontWeight: 700 as const,
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
-    border: '2px solid #0a0a0a',
+    border: '3px solid #000',
     pointerEvents: 'none' as const,
+    boxShadow: '0 1px 4px rgba(0,0,0,0.4)',
   },
   // Avatar picker modal — bottom sheet style, matches the rest of the
   // app's modal sheets (BlockedListModal, comment composer, etc).
@@ -12284,6 +12558,143 @@ const S: Record<string, React.CSSProperties> = {
     fontSize: 14,
     fontWeight: 600,
     letterSpacing: '0.01em',
+  },
+  // Bio body — multi-line, preserves user-entered newlines.
+  profileBio: {
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    color: '#F0EBE0',
+    fontSize: 13,
+    lineHeight: 1.45,
+    marginTop: 4,
+    whiteSpace: 'pre-wrap' as const,
+    wordBreak: 'break-word' as const,
+  },
+  // External link, IG-style: blue, no underline, slight visited
+  // distinction. Truncates the displayed text (https:// stripped).
+  profileLink: {
+    display: 'inline-block',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    color: '#5BC0FF',
+    fontSize: 13,
+    fontWeight: 600 as const,
+    textDecoration: 'none',
+    marginTop: 6,
+    wordBreak: 'break-all' as const,
+  },
+  // ---- Edit profile modal ----
+  editProfileBackdrop: {
+    position: 'fixed' as const,
+    inset: 0,
+    background: 'rgba(0,0,0,0.85)',
+    zIndex: 10000,
+    display: 'flex',
+    alignItems: 'flex-end',
+    justifyContent: 'center',
+  },
+  editProfileSheet: {
+    width: '100%',
+    maxWidth: 520,
+    background: '#0a0a0a',
+    borderTopLeftRadius: 16,
+    borderTopRightRadius: 16,
+    padding: '12px 16px 24px',
+    display: 'flex',
+    flexDirection: 'column' as const,
+    maxHeight: '92vh',
+    overflowY: 'auto' as const,
+  },
+  editProfileHeader: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingBottom: 8,
+    borderBottom: '1px solid #1a1a1a',
+  },
+  editProfileTitle: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: 600 as const,
+    flex: 1,
+    textAlign: 'center' as const,
+  },
+  editProfileCancelBtn: {
+    background: 'transparent',
+    color: '#FFFFFF',
+    border: 'none',
+    fontSize: 15,
+    minWidth: 64,
+    textAlign: 'left' as const,
+    padding: 0,
+    cursor: 'pointer',
+  },
+  editProfileSaveBtn: {
+    background: 'transparent',
+    color: '#5BC0FF',
+    border: 'none',
+    fontSize: 15,
+    fontWeight: 700 as const,
+    minWidth: 64,
+    textAlign: 'right' as const,
+    padding: 0,
+    cursor: 'pointer',
+  },
+  editProfileErr: {
+    color: '#FF3B5C',
+    fontSize: 13,
+    padding: '8px 0',
+    textAlign: 'center' as const,
+  },
+  editProfileBody: {
+    paddingTop: 16,
+    display: 'flex',
+    flexDirection: 'column' as const,
+  },
+  editProfileFieldLabel: {
+    color: '#888',
+    fontSize: 12,
+    fontWeight: 600 as const,
+    textTransform: 'uppercase' as const,
+    letterSpacing: '0.05em',
+    marginTop: 12,
+    marginBottom: 6,
+  },
+  editProfileInput: {
+    width: '100%',
+    background: '#1a1a1a',
+    border: '1px solid #333',
+    borderRadius: 8,
+    color: '#F0EBE0',
+    fontSize: 15,
+    padding: '10px 12px',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    boxSizing: 'border-box' as const,
+    outline: 'none',
+  },
+  editProfileTextarea: {
+    width: '100%',
+    background: '#1a1a1a',
+    border: '1px solid #333',
+    borderRadius: 8,
+    color: '#F0EBE0',
+    fontSize: 15,
+    padding: '10px 12px',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    resize: 'vertical' as const,
+    minHeight: 80,
+    boxSizing: 'border-box' as const,
+    outline: 'none',
+    lineHeight: 1.4,
+  },
+  editProfileCounter: {
+    color: '#666',
+    fontSize: 11,
+    textAlign: 'right' as const,
+    marginTop: 4,
+  },
+  editProfileHint: {
+    color: '#888',
+    fontSize: 11,
+    marginTop: 6,
   },
   // ---- IG-style action button row ----
   profileActionsRow: {
