@@ -498,6 +498,57 @@ async function apiDeleteMyPost(args: { postId: string; handle: string; deviceId:
   } catch { return { ok: false, reason: 'network error' }; }
 }
 
+// ---- Notifications ----
+type NotificationItem = {
+  id: string;
+  type: 'liked_post' | 'followed' | 'commented';
+  actor: string;
+  actorAvatarUrl: string | null;
+  postId: string | null;
+  postThumbUrl: string | null;
+  commentSnippet?: string;
+  createdAt: string;
+  unread: boolean;
+};
+
+type NotificationListResp = {
+  handle: string;
+  count: number;
+  unreadCount: number;
+  lastReadAt: string | null;
+  notifications: NotificationItem[];
+};
+
+async function apiFetchNotifications(handle: string): Promise<NotificationListResp | null> {
+  try {
+    const res = await fetch(`${API_BASE}/notifications/${encodeURIComponent(handle)}`);
+    if (!res.ok) return null;
+    return await res.json();
+  } catch { return null; }
+}
+
+async function apiFetchUnreadCount(handle: string): Promise<number> {
+  try {
+    const res = await fetch(`${API_BASE}/notifications/count/${encodeURIComponent(handle)}`);
+    if (!res.ok) return 0;
+    const data = await res.json();
+    return typeof data.unreadCount === 'number' ? data.unreadCount : 0;
+  } catch { return 0; }
+}
+
+async function apiMarkNotificationsRead(args: { handle: string; deviceId: string }):
+  Promise<{ ok: boolean }> {
+  try {
+    const res = await fetch(`${API_BASE}/notifications/mark-read`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    if (!res.ok) return { ok: false };
+    return await res.json();
+  } catch { return { ok: false }; }
+}
+
 // ---------- Visit-claim API ----------
 // POST /visits — server checks (handle, deviceId) ownership, verifies the
 // reported lat/lng is within 100m of the site's coords, dedupes (one visit
@@ -2125,6 +2176,7 @@ type View =
   | { name: 'social' }
   | { name: 'userProfile'; handle: string }
   | { name: 'post'; postId: string; postList?: string[]; preloadedPosts?: SocialPost[] }
+  | { name: 'notifications' }
   | { name: 'settings' };
 
 export default function App() {
@@ -2783,6 +2835,7 @@ export default function App() {
             onSelectPost={(postId, postList, preloadedPosts) => setView({ name: 'post', postId, postList, preloadedPosts })}
             onHandleClaimed={setHandle}
             onSelectSettings={() => setView({ name: 'settings' })}
+            onSelectNotifications={() => setView({ name: 'notifications' })}
           />
         ),
       };
@@ -2798,6 +2851,7 @@ export default function App() {
             onSelectSite={goDetail}
             onSelectBadges={(h) => setView({ name: 'badges', handle: h })}
             onSelectPost={(postId, postList, preloadedPosts) => setView({ name: 'post', postId, postList, preloadedPosts })}
+            onSelectHandle={(h) => setView({ name: 'userProfile', handle: h })}
             onSelectExposureTab={(tab) => {
               // Tapping a bottom-bar tab from inside a standalone profile
               // jumps to eXposure on that sub-tab. Same pattern as
@@ -2854,6 +2908,28 @@ export default function App() {
               // so we don't re-render screens with a stale handle.
               setHandle(null);
               setView({ name: 'home' });
+            }}
+          />
+        ),
+      };
+    } else if (v.name === 'notifications') {
+      // The bell is only tappable when a handle exists, so handle/deviceId
+      // should be present — but defensively fall back to home if not.
+      if (!handle || !deviceId) {
+        return { key: 'notifications-noauth', element: null };
+      }
+      return {
+        key: 'notifications',
+        element: (
+          <NotificationsView
+            handle={handle}
+            deviceId={deviceId}
+            onSelectHandle={(h) => setView({ name: 'userProfile', handle: h })}
+            onSelectPost={(postId) => setView({ name: 'post', postId })}
+            onBack={() => {
+              // Back returns to DreadFeed feed tab.
+              _exposureSubTabMemory = 'feed';
+              setView({ name: 'social' });
             }}
           />
         ),
@@ -4777,7 +4853,7 @@ function DreadFeedClaimScreen({ deviceId, onClaimed }: {
 }
 
 
-function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, onBack, onSelectHandle, onSelectPost, onHandleClaimed, onSelectSettings }: {
+function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, onBack, onSelectHandle, onSelectPost, onHandleClaimed, onSelectSettings, onSelectNotifications }: {
   handle: string | null;
   deviceId: string | null;
   sites: SinisterSite[];
@@ -4794,6 +4870,9 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
   // Opens the Settings screen, plumbed down to the embedded
   // UserProfileView's gear icon.
   onSelectSettings: () => void;
+  // Routes to the NotificationsView when the user taps the bell in
+  // the DreadFeed header.
+  onSelectNotifications: () => void;
 }) {
   // Sub-tab inside eXposure. The static black bottom bar switches
   // between four sub-screens: 'feed' (the post feed, eXposure home),
@@ -4823,6 +4902,24 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
   // site is within 100m, it shows a "get closer" message; otherwise it
   // surfaces the existing AddPhotoButton composer.
   const [postSheetOpen, setPostSheetOpen] = useState(false);
+
+  // Unread notifications badge count, shown on the bell in the brand
+  // header. Polled on mount + every 60 seconds while DreadFeed is open.
+  const [unreadCount, setUnreadCount] = useState(0);
+  useEffect(() => {
+    if (!handle) {
+      setUnreadCount(0);
+      return;
+    }
+    let cancelled = false;
+    const refresh = async () => {
+      const n = await apiFetchUnreadCount(handle);
+      if (!cancelled) setUnreadCount(n);
+    };
+    refresh();
+    const id = window.setInterval(refresh, 60000);
+    return () => { cancelled = true; window.clearInterval(id); };
+  }, [handle]);
 
   const [posts, setPosts] = useState<SocialPost[]>([]);
   const [nextBefore, setNextBefore] = useState<string | null>(null);
@@ -5003,7 +5100,10 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
           Black bar with the eXposure brand on top and a short tagline
           underneath. Sticky so it stays visible while the feed scrolls.
           Pull-to-refresh and per-sub-tab headers render BELOW this. */}
-      <ExposureBrandHeader />
+      <ExposureBrandHeader
+        unreadCount={unreadCount}
+        onTapBell={onSelectNotifications}
+      />
 
       {/* ====== FEED sub-tab ====== */}
       {subTab === 'feed' && (
@@ -5113,6 +5213,7 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
           onSelectSite={onSelectSite}
           onSelectBadges={(h) => { /* tab-bound; ignore deep link */ void h; }}
           onSelectPost={onSelectPost}
+          onSelectHandle={onSelectHandle}
           onSelectSettings={onSelectSettings}
           onBack={() => setSubTab('feed')}
           embedded
@@ -6427,7 +6528,12 @@ function formatTimeAgo(iso: string): string {
 // Profile, Post Detail, and other-user profiles). Sticky black bar with
 // the eXposure brand on top and a short tagline below — keeps the
 // app's identity visible no matter where you've drilled in.
-function ExposureBrandHeader() {
+// DreadFeed brand header with optional notification bell on the right.
+// Bell shows a red dot when unreadCount > 0. Tap routes to NotificationsView.
+function ExposureBrandHeader({ unreadCount, onTapBell }: {
+  unreadCount?: number;
+  onTapBell?: () => void;
+} = {}) {
   return (
     <div style={S.exposureBrandHeader}>
       {/* Same VHS-glitch effect as the home page "Dread Directory" title —
@@ -6441,6 +6547,25 @@ function ExposureBrandHeader() {
       >
         DreadFeed
       </div>
+      {/* Bell sits in the top-right corner of the header. Absolute
+          positioning keeps the existing centered title layout intact. */}
+      {onTapBell && (
+        <button
+          onClick={onTapBell}
+          style={S.exposureBellBtn}
+          aria-label={unreadCount && unreadCount > 0 ? `Notifications (${unreadCount} unread)` : 'Notifications'}
+        >
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9" />
+            <path d="M13.73 21a2 2 0 0 1-3.46 0" />
+          </svg>
+          {!!unreadCount && unreadCount > 0 && (
+            <span style={S.exposureBellBadge}>
+              {unreadCount > 99 ? '99+' : String(unreadCount)}
+            </span>
+          )}
+        </button>
+      )}
     </div>
   );
 }
@@ -6463,7 +6588,7 @@ function ExposureBrandHeader() {
 //   - GET /badges/:handle for visit count
 //   - GET /posts/handle/:handle for the grid (new server endpoint —
 //     replaces the old "fetch full feed and filter client-side" trick)
-function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSelectSite, onSelectBadges, onSelectPost, onSelectExposureTab, onSelectSettings, onBack, embedded }: {
+function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSelectSite, onSelectBadges, onSelectPost, onSelectHandle, onSelectExposureTab, onSelectSettings, onBack, embedded }: {
   profileHandle: string;
   currentHandle: string | null;
   deviceId: string | null;
@@ -6471,6 +6596,10 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
   onSelectSite: (site: SinisterSite) => void;
   onSelectBadges: (handle: string) => void;
   onSelectPost: (postId: string, postList?: string[], preloadedPosts?: SocialPost[]) => void;
+  // Tapping a handle inside the followers/following list sheet — routes
+  // to that handle's profile. Required so the sheet doesn't just close
+  // with no nav.
+  onSelectHandle: (handle: string) => void;
   // Optional — only passed when this view is dispatched as a standalone
   // route (e.g. tapped @handle from a feed card). Embedded inside the
   // DreadFeed profile tab, the parent SocialView handles tab nav itself.
@@ -6727,7 +6856,8 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
         )}
       </div>
 
-      {/* Followers / Following list sheet — opens when a stat is tapped. */}
+      {/* Followers / Following list sheet — opens when a stat is tapped.
+          Tapping a row routes to that handle's profile via onSelectHandle. */}
       {listSheet && (
         <HandleListSheet
           mode={listSheet}
@@ -6736,11 +6866,9 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
           onClose={() => setListSheet(null)}
           onSelectHandle={(h) => {
             setListSheet(null);
-            // Reuse the existing onSelectHandle plumbing — but profile
-            // doesn't get one as a prop. Instead, leverage the back
-            // gesture: we'll just close the sheet and let the user
-            // navigate manually. (Could be improved later.)
-            void h;
+            // Don't re-navigate if the user tapped themselves.
+            if (h.toLowerCase() === profileHandle.toLowerCase()) return;
+            onSelectHandle(h);
           }}
         />
       )}
@@ -6919,6 +7047,124 @@ function AvatarPickerModal({ handle, deviceId, currentAvatarUrl, onClose, onChan
       </div>
     </div>,
     document.body
+  );
+}
+
+// ---------- NotificationsView ----------
+// Standalone screen showing all of the user's likes/follows/comments
+// notifications, newest first. Tapping a row routes to the relevant
+// destination (post for likes/comments, profile for follows).
+// Mark-read is called on mount so the bell badge clears.
+function NotificationsView({ handle, deviceId, onSelectHandle, onSelectPost, onBack }: {
+  handle: string;
+  deviceId: string;
+  onSelectHandle: (handle: string) => void;
+  onSelectPost: (postId: string) => void;
+  onBack: () => void;
+}) {
+  const [items, setItems] = useState<NotificationItem[] | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      const resp = await apiFetchNotifications(handle);
+      if (cancelled) return;
+      setItems(resp ? resp.notifications : []);
+      setLoading(false);
+      // Mark all as read in the background so the bell clears next poll.
+      apiMarkNotificationsRead({ handle, deviceId }).catch(() => { /* silent */ });
+    })();
+    return () => { cancelled = true; };
+  }, [handle, deviceId]);
+
+  return (
+    <div style={S.notifWrap}>
+      <div style={S.notifHeader}>
+        <button onClick={onBack} style={S.notifBackBtn} aria-label="Back">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <polyline points="15 18 9 12 15 6" />
+          </svg>
+        </button>
+        <div style={S.notifHeaderTitle}>Notifications</div>
+        <div style={{ width: 40 }} />
+      </div>
+
+      {loading ? (
+        <div style={S.notifEmpty}>Loading…</div>
+      ) : !items || items.length === 0 ? (
+        <div style={S.notifEmpty}>
+          <div style={{ fontSize: 32, marginBottom: 8 }}>🔕</div>
+          <div>No notifications yet.</div>
+          <div style={{ fontSize: 12, opacity: 0.6, marginTop: 6 }}>
+            You'll see likes, follows, and comments here.
+          </div>
+        </div>
+      ) : (
+        <div style={S.notifList}>
+          {items.map((n) => (
+            <NotificationRow
+              key={n.id}
+              item={n}
+              onSelectHandle={onSelectHandle}
+              onSelectPost={onSelectPost}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function NotificationRow({ item, onSelectHandle, onSelectPost }: {
+  item: NotificationItem;
+  onSelectHandle: (handle: string) => void;
+  onSelectPost: (postId: string) => void;
+}) {
+  // Tapping the row routes contextually: likes/comments → the post,
+  // follows → the actor's profile. Avatar is always tappable to actor.
+  const onRowTap = () => {
+    if ((item.type === 'liked_post' || item.type === 'commented') && item.postId) {
+      onSelectPost(item.postId);
+    } else {
+      onSelectHandle(item.actor);
+    }
+  };
+
+  const verb = item.type === 'liked_post'
+    ? 'liked your post'
+    : item.type === 'commented'
+      ? `commented: ${item.commentSnippet || ''}`
+      : 'started following you';
+
+  return (
+    <button
+      onClick={onRowTap}
+      style={{ ...S.notifRow, ...(item.unread ? S.notifRowUnread : {}) }}
+    >
+      <button
+        onClick={(e) => { e.stopPropagation(); onSelectHandle(item.actor); }}
+        style={S.notifAvatarBtn}
+        aria-label={`${item.actor} profile`}
+      >
+        <img
+          src={resolveAvatarUrl(item.actorAvatarUrl) || exposureIconUrl}
+          alt=""
+          style={S.notifAvatarImg}
+        />
+      </button>
+      <div style={S.notifBodyCol}>
+        <div style={S.notifBodyText}>
+          <span style={S.notifActorName}>{item.actor}</span>
+          <span style={S.notifVerb}> {verb}</span>
+        </div>
+        <div style={S.notifTime}>{formatTimeAgoShort(item.createdAt)}</div>
+      </div>
+      {item.postThumbUrl && (
+        <img src={item.postThumbUrl} alt="" style={S.notifThumb} />
+      )}
+    </button>
   );
 }
 
@@ -11556,6 +11802,152 @@ const S: Record<string, React.CSSProperties> = {
     // rest of the app's purple accents.
     textShadow: `0 0 14px #FFFFFFcc, 0 0 4px #FFFFFF88`,
     lineHeight: 1,
+  },
+  // Bell button — absolute-positioned in the top-right of the brand
+  // header. Sized to be tap-friendly (~44pt) but visually small.
+  exposureBellBtn: {
+    position: 'absolute' as const,
+    right: 12,
+    top: 'calc(env(safe-area-inset-top, 44px) + 14px)' as any,
+    width: 36,
+    height: 36,
+    background: 'transparent',
+    border: 'none',
+    padding: 0,
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  // Red unread-count badge in the bell's top-right corner.
+  exposureBellBadge: {
+    position: 'absolute' as const,
+    top: -2,
+    right: -2,
+    minWidth: 16,
+    height: 16,
+    padding: '0 4px',
+    background: '#FF3B5C',
+    color: '#FFFFFF',
+    fontSize: 10,
+    fontWeight: 700 as const,
+    borderRadius: 8,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    pointerEvents: 'none' as const,
+  },
+  // ---- NotificationsView ----
+  notifWrap: {
+    minHeight: '100vh',
+    background: '#000',
+    color: '#FFFFFF',
+    paddingBottom: 'env(safe-area-inset-bottom, 0)' as any,
+  },
+  notifHeader: {
+    position: 'sticky' as const,
+    top: 0,
+    zIndex: 5,
+    background: '#000',
+    borderBottom: '1px solid #1a1a1a',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: 'calc(env(safe-area-inset-top, 44px) + 8px) 12px 8px' as any,
+  },
+  notifBackBtn: {
+    width: 40,
+    height: 40,
+    background: 'transparent',
+    border: 'none',
+    padding: 0,
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  notifHeaderTitle: {
+    color: '#FFFFFF',
+    fontSize: 17,
+    fontWeight: 600 as const,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  notifEmpty: {
+    padding: '80px 24px',
+    textAlign: 'center' as const,
+    color: '#888',
+    fontSize: 14,
+  },
+  notifList: {
+    display: 'flex',
+    flexDirection: 'column' as const,
+  },
+  notifRow: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 12,
+    padding: '10px 14px',
+    background: 'transparent',
+    border: 'none',
+    borderBottom: '1px solid #111',
+    cursor: 'pointer',
+    width: '100%',
+    textAlign: 'left' as const,
+  },
+  notifRowUnread: {
+    background: 'rgba(255, 59, 92, 0.06)',
+  },
+  notifAvatarBtn: {
+    width: 44,
+    height: 44,
+    minWidth: 44,
+    padding: 0,
+    background: 'transparent',
+    border: 'none',
+    borderRadius: '50%',
+    overflow: 'hidden',
+    cursor: 'pointer',
+  },
+  notifAvatarImg: {
+    width: '100%',
+    height: '100%',
+    objectFit: 'cover' as const,
+    pointerEvents: 'none' as const,
+  },
+  notifBodyCol: {
+    flex: 1,
+    display: 'flex',
+    flexDirection: 'column' as const,
+    gap: 2,
+    minWidth: 0,
+  },
+  notifBodyText: {
+    color: '#F0EBE0',
+    fontSize: 14,
+    lineHeight: 1.35,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis' as const,
+  },
+  notifActorName: {
+    fontWeight: 700 as const,
+    color: '#FFFFFF',
+  },
+  notifVerb: {
+    color: '#aaa',
+  },
+  notifTime: {
+    color: '#666',
+    fontSize: 11,
+  },
+  notifThumb: {
+    width: 44,
+    height: 44,
+    minWidth: 44,
+    objectFit: 'cover' as const,
+    borderRadius: 4,
+    pointerEvents: 'none' as const,
   },
   exposureBrandTagline: {
     color: '#888',
