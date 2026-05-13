@@ -177,6 +177,14 @@ let _lastNotifiedAt: Map<string, number> = new Map();
 // in the set, additional ENTER events are ignored as GPS jitter — that
 // stops the hotel-stay repeat-notification bug. The 30-min cooldown above
 // stays in place as defense-in-depth in case we ever miss an EXIT.
+//
+// CRITICAL: this set + _lastNotifiedAt MUST be persisted to disk via
+// savePresenceState() because iOS aggressively terminates the app between
+// geofence events to save battery. When iOS wakes the app back up for
+// the next event, the entire JS module reloads from scratch with empty
+// state — without persistence, every ENTER looks like a first-time entry
+// and fires a duplicate notification. See loadPresenceState() below for
+// the cold-start rehydration.
 let _currentlyInside: Set<string> = new Set();
 // In-flight EXIT debounce timers keyed by site id. We don't trust the very
 // first EXIT event because GPS at the radius boundary flickers; we wait
@@ -185,6 +193,132 @@ let _currentlyInside: Set<string> = new Set();
 // cancel — that was just jitter.
 const EXIT_DEBOUNCE_MS = 60 * 1000;
 let _pendingExitTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
+// Persistent companion to _pendingExitTimers. Maps site id -> Unix ms
+// timestamp at which the exit should be committed. We persist this so
+// that if iOS terminates the JS engine mid-debounce (very common when
+// the user drives away from a site — iOS suspends the app right then),
+// the deadline survives. On cold start, loadPresenceState() walks this
+// map and commits any exits whose deadline has already passed, BEFORE
+// any ENTER event can be processed. Without this, a short out-and-back
+// trip ends with the site still in _currentlyInside on disk and the
+// returning ENTER is silently suppressed as a "duplicate."
+let _pendingExitDeadlines: Map<string, number> = new Map();
+
+// ---------- Persistence (survives iOS app termination between events) ----------
+// Storage key for the {currentlyInside, lastNotifiedAt} blob. Stored as a
+// single JSON value to make the save atomic — one Preferences.set call
+// per state change instead of two.
+const PRESENCE_STORAGE_KEY = 'sinister.geofencePresence.v1';
+let _presenceLoaded = false;
+
+async function readPersistent(key: string): Promise<string | null> {
+  try {
+    const cap = (window as any).Capacitor;
+    if (cap?.isNativePlatform?.() && cap?.Plugins?.Preferences) {
+      const { value } = await cap.Plugins.Preferences.get({ key });
+      return value || null;
+    }
+  } catch { /* fall through to web */ }
+  try { return typeof localStorage !== 'undefined' ? localStorage.getItem(key) : null; }
+  catch { return null; }
+}
+
+async function writePersistent(key: string, value: string): Promise<void> {
+  try {
+    const cap = (window as any).Capacitor;
+    if (cap?.isNativePlatform?.() && cap?.Plugins?.Preferences) {
+      await cap.Plugins.Preferences.set({ key, value });
+      return;
+    }
+  } catch { /* fall through to web */ }
+  try { if (typeof localStorage !== 'undefined') localStorage.setItem(key, value); }
+  catch { /* silent */ }
+}
+
+// Load _currentlyInside and _lastNotifiedAt from disk. Called once at
+// module init before any geofence event can be processed. If the load
+// fails or the stored data is malformed, we start with empty state —
+// worst case is one duplicate notification, not a crash.
+//
+// Also rehydrates _pendingExitDeadlines and commits any exits whose
+// deadline has passed during the time the app was terminated. This is
+// what fixes the "drove to the store and came back, no notification"
+// bug: the EXIT event fired, the 60-second debounce timer started, then
+// iOS killed the app before the timer could complete. Without this
+// catch-up, the site stays in _currentlyInside forever (until manually
+// re-entered by walking into the radius from a different direction or
+// something equally accidental), and every legitimate return is
+// silently treated as a duplicate ENTER.
+async function loadPresenceState(): Promise<void> {
+  if (_presenceLoaded) return;
+  try {
+    const raw = await readPersistent(PRESENCE_STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && Array.isArray(parsed.currentlyInside)) {
+        _currentlyInside = new Set(parsed.currentlyInside);
+      }
+      if (parsed && parsed.lastNotifiedAt && typeof parsed.lastNotifiedAt === 'object') {
+        _lastNotifiedAt = new Map(Object.entries(parsed.lastNotifiedAt));
+      }
+      if (parsed && parsed.pendingExitDeadlines && typeof parsed.pendingExitDeadlines === 'object') {
+        _pendingExitDeadlines = new Map(
+          Object.entries(parsed.pendingExitDeadlines).map(([k, v]) => [k, Number(v)])
+        );
+      }
+
+      // Catch-up: walk persisted deadlines and commit any that have
+      // expired during termination. We mutate _currentlyInside in place;
+      // savePresenceState() is called once at the end to persist the
+      // cleaned-up state. We do NOT restart in-memory setTimeouts for
+      // unexpired deadlines — if iOS wakes us again before the deadline,
+      // the deadline will simply expire in disk and be caught on the
+      // NEXT cold start. The native plugin is what wakes us, not a JS
+      // timer, so we don't need an active timer to make progress.
+      const now = Date.now();
+      let committedAny = false;
+      for (const [siteId, deadline] of Array.from(_pendingExitDeadlines.entries())) {
+        if (deadline <= now) {
+          _currentlyInside.delete(siteId);
+          _pendingExitDeadlines.delete(siteId);
+          committedAny = true;
+          dlog('loadPresenceState: committed expired exit for ' + siteId);
+        }
+      }
+      if (committedAny) savePresenceState();
+
+      dlog('loadPresenceState: restored ' + _currentlyInside.size + ' inside, ' + _lastNotifiedAt.size + ' cooldowns, ' + _pendingExitDeadlines.size + ' pending exits');
+    } else {
+      dlog('loadPresenceState: no prior state');
+    }
+  } catch (err: any) {
+    dlog('loadPresenceState failed: ' + (err?.message || err));
+  }
+  _presenceLoaded = true;
+}
+
+// Serialize current state to disk. Called after every mutation. Fire-
+// and-forget — we don't await it from the geofence event handler because
+// blocking on Preferences.set could lose the event if the JS engine is
+// torn down mid-write. If a write loses, the worst case is the in-memory
+// state being one step ahead of disk — next time the app cold-starts
+// it'll think the user is still inside (or has a stale cooldown) which
+// is the SAFE direction to fail (no duplicate notifications).
+function savePresenceState(): void {
+  const payload = JSON.stringify({
+    currentlyInside: Array.from(_currentlyInside),
+    lastNotifiedAt: Object.fromEntries(_lastNotifiedAt),
+    pendingExitDeadlines: Object.fromEntries(_pendingExitDeadlines),
+    savedAt: Date.now(),
+  });
+  void writePersistent(PRESENCE_STORAGE_KEY, payload);
+}
+
+// Kick off persistence load at module init. Doesn't block module load —
+// the load completes in the background, and geofence events that arrive
+// before it finishes will see empty state (worst case: one extra
+// notification on the very first cold-start after install).
+void loadPresenceState();
 let _onPosition: ((lat: number, lng: number) => void) | null = null;
 let _notifListenersAttached = false;
 let _bgListenersAttached = false;
@@ -278,16 +412,26 @@ async function attachBgListeners(BG: any): Promise<void> {
       if (action === 'ENTER') {
         // Cancel any pending exit debounce for this site — we entered again
         // before the exit was confirmed, so the prior "exit" was just GPS
-        // jitter at the boundary.
+        // jitter at the boundary. We clear BOTH the in-memory timer AND
+        // the persisted deadline — if we only cleared the timer, the
+        // deadline would still be on disk and the next cold start would
+        // incorrectly commit the exit and remove the site from
+        // _currentlyInside.
         const pending = _pendingExitTimers.get(site.id);
         if (pending) {
           clearTimeout(pending);
           _pendingExitTimers.delete(site.id);
           dlog('onGeofence: cancelled pending exit for ' + site.title);
         }
+        if (_pendingExitDeadlines.has(site.id)) {
+          _pendingExitDeadlines.delete(site.id);
+          savePresenceState();
+        }
         // If we already think the user is inside this site, this ENTER is
         // a duplicate (GPS reacquisition, signal regain, etc.). Suppress —
-        // this is the core of the hotel-stay fix.
+        // this is the core of the hotel-stay fix. Works across iOS app
+        // termination because _currentlyInside is hydrated from disk by
+        // loadPresenceState() before any geofence event is processed.
         if (_currentlyInside.has(site.id)) {
           dlog('onGeofence: already inside ' + site.title + ', ignoring duplicate ENTER');
           return;
@@ -300,10 +444,12 @@ async function attachBgListeners(BG: any): Promise<void> {
           dlog('onGeofence: cooldown active for ' + site.title);
           // Still mark as inside so subsequent jitter ENTERs are deduped.
           _currentlyInside.add(site.id);
+          savePresenceState();
           return;
         }
         _currentlyInside.add(site.id);
         _lastNotifiedAt.set(site.id, now);
+        savePresenceState();
         void fireNotification(site);
         return;
       }
@@ -315,9 +461,22 @@ async function attachBgListeners(BG: any): Promise<void> {
           // Already a pending confirmation — let it run.
           return;
         }
+        // Record the deadline to disk BEFORE setting the in-memory timer.
+        // This is what makes the debounce durable across iOS app
+        // termination: even if iOS kills the JS context the moment after
+        // this handler returns (very likely — leaving a geofence is a
+        // classic moment for the OS to suspend the app), the deadline
+        // survives. Next cold start, loadPresenceState() will see the
+        // expired deadline and commit the exit before any returning
+        // ENTER can be processed.
+        const deadline = Date.now() + EXIT_DEBOUNCE_MS;
+        _pendingExitDeadlines.set(site.id, deadline);
+        savePresenceState();
         const timer = setTimeout(() => {
           _currentlyInside.delete(site.id);
           _pendingExitTimers.delete(site.id);
+          _pendingExitDeadlines.delete(site.id);
+          savePresenceState();
           dlog('onGeofence: confirmed exit from ' + site.title);
         }, EXIT_DEBOUNCE_MS);
         _pendingExitTimers.set(site.id, timer);
@@ -539,6 +698,7 @@ export function simulateLocation(lat: number, lng: number) {
       const lastAt = _lastNotifiedAt.get(site.id) || 0;
       if (now - lastAt < NOTIFICATION_COOLDOWN_MS) continue;
       _lastNotifiedAt.set(site.id, now);
+      savePresenceState();
       dlog(`SIM TRIGGER: ${site.title} at ${Math.round(d)}m`);
       void fireNotification(site);
     }
