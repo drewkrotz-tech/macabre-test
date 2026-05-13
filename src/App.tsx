@@ -451,6 +451,54 @@ function invalidateHiddenSet() {
   _hiddenSetCache = { viewer: null, set: new Set(), loadedAt: 0 };
 }
 
+// ---- Hidden posts (client-side only) ----
+// Personal "I don't want to see this again" hides, distinct from
+// block-handle (which hides ALL of a user's content). Stored locally in
+// Capacitor Preferences and never sent to the server — the user's
+// hides are their own business and don't affect other viewers.
+// Reinstall = wipe. That's acceptable.
+const HIDDEN_POSTS_KEY = 'sinister.hiddenPosts.v1';
+let _hiddenPostsCache: Set<string> | null = null;
+
+async function loadHiddenPosts(): Promise<Set<string>> {
+  if (_hiddenPostsCache) return _hiddenPostsCache;
+  try {
+    const { Preferences } = await import('@capacitor/preferences');
+    const { value } = await Preferences.get({ key: HIDDEN_POSTS_KEY });
+    const arr = value ? JSON.parse(value) : [];
+    _hiddenPostsCache = new Set(Array.isArray(arr) ? arr : []);
+  } catch {
+    _hiddenPostsCache = new Set();
+  }
+  return _hiddenPostsCache;
+}
+
+async function hidePost(postId: string): Promise<void> {
+  const set = await loadHiddenPosts();
+  set.add(postId);
+  try {
+    const { Preferences } = await import('@capacitor/preferences');
+    await Preferences.set({ key: HIDDEN_POSTS_KEY, value: JSON.stringify([...set]) });
+  } catch {
+    // Best effort — set is still updated in memory.
+  }
+}
+
+// Delete one of your own posts from the server. Server verifies handle
+// ownership AND that the post was actually authored by you.
+async function apiDeleteMyPost(args: { postId: string; handle: string; deviceId: string }):
+  Promise<{ ok: boolean; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/posts/delete-mine/${encodeURIComponent(args.postId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ handle: args.handle, deviceId: args.deviceId }),
+    });
+    if (!res.ok) return { ok: false, reason: `http ${res.status}` };
+    return await res.json();
+  } catch { return { ok: false, reason: 'network error' }; }
+}
+
 // ---------- Visit-claim API ----------
 // POST /visits — server checks (handle, deviceId) ownership, verifies the
 // reported lat/lng is within 100m of the site's coords, dedupes (one visit
@@ -4792,9 +4840,9 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
   // Helper: load a page from the right endpoint depending on feed mode.
   // Following mode requires a handle; falls back to empty page if not.
   // After fetching, we filter out posts authored by handles the viewer
-  // has blocked. Server doesn't know about the viewer's block list, so
-  // filtering is client-side. Anonymous viewers (no handle) get
-  // everything — there's no block list without an account.
+  // has blocked AND posts the viewer has personally hidden. Server
+  // doesn't know about either, so filtering is client-side. Anonymous
+  // viewers (no handle) skip the block list but still get post hides.
   const loadPage = async (before: string | null): Promise<FeedPage> => {
     let page: FeedPage;
     if (feedMode === 'following') {
@@ -4803,16 +4851,18 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
     } else {
       page = await apiFetchFeed({ limit: 20, before });
     }
+    const hiddenPosts = await loadHiddenPosts();
+    let filtered = page.posts;
+    if (hiddenPosts.size > 0) {
+      filtered = filtered.filter((p) => !hiddenPosts.has(p.id));
+    }
     if (handle) {
       const hidden = await getHiddenSet(handle);
       if (hidden.size > 0) {
-        return {
-          posts: page.posts.filter((p) => !hidden.has((p.handle || '').toLowerCase())),
-          nextBefore: page.nextBefore,
-        };
+        filtered = filtered.filter((p) => !hidden.has((p.handle || '').toLowerCase()));
       }
     }
-    return page;
+    return { posts: filtered, nextBefore: page.nextBefore };
   };
 
   // ---- Pull-to-refresh state ----
@@ -5023,6 +5073,9 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
                     if (s) onSelectSite(s);
                   }}
                   onHandleTap={() => onSelectHandle(p.handle)}
+                  onPostRemoved={(postId) => {
+                    setPosts((prev) => prev.filter((x) => x.id !== postId));
+                  }}
                 />
               ))}
               {loadingMore && <div style={S.socialEmpty}>Loading more…</div>}
@@ -5463,12 +5516,16 @@ function ExposureSearchView({ allPosts, currentHandle, deviceId, sites, onSelect
 
 // Single post card inside the feed. Owns its own like state so toggling
 // is fast and doesn't trigger a parent re-render of the whole list.
-function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap }: {
+function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap, onPostRemoved }: {
   post: SocialPost;
   currentHandle: string | null;
   deviceId: string | null;
   onSiteTap: () => void;
   onHandleTap: () => void;
+  // Optional. Called when the user hides or deletes this post — parent
+  // should remove it from its post list so it doesn't re-render. If
+  // omitted, the card hides itself locally.
+  onPostRemoved?: (postId: string) => void;
 }) {
   const [liked, setLiked] = useState(false);
   const [likeCount, setLikeCount] = useState(post.likeCount || 0);
@@ -5483,6 +5540,16 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap 
   // 3-dot menu state — action sheet open, report modal open.
   const [menuOpen, setMenuOpen] = useState(false);
   const [reportOpen, setReportOpen] = useState(false);
+  // Delete confirmation modal (own posts only).
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  // Local-hide fallback when no onPostRemoved callback is wired.
+  const [localHidden, setLocalHidden] = useState(false);
+
+  // Follow state — only relevant for other people's posts. Inline
+  // button matches IG: "Follow" → "Following" after tap. Server is the
+  // source of truth, loaded once per mount.
+  const [isFollowing, setIsFollowing] = useState(false);
+  const [followBusy, setFollowBusy] = useState(false);
 
   const isOwn = !!currentHandle && currentHandle.toLowerCase() === (post.handle || '').toLowerCase();
 
@@ -5499,6 +5566,40 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap 
     })();
     return () => { cancelled = true; };
   }, [post.id, currentHandle]);
+
+  // Fetch follow status for the post author so we can render "Follow"
+  // vs "Following" inline. Skipped on own posts (no follow button there).
+  useEffect(() => {
+    if (isOwn || !currentHandle) return;
+    let cancelled = false;
+    (async () => {
+      const status = await apiFollowStatus({ target: post.handle, handle: currentHandle });
+      if (cancelled) return;
+      setIsFollowing(status.followedByYou);
+    })();
+    return () => { cancelled = true; };
+  }, [post.handle, currentHandle, isOwn]);
+
+  const onToggleFollow = async () => {
+    if (followBusy) return;
+    if (!currentHandle || !deviceId) {
+      showToast('Sign in to follow', 'error');
+      return;
+    }
+    setFollowBusy(true);
+    // Optimistic flip.
+    const wasFollowing = isFollowing;
+    setIsFollowing(!wasFollowing);
+    const r = wasFollowing
+      ? await apiUnfollow({ follower: currentHandle, target: post.handle, deviceId })
+      : await apiFollow({ follower: currentHandle, target: post.handle, deviceId });
+    setFollowBusy(false);
+    if (!r.ok) {
+      // Roll back on failure.
+      setIsFollowing(wasFollowing);
+      showToast(r.reason || 'Follow failed', 'error');
+    }
+  };
 
   const onToggleLike = async () => {
     if (!currentHandle || !deviceId) {
@@ -5534,9 +5635,14 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap 
 
   const timeAgoShort = formatTimeAgoShort(post.approvedAt || post.createdAt);
 
+  // If the user picked "Hide post" from the 3-dot menu (and there's no
+  // parent callback to remove from the list), short-circuit the render
+  // so the card disappears in place.
+  if (localHidden) return null;
+
   return (
     <div style={S.postCard}>
-      {/* Top row: avatar | handle · time | location chip | menu */}
+      {/* Top row: avatar | handle · time | follow | menu */}
       <div style={S.postHeader}>
         <button onClick={onHandleTap} style={S.postAvatarBtn} aria-label={`${post.handle} profile`}>
           {/* Author avatar — server denormalizes post.avatarUrl. Falls
@@ -5563,6 +5669,20 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap 
             </button>
           )}
         </div>
+        {/* IG-style inline Follow button — hides on own posts. The
+            button toggles between "Follow" (filled white pill) and
+            "Following" (outlined gray pill). Sits between the handle
+            column and the 3-dot menu. */}
+        {!isOwn && currentHandle && (
+          <button
+            onClick={onToggleFollow}
+            disabled={followBusy}
+            style={isFollowing ? S.postFollowBtnFollowing : S.postFollowBtn}
+            aria-label={isFollowing ? `Unfollow ${post.handle}` : `Follow ${post.handle}`}
+          >
+            {isFollowing ? 'Following' : 'Follow'}
+          </button>
+        )}
         <button
           onClick={() => setMenuOpen(true)}
           style={S.postMenuBtn}
@@ -5677,46 +5797,97 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap 
         />
       )}
 
-      {/* 3-dot action sheet — Report and Block options. Own posts get
-          no menu options surfaced here (Delete-own-content can live
-          elsewhere; for now, owners have nothing to do from the menu). */}
+      {/* 3-dot action sheet — IG-style. About this account is always
+          available; Hide is always available. Block + Report are
+          surfaced only for other people's posts. Delete is surfaced
+          only for the viewer's own posts. */}
       {menuOpen && (
         <ActionSheet
           onClose={() => setMenuOpen(false)}
-          actions={isOwn ? [] : [
+          actions={[
             {
-              label: 'Report post',
-              onClick: () => {
-                if (!currentHandle || !deviceId) {
-                  showToast('Claim a handle to report', 'error');
-                  return;
-                }
-                setReportOpen(true);
-              },
-              destructive: true,
+              label: 'About this account',
+              onClick: () => onHandleTap(),
             },
             {
-              label: `Block @${post.handle}`,
+              label: 'Hide post',
               onClick: async () => {
-                if (!currentHandle || !deviceId) {
-                  showToast('Claim a handle to block', 'error');
-                  return;
-                }
-                const result = await apiBlock({
-                  blocker: currentHandle,
-                  blocked: post.handle,
-                  deviceId,
-                });
-                if (result.ok) {
-                  invalidateHiddenSet();
-                  showToast(`Blocked @${post.handle}`, 'success');
+                await hidePost(post.id);
+                if (onPostRemoved) {
+                  onPostRemoved(post.id);
                 } else {
-                  showToast(result.reason || 'Block failed', 'error');
+                  setLocalHidden(true);
                 }
+                showToast('Post hidden', 'success');
               },
-              destructive: true,
             },
+            ...(isOwn ? [
+              {
+                label: 'Delete post',
+                onClick: () => setDeleteConfirmOpen(true),
+                destructive: true,
+              },
+            ] : [
+              {
+                label: 'Report post',
+                onClick: () => {
+                  if (!currentHandle || !deviceId) {
+                    showToast('Claim a handle to report', 'error');
+                    return;
+                  }
+                  setReportOpen(true);
+                },
+                destructive: true,
+              },
+              {
+                label: `Block @${post.handle}`,
+                onClick: async () => {
+                  if (!currentHandle || !deviceId) {
+                    showToast('Claim a handle to block', 'error');
+                    return;
+                  }
+                  const result = await apiBlock({
+                    blocker: currentHandle,
+                    blocked: post.handle,
+                    deviceId,
+                  });
+                  if (result.ok) {
+                    invalidateHiddenSet();
+                    showToast(`Blocked @${post.handle}`, 'success');
+                  } else {
+                    showToast(result.reason || 'Block failed', 'error');
+                  }
+                },
+                destructive: true,
+              },
+            ]),
           ]}
+        />
+      )}
+
+      {/* Delete confirmation modal — only own posts. Two-step so a
+          stray tap doesn't nuke a post. */}
+      {deleteConfirmOpen && currentHandle && deviceId && (
+        <ConfirmDeletePostModal
+          onCancel={() => setDeleteConfirmOpen(false)}
+          onConfirm={async () => {
+            setDeleteConfirmOpen(false);
+            const r = await apiDeleteMyPost({
+              postId: post.id,
+              handle: currentHandle,
+              deviceId,
+            });
+            if (r.ok) {
+              if (onPostRemoved) {
+                onPostRemoved(post.id);
+              } else {
+                setLocalHidden(true);
+              }
+              showToast('Post deleted', 'success');
+            } else {
+              showToast(r.reason || 'Delete failed', 'error');
+            }
+          }}
         />
       )}
 
@@ -5736,6 +5907,31 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap 
         />
       )}
     </div>
+  );
+}
+
+// ---------- ConfirmDeletePostModal ----------
+// Two-step confirm before nuking your own post. Shown when the user
+// picks "Delete post" from the 3-dot menu on their own post card.
+function ConfirmDeletePostModal({ onCancel, onConfirm }: {
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  return createPortal(
+    <div style={S.confirmBackdrop} onClick={onCancel}>
+      <div style={S.confirmCard} onClick={(e) => e.stopPropagation()}>
+        <div style={S.confirmTitle}>Delete this post?</div>
+        <div style={S.confirmBody}>
+          The photo, caption, and all likes will be permanently removed.
+          This can't be undone.
+        </div>
+        <div style={S.confirmActions}>
+          <button onClick={onCancel} style={S.confirmCancelBtn}>Cancel</button>
+          <button onClick={onConfirm} style={S.confirmDeleteBtn}>Delete</button>
+        </div>
+      </div>
+    </div>,
+    document.body
   );
 }
 
@@ -11746,6 +11942,99 @@ const S: Record<string, React.CSSProperties> = {
     letterSpacing: '0.02em',
     cursor: 'pointer',
     fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  // Inline Follow button on feed cards — smaller than the profile-page
+  // version. Sits between the handle column and the 3-dot menu. IG-style
+  // gray rounded rect.
+  postFollowBtn: {
+    padding: '5px 12px',
+    marginRight: 4,
+    backgroundColor: '#1f1f1f',
+    color: '#F0EBE0',
+    border: '1px solid #333',
+    borderRadius: 8,
+    fontSize: 12,
+    fontWeight: 700,
+    letterSpacing: '0.02em',
+    cursor: 'pointer',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    whiteSpace: 'nowrap' as const,
+  },
+  postFollowBtnFollowing: {
+    padding: '5px 12px',
+    marginRight: 4,
+    backgroundColor: 'transparent',
+    color: '#888',
+    border: '1px solid #333',
+    borderRadius: 8,
+    fontSize: 12,
+    fontWeight: 600,
+    letterSpacing: '0.02em',
+    cursor: 'pointer',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    whiteSpace: 'nowrap' as const,
+  },
+  // Confirm-delete-post modal — centered card, not a sheet. Two buttons.
+  confirmBackdrop: {
+    position: 'fixed' as const,
+    inset: 0,
+    background: 'rgba(0,0,0,0.85)',
+    zIndex: 10001,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 24,
+  },
+  confirmCard: {
+    width: '100%',
+    maxWidth: 360,
+    background: '#0a0a0a',
+    border: '1px solid #222',
+    borderRadius: 14,
+    padding: 20,
+    display: 'flex',
+    flexDirection: 'column' as const,
+    gap: 12,
+  },
+  confirmTitle: {
+    color: '#FFFFFF',
+    fontSize: 17,
+    fontWeight: 700 as const,
+    textAlign: 'center' as const,
+  },
+  confirmBody: {
+    color: '#aaa',
+    fontSize: 13,
+    lineHeight: 1.45,
+    textAlign: 'center' as const,
+    padding: '0 4px',
+  },
+  confirmActions: {
+    display: 'flex',
+    gap: 10,
+    marginTop: 8,
+  },
+  confirmCancelBtn: {
+    flex: 1,
+    padding: '10px 0',
+    background: 'transparent',
+    color: '#FFFFFF',
+    border: '1px solid #333',
+    borderRadius: 8,
+    fontSize: 14,
+    fontWeight: 600 as const,
+    cursor: 'pointer',
+  },
+  confirmDeleteBtn: {
+    flex: 1,
+    padding: '10px 0',
+    background: '#FF3B5C',
+    color: '#FFFFFF',
+    border: 'none',
+    borderRadius: 8,
+    fontSize: 14,
+    fontWeight: 700 as const,
+    cursor: 'pointer',
   },
   // ---- Follow / For You segmented toggle at top of feed ----
   // Two flush buttons under the brand header. Active state gets bold
