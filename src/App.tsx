@@ -453,18 +453,18 @@ function invalidateHiddenSet() {
 
 // ---- Hidden posts (client-side only) ----
 // Personal "I don't want to see this again" hides, distinct from
-// block-handle (which hides ALL of a user's content). Stored locally in
-// Capacitor Preferences and never sent to the server — the user's
-// hides are their own business and don't affect other viewers.
-// Reinstall = wipe. That's acceptable.
+// block-handle (which hides ALL of a user's content). Stored locally
+// via readPersistent/writePersistent (Capacitor Preferences on native,
+// localStorage on web) and never sent to the server — the user's hides
+// are their own business and don't affect other viewers. Reinstall =
+// wipe. That's acceptable.
 const HIDDEN_POSTS_KEY = 'sinister.hiddenPosts.v1';
 let _hiddenPostsCache: Set<string> | null = null;
 
 async function loadHiddenPosts(): Promise<Set<string>> {
   if (_hiddenPostsCache) return _hiddenPostsCache;
   try {
-    const { Preferences } = await import('@capacitor/preferences');
-    const { value } = await Preferences.get({ key: HIDDEN_POSTS_KEY });
+    const value = await readPersistent(HIDDEN_POSTS_KEY);
     const arr = value ? JSON.parse(value) : [];
     _hiddenPostsCache = new Set(Array.isArray(arr) ? arr : []);
   } catch {
@@ -477,8 +477,7 @@ async function hidePost(postId: string): Promise<void> {
   const set = await loadHiddenPosts();
   set.add(postId);
   try {
-    const { Preferences } = await import('@capacitor/preferences');
-    await Preferences.set({ key: HIDDEN_POSTS_KEY, value: JSON.stringify([...set]) });
+    await writePersistent(HIDDEN_POSTS_KEY, JSON.stringify([...set]));
   } catch {
     // Best effort — set is still updated in memory.
   }
@@ -7671,7 +7670,7 @@ function ListView({ sites, currentLocation, onSelectSite, onBack }: {
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Search by title, state, or category…"
-            style={S.searchInput}
+            style={S.localeSearchInput}
           />
           {query && (
             <button
@@ -9550,7 +9549,7 @@ function CategoryView({ label, color, sites, currentLocation, onSelectSite, onSu
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder="Search by name, city, or keyword..."
-                style={S.searchInput}
+                style={S.localeSearchInput}
               />
               {query && (
                 <button
@@ -13954,7 +13953,7 @@ const S: Record<string, React.CSSProperties> = {
     display: 'flex',
     alignItems: 'center',
   },
-  searchInput: {
+  localeSearchInput: {
     flex: 1,
     backgroundColor: 'rgba(0,0,0,0.6)',
     color: BONE,
@@ -13987,18 +13986,6 @@ const S: Record<string, React.CSSProperties> = {
   siteCardDesc: { fontSize: 13, lineHeight: 1.5, color: '#BBB' },
   siteCardDistance: { fontSize: 11, marginTop: 12, fontWeight: 700, letterSpacing: '0.15em' },
 
-  emptyState: {
-    margin: '40px 32px',
-    padding: '32px 20px',
-    textAlign: 'center',
-    color: GRAY_MID,
-    fontSize: 13,
-    letterSpacing: '0.05em',
-    border: `1px dashed ${GRAY_MID}`,
-    borderRadius: 14,
-    position: 'relative',
-    zIndex: 1,
-  },
   emptyStateSub: { marginTop: 10, fontSize: 11, color: GRAY_MID },
 
   heroImage: { width: 'calc(100% - 32px)', height: 260, backgroundSize: 'cover', backgroundPosition: 'center', margin: '14px 16px', borderRadius: 18, boxSizing: 'border-box', position: 'relative', zIndex: 1 },
