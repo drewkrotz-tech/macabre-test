@@ -5884,6 +5884,17 @@ function ExposurePostEditor({ photoFile, onBack, onNext }: {
       l.id === selectedId ? { ...l, rotation: (l.rotation + delta) % 360 } : l
     ));
   };
+  // Re-skin the currently selected text layer with a different font face.
+  // No-op if the selection is a sticker or nothing is selected. Also nudges
+  // the "default for next text layer" so the user's last font choice
+  // persists when they create another.
+  const setLayerFont = (fontId: FontId) => {
+    if (!selectedId) return;
+    setLayers((prev) => prev.map((l) =>
+      l.id === selectedId && l.kind === 'text' ? { ...l, fontId } : l
+    ));
+    setSelectedFont(fontId);
+  };
 
   const onConfirm = async () => {
     if (baking) return;
@@ -6043,6 +6054,67 @@ function ExposurePostEditor({ photoFile, onBack, onNext }: {
           );
         })}
       </div>
+
+      {/* Font picker for the selected TEXT layer. Hidden when nothing is
+          selected OR when the selection is a sticker. Sits above the
+          layer controls; tap any font cell to re-skin the layer live. */}
+      {(() => {
+        if (!selectedId) return null;
+        const sel = layers.find((l) => l.id === selectedId);
+        if (!sel || sel.kind !== 'text') return null;
+        const currentFontId = sel.fontId;
+        return (
+          <div
+            style={{
+              position: 'absolute',
+              left: 0,
+              right: 0,
+              bottom: 130,
+              display: 'flex',
+              gap: 8,
+              padding: '0 12px',
+              overflowX: 'auto',
+              WebkitOverflowScrolling: 'touch',
+              zIndex: 10,
+            }}
+          >
+            {EDITOR_FONTS.map((f) => {
+              const isSel = currentFontId === f.id;
+              return (
+                <button
+                  key={f.id}
+                  onClick={() => setLayerFont(f.id)}
+                  style={{
+                    flex: '0 0 auto',
+                    minWidth: 56,
+                    padding: '4px 10px',
+                    background: isSel ? 'rgba(255,59,92,0.18)' : 'rgba(0,0,0,0.65)',
+                    border: isSel ? '2px solid #FF3B5C' : '1px solid rgba(255,255,255,0.15)',
+                    borderRadius: 8,
+                    color: '#FFF',
+                    fontFamily: f.cssStack,
+                    fontWeight: f.weight,
+                    fontSize: 18,
+                    lineHeight: 1.1,
+                    cursor: 'pointer',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    alignItems: 'center',
+                    backdropFilter: 'blur(8px)',
+                    WebkitBackdropFilter: 'blur(8px)',
+                  }}
+                  aria-label={`Set font to ${f.name}`}
+                >
+                  <span>Aa</span>
+                  <span style={{ fontFamily: 'system-ui, -apple-system, sans-serif', fontSize: 8, fontWeight: 400, color: '#BBB', marginTop: 1 }}>
+                    {f.name}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        );
+      })()}
 
       {selectedId && (
         <div style={S.editorLayerControls}>
