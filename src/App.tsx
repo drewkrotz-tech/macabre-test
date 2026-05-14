@@ -5405,38 +5405,36 @@ function ExposureBottomBar({ active, onSelect }: {
 // pipeline (Sharp resize + EXIF strip + R2 upload) doesn't change.
 
 // ---- Sticker library ----
-// OpenMoji horror stickers via jsDelivr CDN. Licensed CC BY-SA 4.0 — credit
-// in the app About page is the only obligation. PNG format at 618x618px,
-// transparent background. We use 14 horror-relevant emoji codepoints
-// chosen for theme + recognizability.
+// OpenMoji horror stickers via jsDelivr's GitHub CDN. Licensed CC BY-SA 4.0
+// — credit in the app About page is the only obligation. SVG format,
+// crisp at any size, ~5-15KB each. The /gh/ jsDelivr path serves files
+// from the GitHub repo directly (the /npm/ path doesn't include the PNG
+// build artifacts — only the source SVGs are published to npm).
 //
 // Codepoints are uppercase hex with hyphens for ZWJ-joined sequences.
-// The CDN returns 404 for ZWJ joiners on some codepoints — if a sticker
-// fails to load at bake time, it's silently skipped from the output.
 type HorrorSticker = {
   id: string;
   name: string;
-  // Full URL to the PNG. CORS is permitted from jsDelivr.
   url: string;
 };
 
-const OPENMOJI_BASE = 'https://cdn.jsdelivr.net/npm/openmoji@15.1.0/color/618x618';
+const OPENMOJI_BASE = 'https://cdn.jsdelivr.net/gh/hfg-gmuend/openmoji@15.1.0/color/svg';
 
 const HORROR_STICKERS: HorrorSticker[] = [
-  { id: 'skull',     name: 'Skull',           url: `${OPENMOJI_BASE}/1F480.png` },
-  { id: 'skullbones',name: 'Skull & bones',   url: `${OPENMOJI_BASE}/2620.png` },
-  { id: 'ghost',     name: 'Ghost',           url: `${OPENMOJI_BASE}/1F47B.png` },
-  { id: 'vampire',   name: 'Vampire',         url: `${OPENMOJI_BASE}/1F9DB.png` },
-  { id: 'zombie',    name: 'Zombie',          url: `${OPENMOJI_BASE}/1F9DF.png` },
-  { id: 'pumpkin',   name: 'Jack-o-lantern',  url: `${OPENMOJI_BASE}/1F383.png` },
-  { id: 'bat',       name: 'Bat',             url: `${OPENMOJI_BASE}/1F987.png` },
-  { id: 'spider',    name: 'Spider',          url: `${OPENMOJI_BASE}/1F577.png` },
-  { id: 'web',       name: 'Spider web',      url: `${OPENMOJI_BASE}/1F578.png` },
-  { id: 'crystalball',name: 'Crystal ball',   url: `${OPENMOJI_BASE}/1F52E.png` },
-  { id: 'candle',    name: 'Candle',          url: `${OPENMOJI_BASE}/1F56F.png` },
-  { id: 'coffin',    name: 'Coffin',          url: `${OPENMOJI_BASE}/26B0.png` },
-  { id: 'fire',      name: 'Fire',            url: `${OPENMOJI_BASE}/1F525.png` },
-  { id: 'eye',       name: 'Eye',             url: `${OPENMOJI_BASE}/1F441.png` },
+  { id: 'skull',     name: 'Skull',           url: `${OPENMOJI_BASE}/1F480.svg` },
+  { id: 'skullbones',name: 'Skull & bones',   url: `${OPENMOJI_BASE}/2620.svg` },
+  { id: 'ghost',     name: 'Ghost',           url: `${OPENMOJI_BASE}/1F47B.svg` },
+  { id: 'vampire',   name: 'Vampire',         url: `${OPENMOJI_BASE}/1F9DB.svg` },
+  { id: 'zombie',    name: 'Zombie',          url: `${OPENMOJI_BASE}/1F9DF.svg` },
+  { id: 'pumpkin',   name: 'Jack-o-lantern',  url: `${OPENMOJI_BASE}/1F383.svg` },
+  { id: 'bat',       name: 'Bat',             url: `${OPENMOJI_BASE}/1F987.svg` },
+  { id: 'spider',    name: 'Spider',          url: `${OPENMOJI_BASE}/1F577.svg` },
+  { id: 'web',       name: 'Spider web',      url: `${OPENMOJI_BASE}/1F578.svg` },
+  { id: 'crystalball',name: 'Crystal ball',   url: `${OPENMOJI_BASE}/1F52E.svg` },
+  { id: 'candle',    name: 'Candle',          url: `${OPENMOJI_BASE}/1F56F.svg` },
+  { id: 'coffin',    name: 'Coffin',          url: `${OPENMOJI_BASE}/26B0.svg` },
+  { id: 'fire',      name: 'Fire',            url: `${OPENMOJI_BASE}/1F525.svg` },
+  { id: 'eye',       name: 'Eye',             url: `${OPENMOJI_BASE}/1F441.svg` },
 ];
 
 // Layers placed on the photo. Position is normalized (0-1) so layers
