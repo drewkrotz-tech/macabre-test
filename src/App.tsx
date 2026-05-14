@@ -1739,7 +1739,7 @@ const EMBERS: { left: number; size: number; duration: number; delay: number; swa
 //   - Brightness swing: 1.0 -> 1.18 (was 1.35)
 //   - Flicker opacity range tightened 0.78-0.92 (was 0.7-1.0)
 function buildStyleCss() {
-  let css = `@import url('https://fonts.bunny.net/css?family=jolly-lodger:400');\n`;
+  let css = `@import url('https://fonts.bunny.net/css?family=jolly-lodger:400|creepster:400|special-elite:400|permanent-marker:400|oswald:400,700|share-tech-mono:400');\n`;
 
   CATEGORIES.forEach((cat) => {
     const T = cat.cascadeOrder;
@@ -5511,6 +5511,25 @@ type StickerLayer = {
   rotation: number;    // degrees
 };
 
+// Editor text fonts — 6 horror-themed faces. The id is what's persisted
+// on the TextLayer; the cssStack is what gets passed to ctx.font during
+// bake AND to fontFamily in the live preview, so the user sees exactly
+// what they'll get in the final JPEG. Bunny.net imports are issued once
+// in buildStyleCss(); system fallbacks cover the cases where the user is
+// offline mid-bake.
+type FontId = 'jollyLodger' | 'creepster' | 'specialElite' | 'permanentMarker' | 'oswald' | 'shareTechMono';
+const EDITOR_FONTS: { id: FontId; name: string; cssStack: string; weight: number }[] = [
+  { id: 'jollyLodger',     name: 'Jolly Lodger', cssStack: '"Jolly Lodger", serif',                       weight: 700 },
+  { id: 'creepster',       name: 'Creepster',    cssStack: '"Creepster", "Jolly Lodger", serif',          weight: 400 },
+  { id: 'specialElite',    name: 'Typewriter',   cssStack: '"Special Elite", "Courier New", monospace',   weight: 400 },
+  { id: 'permanentMarker', name: 'Marker',       cssStack: '"Permanent Marker", "Jolly Lodger", cursive', weight: 400 },
+  { id: 'oswald',          name: 'Display',      cssStack: '"Oswald", "Impact", system-ui, sans-serif',   weight: 700 },
+  { id: 'shareTechMono',   name: 'Mono',         cssStack: '"Share Tech Mono", "Courier New", monospace', weight: 400 },
+];
+function fontFor(id: FontId): { cssStack: string; weight: number } {
+  return EDITOR_FONTS.find((f) => f.id === id) || EDITOR_FONTS[0];
+}
+
 type TextLayer = {
   kind: 'text';
   id: string;
@@ -5519,6 +5538,7 @@ type TextLayer = {
   y: number;
   scale: number;       // font scaling
   rotation: number;
+  fontId: FontId;      // which face from EDITOR_FONTS (defaults to jollyLodger for back-compat)
 };
 
 type EditorLayer = StickerLayer | TextLayer;
@@ -5530,16 +5550,23 @@ function makeLayerId() {
 // Filter presets — applied via canvas `filter` property at bake time
 // and via the equivalent CSS filter on the live preview. Keys match the
 // FILTER_PRESETS array entries.
-type FilterId = 'none' | 'foundFootage' | 'polaroid' | 'nightVision' | 'vhs' | 'crimeScene' | 'cursed';
+type FilterId = 'none' | 'foundFootage' | 'polaroid' | 'nightVision' | 'vhs' | 'crimeScene' | 'cursed' | 'asylum' | 'bloodstain' | 'ouija' | 'static' | 'coldCase' | 'witness';
 
 const FILTER_PRESETS: { id: FilterId; name: string; css: string }[] = [
-  { id: 'none',         name: 'Original',     css: 'none' },
-  { id: 'foundFootage', name: 'Found Footage',css: 'grayscale(0.4) sepia(0.25) hue-rotate(60deg) contrast(1.15) brightness(0.9)' },
-  { id: 'polaroid',     name: 'Polaroid',     css: 'sepia(0.6) contrast(0.95) brightness(1.05) saturate(0.85)' },
-  { id: 'nightVision',  name: 'Night Vision', css: 'grayscale(1) sepia(1) hue-rotate(60deg) saturate(8) brightness(0.8) contrast(1.4)' },
-  { id: 'vhs',          name: 'VHS',          css: 'contrast(1.2) saturate(1.4) brightness(0.95) hue-rotate(-5deg)' },
-  { id: 'crimeScene',   name: 'Crime Scene',  css: 'contrast(1.6) brightness(0.85) saturate(0.3)' },
-  { id: 'cursed',       name: 'Cursed',       css: 'contrast(1.4) saturate(1.6) hue-rotate(-15deg) brightness(0.88)' },
+  { id: 'none',         name: 'Original',      css: 'none' },
+  { id: 'foundFootage', name: 'Found Footage', css: 'grayscale(0.4) sepia(0.25) hue-rotate(60deg) contrast(1.15) brightness(0.9)' },
+  { id: 'polaroid',     name: 'Polaroid',      css: 'sepia(0.6) contrast(0.95) brightness(1.05) saturate(0.85)' },
+  { id: 'nightVision',  name: 'Night Vision',  css: 'grayscale(1) sepia(1) hue-rotate(60deg) saturate(8) brightness(0.8) contrast(1.4)' },
+  { id: 'vhs',          name: 'VHS',           css: 'contrast(1.2) saturate(1.4) brightness(0.95) hue-rotate(-5deg)' },
+  { id: 'crimeScene',   name: 'Crime Scene',   css: 'contrast(1.6) brightness(0.85) saturate(0.3)' },
+  { id: 'cursed',       name: 'Cursed',        css: 'contrast(1.4) saturate(1.6) hue-rotate(-15deg) brightness(0.88)' },
+  // New filters added in the second editor pass.
+  { id: 'asylum',       name: 'Asylum',        css: 'grayscale(0.7) sepia(0.2) hue-rotate(180deg) saturate(1.2) brightness(0.92) contrast(1.15)' },
+  { id: 'bloodstain',   name: 'Bloodstain',    css: 'saturate(2) hue-rotate(-25deg) contrast(1.35) brightness(0.9)' },
+  { id: 'ouija',        name: 'Ouija',         css: 'sepia(0.85) saturate(0.9) brightness(0.95) contrast(1.2) hue-rotate(-10deg)' },
+  { id: 'static',       name: 'Static',        css: 'grayscale(1) contrast(1.5) brightness(1.1)' },
+  { id: 'coldCase',     name: 'Cold Case',     css: 'saturate(0.5) contrast(0.95) brightness(1.05) sepia(0.15)' },
+  { id: 'witness',      name: 'Witness',       css: 'blur(0.4px) contrast(1.1) brightness(0.93) saturate(1.1)' },
 ];
 
 function filterCssFor(id: FilterId): string {
@@ -5708,7 +5735,8 @@ async function bakePostImage(opts: {
       }
     } else if (layer.kind === 'text') {
       const fontSize = Math.round(stickerBase * 0.45 * layer.scale);
-      ctx.font = `700 ${fontSize}px "Jolly Lodger", serif`;
+      const font = fontFor(layer.fontId);
+      ctx.font = `${font.weight} ${fontSize}px ${font.cssStack}`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       ctx.shadowColor = '#DC2626';
@@ -5748,7 +5776,7 @@ function ExposurePostEditor({ photoFile, onBack, onNext }: {
   onBack: () => void;
   onNext: (editedFile: File) => void;
 }) {
-  const [filmstripOn, setFilmstripOn] = useState(true);
+  const [filmstripOn, setFilmstripOn] = useState(false);
   const [filterId, setFilterId] = useState<FilterId>('none');
   const [crop, setCrop] = useState<CropRect>(FULL_CROP);
   const [rotation, setRotation] = useState<0 | 90 | 180 | 270>(0);
@@ -5759,6 +5787,11 @@ function ExposurePostEditor({ photoFile, onBack, onNext }: {
   // tray 'stickers' / 'text' = bottom drawer
   const [tray, setTray] = useState<'stickers' | 'text' | 'crop' | 'filter' | null>(null);
   const [textInput, setTextInput] = useState('');
+  // Selected font for the next text layer added. Once a layer is created, it
+  // carries its own fontId so changing this doesn't retroactively affect
+  // existing text layers — to change one of those, the user tags it as
+  // selected and picks a new font in the tray header.
+  const [selectedFont, setSelectedFont] = useState<FontId>('jollyLodger');
   const [baking, setBaking] = useState(false);
 
   const previewRef = useRef<HTMLDivElement | null>(null);
@@ -5778,7 +5811,7 @@ function ExposurePostEditor({ photoFile, onBack, onNext }: {
     if (!trimmed) return;
     setLayers((prev) => [
       ...prev,
-      { kind: 'text', id: makeLayerId(), text: trimmed, x: 0.5, y: 0.5, scale: 1, rotation: 0 },
+      { kind: 'text', id: makeLayerId(), text: trimmed, x: 0.5, y: 0.5, scale: 1, rotation: 0, fontId: selectedFont },
     ]);
     setTextInput('');
     setTray(null);
@@ -5971,8 +6004,8 @@ function ExposurePostEditor({ photoFile, onBack, onNext }: {
               key={layer.id}
               style={{
                 ...wrapStyle,
-                fontFamily: 'Jolly Lodger, serif',
-                fontWeight: 700,
+                fontFamily: fontFor(layer.fontId).cssStack,
+                fontWeight: fontFor(layer.fontId).weight,
                 fontSize: 36,
                 color: '#FFFFFF',
                 textShadow: '2px 2px 0 #DC2626, 0 0 6px rgba(220,38,38,0.6)',
@@ -6057,13 +6090,57 @@ function ExposurePostEditor({ photoFile, onBack, onNext }: {
             <span style={S.editorTrayTitle}>Add text</span>
             <button onClick={() => setTray(null)} style={S.editorTrayClose}>✕</button>
           </div>
+          {/* Font picker — horizontal scroll of 6 fonts, each rendering "Aa"
+              in its own face so the user previews exactly what they'll get. */}
+          <div
+            style={{
+              display: 'flex',
+              gap: 8,
+              padding: '8px 12px 4px',
+              overflowX: 'auto',
+              WebkitOverflowScrolling: 'touch',
+            }}
+          >
+            {EDITOR_FONTS.map((f) => {
+              const isSel = selectedFont === f.id;
+              return (
+                <button
+                  key={f.id}
+                  onClick={() => setSelectedFont(f.id)}
+                  style={{
+                    flex: '0 0 auto',
+                    minWidth: 64,
+                    padding: '6px 12px',
+                    background: isSel ? 'rgba(255,59,92,0.15)' : 'rgba(255,255,255,0.05)',
+                    border: isSel ? '2px solid #FF3B5C' : '1px solid rgba(255,255,255,0.1)',
+                    borderRadius: 8,
+                    color: '#FFF',
+                    fontFamily: f.cssStack,
+                    fontWeight: f.weight,
+                    fontSize: 20,
+                    lineHeight: 1.2,
+                    cursor: 'pointer',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    alignItems: 'center',
+                  }}
+                  aria-label={f.name}
+                >
+                  <span>Aa</span>
+                  <span style={{ fontFamily: 'system-ui, -apple-system, sans-serif', fontSize: 9, fontWeight: 400, color: '#999', marginTop: 2 }}>
+                    {f.name}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
           <div style={{ padding: 12, display: 'flex', gap: 8 }}>
             <input
               autoFocus
               value={textInput}
               onChange={(e) => setTextInput(e.target.value.slice(0, 40))}
               placeholder="Type text..."
-              style={S.editorTextInput}
+              style={{ ...S.editorTextInput, fontFamily: fontFor(selectedFont).cssStack, fontWeight: fontFor(selectedFont).weight }}
               onKeyDown={(e) => { if (e.key === 'Enter') addText(); }}
             />
             <button onClick={addText} style={S.editorTextAddBtn} disabled={!textInput.trim()}>
