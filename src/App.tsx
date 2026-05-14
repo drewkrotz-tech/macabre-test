@@ -15003,13 +15003,16 @@ const S: Record<string, React.CSSProperties> = {
   },
   // The sliding panel itself. Black background, rounded top corners,
   // takes 78% of viewport height (per IG). Transform is set inline on
-  // the element so we can drive the slide animation.
+  // the element so we can drive the slide animation. Background is
+  // Apple's secondary-surface gray (#1c1c1e), matching Instagram's
+  // comment sheet exactly — gives the sheet clear elevation above the
+  // black post area behind it.
   commentSheetPanel: {
     position: 'relative' as const,
     width: '100%',
     maxWidth: 600,
     height: '78vh',
-    backgroundColor: '#000000',
+    backgroundColor: '#1c1c1e',
     borderTopLeftRadius: 14,
     borderTopRightRadius: 14,
     display: 'flex',
@@ -15043,7 +15046,7 @@ const S: Record<string, React.CSSProperties> = {
     alignItems: 'center',
     justifyContent: 'space-between',
     padding: '6px 14px 10px 14px',
-    borderBottom: '1px solid #1a1a1a',
+    borderBottom: '1px solid #2a2a2a',
   },
   commentSheetTitle: {
     color: '#FFFFFF',
@@ -15156,7 +15159,7 @@ const S: Record<string, React.CSSProperties> = {
     justifyContent: 'space-around',
     alignItems: 'center',
     padding: '10px 8px 8px 8px',
-    borderTop: '1px solid #1a1a1a',
+    borderTop: '1px solid #2a2a2a',
   },
   commentSheetEmojiBtn: {
     backgroundColor: 'transparent',
@@ -15168,15 +15171,16 @@ const S: Record<string, React.CSSProperties> = {
   },
   // Composer row at the bottom: avatar + input + Post button.
   // Uses safe-area-inset-bottom so it doesn't collide with the iOS
-  // home indicator.
+  // home indicator. Background inherits from the panel (#1c1c1e) so
+  // the composer reads as part of the same surface, not a darker strip.
   commentSheetComposer: {
     display: 'flex',
     alignItems: 'center',
     gap: 10,
     padding: '8px 14px 8px 14px',
     paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 8px)' as any,
-    borderTop: '1px solid #1a1a1a',
-    backgroundColor: '#000000',
+    borderTop: '1px solid #2a2a2a',
+    backgroundColor: '#1c1c1e',
   },
   commentSheetComposerAvatar: {
     width: 28,
@@ -15890,7 +15894,7 @@ const S: Record<string, React.CSSProperties> = {
   mapBackBtn: {
     position: 'absolute' as const,
     left: 12,
-    bottom: 12,
+    bottom: 16,
     zIndex: 2,
     width: 36,
     height: 36,
@@ -16291,7 +16295,7 @@ const S: Record<string, React.CSSProperties> = {
     flexWrap: 'wrap' as const,
     justifyContent: 'center' as const,
     gap: 6,
-    padding: '8px 12px 4px 24px',
+    padding: '8px 12px 4px 28px',
   },
   radiusChip: {
     background: 'transparent',
