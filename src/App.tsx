@@ -708,6 +708,16 @@ type SocialPost = {
   // the feed can render the count without joining comments.json. Server
   // may omit it on older records, so the post card defaults to 0.
   commentCount?: number;
+  // Cached repost count — like commentCount, denormalized on the post
+  // so the feed render doesn't have to join reposts.json.
+  repostCount?: number;
+  // When this feed entry is a REPOST rather than an original post, the
+  // server stamps these. repostedBy is the handle of the user who
+  // reposted; repostedAt is when. Null/undefined on original entries.
+  // Used by the card to render the "Reposted by X" header above the
+  // post content.
+  repostedBy?: string | null;
+  repostedAt?: string | null;
 };
 
 // One comment on a post. Returned by GET /comments/post/:postId.
@@ -869,6 +879,36 @@ async function apiLikeStatus(args: { postId: string; handle: string | null }): P
     const data = await res.json();
     return { liked: !!data?.liked, count: typeof data?.count === 'number' ? data.count : 0 };
   } catch { return { liked: false, count: 0 }; }
+}
+
+// ---- Repost API ----
+// Mirrors the like API. POST toggles, GET returns current status. The
+// server prevents reposting your own post and verifies handle ownership.
+
+async function apiToggleRepost(args: { postId: string; handle: string; deviceId: string }): Promise<{ ok: boolean; reposted?: boolean; count?: number; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/posts/repost/${encodeURIComponent(args.postId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ handle: args.handle, deviceId: args.deviceId }),
+    });
+    const data = await res.json();
+    if (!res.ok) return { ok: false, reason: data?.error || `HTTP ${res.status}` };
+    return { ok: true, reposted: !!data?.reposted, count: typeof data?.count === 'number' ? data.count : undefined };
+  } catch (e: any) {
+    return { ok: false, reason: e?.message || 'network error' };
+  }
+}
+
+async function apiRepostStatus(args: { postId: string; handle: string | null }): Promise<{ reposted: boolean; count: number }> {
+  try {
+    const url = args.handle
+      ? `${API_BASE}/posts/repost-status/${encodeURIComponent(args.postId)}?handle=${encodeURIComponent(args.handle)}`
+      : `${API_BASE}/posts/repost-status/${encodeURIComponent(args.postId)}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    return { reposted: !!data?.reposted, count: typeof data?.count === 'number' ? data.count : 0 };
+  } catch { return { reposted: false, count: 0 }; }
 }
 
 // ---- Comment API ----
@@ -6981,6 +7021,26 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap,
   // Lightbox state — tapping the photo opens a full-screen viewer with
   // pinch-zoom, pan, and swipe-down dismiss. See PhotoLightbox above.
   const [lightboxOpen, setLightboxOpen] = useState(false);
+  // Repost state — server-backed. Optimistic toggle on tap, rollback
+  // on failure. Status is fetched on mount so reloads show the correct
+  // filled/empty icon for the current user.
+  const [reposted, setReposted] = useState(false);
+  const [repostCount, setRepostCount] = useState(post.repostCount || 0);
+  const [repostBusy, setRepostBusy] = useState(false);
+
+  // Load this user's current repost status when the card mounts. We
+  // don't block render on it — the icon starts empty and fills in if
+  // the server says we've reposted.
+  useEffect(() => {
+    if (!currentHandle) return;
+    let cancelled = false;
+    apiRepostStatus({ postId: post.id, handle: currentHandle }).then((s) => {
+      if (cancelled) return;
+      setReposted(s.reposted);
+      if (typeof s.count === 'number') setRepostCount(s.count);
+    });
+    return () => { cancelled = true; };
+  }, [post.id, currentHandle]);
 
   // Follow state — only relevant for other people's posts. Inline
   // button matches IG: "Follow" → "Following" after tap. Server is the
@@ -7079,6 +7139,24 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap,
 
   return (
     <div style={S.postCard}>
+      {/* "Reposted by X" banner — only renders when this feed entry is a
+          repost (server stamps repostedBy on the entry). Tapping the
+          handle opens that user's profile. Matches IG's small grey
+          line that sits above the original post card. */}
+      {post.repostedBy && (
+        <div style={S.repostBanner}>
+          {/* Repost icon, smaller — visual cue this entry was rebroadcast. */}
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#8a8a8a" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+            <polyline points="17 1 21 5 17 9" />
+            <path d="M3 11V9a4 4 0 0 1 4-4h14" />
+            <polyline points="7 23 3 19 7 15" />
+            <path d="M21 13v2a4 4 0 0 1-4 4H3" />
+          </svg>
+          <span style={S.repostBannerText}>
+            Reposted by <span style={S.repostBannerHandle}>{post.repostedBy}</span>
+          </span>
+        </div>
+      )}
       {/* Top row: avatar | handle · time | follow | menu */}
       <div style={S.postHeader}>
         <button onClick={onHandleTap} style={S.postAvatarBtn} aria-label={`${post.handle} profile`}>
@@ -7178,6 +7256,57 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap,
           </svg>
           {commentCount > 0 && (
             <span style={S.postIconBtnCount}>{commentCount}</span>
+          )}
+        </button>
+        <button
+          onClick={async () => {
+            if (!currentHandle || !deviceId) {
+              showToast('Sign in to repost', 'error');
+              return;
+            }
+            if (repostBusy) return;
+            // Optimistic toggle so the icon flips instantly. Roll back
+            // if the server rejects.
+            const prev = reposted;
+            const prevCount = repostCount;
+            setReposted(!prev);
+            setRepostCount(prev ? Math.max(0, prevCount - 1) : prevCount + 1);
+            setRepostBusy(true);
+            const result = await apiToggleRepost({
+              postId: post.id, handle: currentHandle, deviceId,
+            });
+            setRepostBusy(false);
+            if (!result.ok) {
+              // Rollback. Show specific message if the server explained why
+              // (e.g. can't repost your own post).
+              setReposted(prev);
+              setRepostCount(prevCount);
+              showToast(result.reason || 'Repost failed', 'error');
+              return;
+            }
+            // Sync to server's authoritative state.
+            if (typeof result.reposted === 'boolean') setReposted(result.reposted);
+            if (typeof result.count === 'number') setRepostCount(result.count);
+            showToast(result.reposted ? 'Reposted' : 'Removed from your reposts', 'success');
+          }}
+          style={S.postIconBtn}
+          aria-label={reposted ? 'Remove repost' : 'Repost'}
+        >
+          {/* Repost icon — two arrows forming a cycle, IG-style. Fills
+              green when reposted for the same visual feedback as the heart. */}
+          <svg
+            width="26" height="26" viewBox="0 0 24 24"
+            fill="none"
+            stroke={reposted ? '#3DDB85' : '#F0EBE0'}
+            strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"
+          >
+            <polyline points="17 1 21 5 17 9" />
+            <path d="M3 11V9a4 4 0 0 1 4-4h14" />
+            <polyline points="7 23 3 19 7 15" />
+            <path d="M21 13v2a4 4 0 0 1-4 4H3" />
+          </svg>
+          {repostCount > 0 && (
+            <span style={S.postIconBtnCount}>{repostCount}</span>
           )}
         </button>
         <button
@@ -9484,15 +9613,14 @@ function ListView({ sites, currentLocation, onSelectSite, onBack }: {
           ) : (
             <div style={S.listSitesWrap}>
               {categoryRows.map(({ cat, count }) => {
-                const color = CATEGORY_COLOR[cat.key];
                 return (
                   <button
                     key={cat.key}
-                    style={{ ...S.listCategoryRow, borderColor: `${color}55`, boxShadow: `0 0 10px ${color}22, inset 0 0 6px ${color}11` }}
+                    style={S.listCategoryRow}
                     onClick={() => { playSubDrop(); setLevel({ kind: 'states', category: cat.key }); }}
                   >
-                    <span style={{ ...S.listRowDot, background: color, boxShadow: `0 0 6px ${color}` }} />
-                    <span style={{ ...S.listRowTitle, color, textShadow: `0 0 8px ${color}88` }}>{cat.label}</span>
+                    <span style={S.listRowDot} />
+                    <span style={S.listRowTitle}>{cat.label}</span>
                     <span style={S.listRowCount}>{count} {count === 1 ? 'location' : 'locations'}</span>
                     <span style={S.listChevron}>›</span>
                   </button>
@@ -9511,14 +9639,13 @@ function ListView({ sites, currentLocation, onSelectSite, onBack }: {
           ) : (
             <div style={S.listSitesWrap}>
               {(() => {
-                const color = CATEGORY_COLOR[level.category];
                 return stateRows.map(({ state, count }) => (
                   <button
                     key={state}
                     style={S.listRow}
                     onClick={() => { playSubDrop(); setLevel({ kind: 'sites', category: level.category, state }); }}
                   >
-                    <span style={{ ...S.listRowDot, background: color, boxShadow: `0 0 6px ${color}` }} />
+                    <span style={S.listRowDot} />
                     <span style={S.listRowTitle}>{state}</span>
                     <span style={S.listRowCount}>{count} {count === 1 ? 'location' : 'locations'}</span>
                     <span style={S.listChevron}>›</span>
@@ -9542,14 +9669,13 @@ function ListView({ sites, currentLocation, onSelectSite, onBack }: {
           ) : (
             <div style={S.listSitesWrap}>
               {(() => {
-                const color = CATEGORY_COLOR[level.category];
                 return siteRows.map((site) => (
                   <button
                     key={site.id}
                     style={S.listRow}
                     onClick={() => { playSubDrop(); onSelectSite(site); }}
                   >
-                    <span style={{ ...S.listRowDot, background: color, boxShadow: `0 0 6px ${color}` }} />
+                    <span style={S.listRowDot} />
                     <span style={S.listRowTitle}>{site.title}</span>
                     <span style={S.listChevron}>›</span>
                   </button>
@@ -14656,6 +14782,25 @@ const S: Record<string, React.CSSProperties> = {
     overflow: 'visible',
     marginBottom: 20,
   },
+  // Small grey banner above the post card when this feed entry is a
+  // repost. Mirrors IG's "Reposted by X" line — quiet, ~12px, neutral
+  // grey to avoid stealing attention from the post itself.
+  repostBanner: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 6,
+    padding: '4px 12px 0',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  repostBannerText: {
+    fontSize: 12,
+    color: '#8a8a8a',
+    fontWeight: 500,
+  },
+  repostBannerHandle: {
+    color: '#F0EBE0',
+    fontWeight: 600,
+  },
   postHeader: {
     display: 'flex',
     alignItems: 'center',
@@ -16185,25 +16330,25 @@ const S: Record<string, React.CSSProperties> = {
   },
   listBackBtn: {
     background: 'transparent',
-    border: '1px solid #2a2a2a',
-    color: '#aaa',
+    border: '1px solid #333',
+    color: '#F0EBE0',
     padding: '8px 14px',
-    fontSize: 12,
-    fontWeight: 700,
-    letterSpacing: '0.15em',
+    fontSize: 13,
+    fontWeight: 600,
+    letterSpacing: 0,
     borderRadius: 8,
     cursor: 'pointer',
-    fontFamily: 'inherit',
-    textTransform: 'uppercase' as const,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
   },
   listSitesWrap: {
     display: 'flex',
     flexDirection: 'column' as const,
     gap: 6,
   },
-  // Category-row variant — slightly taller and uses a border/glow tint
-  // matched to the category color so the level-1 picker feels distinct
-  // from the state and site rows below it.
+  // Category-row variant — same monochrome treatment as listRow but
+  // slightly taller padding for level 1. The previous version tinted
+  // these by category color; per request the entire List View is now
+  // black/white only so category color no longer bleeds in.
   listCategoryRow: {
     display: 'flex',
     alignItems: 'center',
@@ -16212,10 +16357,10 @@ const S: Record<string, React.CSSProperties> = {
     boxSizing: 'border-box' as const,
     padding: '16px 14px',
     background: '#0d0d0d',
-    border: '1px solid',
+    border: '1px solid #1f1f1f',
     borderRadius: 10,
-    color: BONE,
-    fontFamily: 'inherit',
+    color: '#F0EBE0',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
     cursor: 'pointer',
     textAlign: 'left' as const,
   },
@@ -16229,8 +16374,8 @@ const S: Record<string, React.CSSProperties> = {
     background: '#0d0d0d',
     border: '1px solid #1f1f1f',
     borderRadius: 8,
-    color: BONE,
-    fontFamily: 'inherit',
+    color: '#F0EBE0',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
     cursor: 'pointer',
     textAlign: 'left' as const,
   },
@@ -16238,13 +16383,16 @@ const S: Record<string, React.CSSProperties> = {
     width: 8,
     height: 8,
     borderRadius: '50%',
+    backgroundColor: '#F0EBE0',
     flexShrink: 0,
   },
   listRowTitle: {
     flex: 1,
-    fontSize: 18,
-    fontWeight: 700,
-    letterSpacing: '0.04em',
+    fontSize: 16,
+    fontWeight: 600,
+    letterSpacing: 0,
+    color: '#F0EBE0',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
     overflow: 'hidden' as const,
     textOverflow: 'ellipsis' as const,
     whiteSpace: 'nowrap' as const,
@@ -16295,17 +16443,21 @@ const S: Record<string, React.CSSProperties> = {
     display: 'flex',
     alignItems: 'center',
   },
+  // List View search input — restyled to match DreadFeed's search bar
+  // (dark grey background, neutral border, system font, white text). The
+  // old blue-glow style felt out of place in the otherwise monochrome
+  // List View.
   localeSearchInput: {
     flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.6)',
-    color: BONE,
-    border: `1.5px solid ${BLUE}`,
-    borderRadius: 14,
-    padding: '12px 40px 12px 16px',
-    fontSize: 18,
-    fontFamily: 'inherit',
+    backgroundColor: '#1a1a1a',
+    color: '#F0EBE0',
+    border: '1px solid #333',
+    borderRadius: 10,
+    padding: '10px 40px 10px 14px',
+    fontSize: 15,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
     outline: 'none',
-    boxShadow: `0 0 12px ${BLUE}33`,
+    boxSizing: 'border-box' as const,
   },
   searchClear: {
     position: 'absolute',
