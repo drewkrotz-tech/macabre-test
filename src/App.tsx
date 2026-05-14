@@ -718,6 +718,12 @@ type SocialPost = {
   // post content.
   repostedBy?: string | null;
   repostedAt?: string | null;
+  // Up to 2 most-recent top-level approved comments, embedded by the
+  // /posts/feed handler so the feed card can render IG-style inline
+  // preview rows ("@handle their comment text") without N+1 follow-up
+  // requests. Older API responses won't include this field; the card
+  // defaults to an empty array in that case.
+  latestComments?: Array<{ id: string; handle: string; body: string; createdAt: string }>;
 };
 
 // One comment on a post. Returned by GET /comments/post/:postId.
@@ -1056,7 +1062,7 @@ async function fetchLiveSites(): Promise<SinisterSite[]> {
       state: s.state || 'Unknown',
       coords: s.coords,
       imageUrl: s.photoUrl || s.imageUrl || '',
-      imageCredit: s.submitter ? `@${s.submitter}` : 'Sinister Locations',
+      imageCredit: s.submitter ? `@${s.submitter}` : 'The Dread Directory',
       // Pass-through fields for detail-page submitter credit. Optional —
       // legacy seeded sites may not have them; the detail page handles
       // both cases (shows "Submitted by Sinister" if submitter missing,
@@ -3622,6 +3628,29 @@ function HomeBottomBar({ onSubmit, onList, onAbout, onSocial }: {
 type _ExposureSubTab = 'feed' | 'search' | 'post' | 'profile';
 let _exposureSubTabMemory: _ExposureSubTab = 'feed';
 
+// Snapshot of SocialView's feed state, preserved across unmounts so
+// navigating from DreadFeed → UserProfileView → swipe-back lands the
+// user on the same post at the same scroll position they were viewing.
+// Without this, each remount kicks off a fresh fetch of page 1 from
+// the server and the user is dumped at the top of the feed — frustrating
+// when they were 30 posts deep.
+//
+// We snapshot ONLY the 'all' feed (not 'following'), because the
+// following filter is cheap enough to recompute and tends to have many
+// fewer posts. Scroll position is window.scrollY since the SocialView
+// uses the document scroll, not an inner overflow container.
+type _SocialFeedSnapshot = {
+  posts: SocialPost[];
+  nextBefore: string | null;
+  scrollY: number;
+  // Wall-clock timestamp when this snapshot was captured. If the user
+  // comes back hours later we discard the snapshot and refetch — a
+  // stale feed is worse than a momentary scroll-to-top.
+  capturedAt: number;
+};
+let _socialFeedMemory: _SocialFeedSnapshot | null = null;
+const SOCIAL_FEED_MEMORY_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
 // ---------- Settings View ----------
 // Reached from a gear icon on your own DreadFeed profile. Centralizes
 // the account management surface that App Store guideline 5.1.1(v)
@@ -5062,9 +5091,24 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
     return () => { cancelled = true; window.clearInterval(id); };
   }, [handle]);
 
-  const [posts, setPosts] = useState<SocialPost[]>([]);
-  const [nextBefore, setNextBefore] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  // If we have a recent snapshot from a previous mount, seed feed state
+  // from it. This makes returning to DreadFeed via swipe-back land the
+  // user on the same posts they were viewing instead of refetching from
+  // the top. Snapshots expire after 10 minutes so the feed eventually
+  // freshens. Only the 'all' feed gets cached this way.
+  const initialSnap = (() => {
+    if (!_socialFeedMemory) return null;
+    if (Date.now() - _socialFeedMemory.capturedAt > SOCIAL_FEED_MEMORY_TTL_MS) {
+      _socialFeedMemory = null;
+      return null;
+    }
+    return _socialFeedMemory;
+  })();
+  const [posts, setPosts] = useState<SocialPost[]>(initialSnap ? initialSnap.posts : []);
+  const [nextBefore, setNextBefore] = useState<string | null>(initialSnap ? initialSnap.nextBefore : null);
+  // Loading=true only if we have nothing seeded. If we restored from a
+  // snapshot, we already have posts to show — no loading flicker.
+  const [loading, setLoading] = useState(!initialSnap);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // Feed mode toggle — 'all' shows every approved post; 'following'
@@ -5122,7 +5166,9 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
 
   // Refresh = reload from the top. Called by pull-to-refresh on release
   // past threshold. Replaces the entire feed since we're back to the
-  // newest post; resets the nextBefore cursor.
+  // newest post; resets the nextBefore cursor. Also wipes the memory
+  // snapshot so the next remount fetches fresh — pull-refresh is an
+  // explicit "I want new content" signal from the user.
   const refreshFeed = async () => {
     if (refreshing) return;
     setRefreshing(true);
@@ -5130,6 +5176,7 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
       const page = await loadPage(null);
       setPosts(page.posts);
       setNextBefore(page.nextBefore);
+      _socialFeedMemory = null;
     } catch { /* silent — keep prior feed visible */ }
     setRefreshing(false);
     setPullDistance(0);
@@ -5137,7 +5184,23 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
 
   // Initial load — and also re-load when feedMode flips between
   // All / Following so the user gets fresh content for the chosen tab.
+  // SPECIAL CASE: on first mount, if we restored from _socialFeedMemory,
+  // skip the network fetch entirely — we already have posts seeded.
+  // The user gets an instant return-to-feed experience. We still fire
+  // a refresh on feedMode flips or handle changes since those are user
+  // actions that imply they want fresh data.
+  const skipInitialLoadRef = useRef(initialSnap !== null);
   useEffect(() => {
+    if (skipInitialLoadRef.current) {
+      // Only skip the FIRST run — subsequent feedMode/handle changes
+      // still trigger a real fetch.
+      skipInitialLoadRef.current = false;
+      // Restore scroll position. RAF gives the layout one frame to
+      // commit so document height is correct before we scroll.
+      const targetY = initialSnap ? initialSnap.scrollY : 0;
+      requestAnimationFrame(() => { window.scrollTo(0, targetY); });
+      return;
+    }
     let cancelled = false;
     (async () => {
       setLoading(true);
@@ -5151,6 +5214,24 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [feedMode, handle]);
+
+  // Snapshot feed state to module-level memory on unmount so a return
+  // to DreadFeed restores the same feed + scroll position the user
+  // was viewing. Only snapshots the 'all' feed (skip 'following' to
+  // keep the cache simple and small).
+  useEffect(() => {
+    return () => {
+      if (feedMode === 'all' && posts.length > 0) {
+        _socialFeedMemory = {
+          posts,
+          nextBefore,
+          scrollY: window.scrollY,
+          capturedAt: Date.now(),
+        };
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [posts, nextBefore, feedMode]);
 
   // Load more — called when the user scrolls near the bottom.
   const loadMore = async () => {
@@ -7531,10 +7612,16 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap,
         </div>
       )}
 
-      {/* Caption — handle in bold inline with caption text, like IG */}
+      {/* Caption — handle in bold inline with caption text, like IG.
+          Tapping the handle goes to profile; tapping the caption TEXT
+          (the actual words) opens the comment sheet, IG-style. */}
       <div style={S.postCaptionLine}>
         <button onClick={onHandleTap} style={S.postCaptionHandle}>{post.handle}</button>
-        <span style={S.postCaptionText}> {post.caption}</span>
+        <button
+          type="button"
+          onClick={() => setCommentsOpen(true)}
+          style={S.postCaptionTextBtn}
+        > {post.caption}</button>
       </div>
 
       {/* "View all N comments" link, IG-style — appears below the
@@ -7544,6 +7631,28 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap,
         <button onClick={() => setCommentsOpen(true)} style={S.postViewCommentsBtn}>
           View {commentCount === 1 ? '1 comment' : `all ${commentCount} comments`}
         </button>
+      )}
+
+      {/* IG-style inline preview rows — show the latest 1-2 top-level
+          comments under the caption. Each row is tappable and opens
+          the comment sheet just like the View-all button. Server sends
+          newest-first; we reverse for display so the older of the two
+          appears above the newer (more natural reading order — same as
+          IG's chronological top-of-thread preview). */}
+      {(post.latestComments && post.latestComments.length > 0) && (
+        <div style={S.postLatestComments}>
+          {[...post.latestComments].reverse().map((c) => (
+            <button
+              key={c.id}
+              type="button"
+              onClick={() => setCommentsOpen(true)}
+              style={S.postLatestCommentRow}
+            >
+              <span style={S.postLatestCommentHandle}>{c.handle}</span>
+              <span style={S.postLatestCommentBody}> {c.body}</span>
+            </button>
+          ))}
+        </div>
       )}
 
       {/* IG-style bottom-sheet comments. Rendered conditionally so the
@@ -7776,14 +7885,95 @@ function CommentSheet({ post, currentHandle, deviceId, onClose, onCountChange }:
   // overscrollBehavior:contain on the list, the underlying feed can
   // scroll if the user starts a drag outside the list (e.g. on the
   // composer or the emoji row). Locking the body prevents bleed-through
-  // completely. We snapshot and restore the previous overflow value so
-  // we don't permanently change anything if another scroll lock is in
-  // play (e.g. from a different modal).
+  // completely.
+  //
+  // iOS quirk: simply setting overflow:hidden visually pins the page
+  // but can reset window.scrollY to 0 when restored. To prevent the
+  // user being jumped back to the top of the feed after closing the
+  // sheet, we snapshot the current scrollY, lock the body with a
+  // negative top + fixed positioning (the IG approach), then restore
+  // both styles AND scroll position on unmount. This is the only
+  // reliable way on iOS Safari WebViews.
   useEffect(() => {
-    const prev = document.body.style.overflow;
+    const scrollY = window.scrollY;
+    const prevOverflow = document.body.style.overflow;
+    const prevPosition = document.body.style.position;
+    const prevTop = document.body.style.top;
+    const prevWidth = document.body.style.width;
+    document.body.style.position = 'fixed';
+    document.body.style.top = `-${scrollY}px`;
+    document.body.style.width = '100%';
     document.body.style.overflow = 'hidden';
-    return () => { document.body.style.overflow = prev; };
+    return () => {
+      document.body.style.position = prevPosition;
+      document.body.style.top = prevTop;
+      document.body.style.width = prevWidth;
+      document.body.style.overflow = prevOverflow;
+      // Restore the scroll position the user was at when they opened
+      // the sheet. Without this, iOS visually jumps to the top.
+      window.scrollTo(0, scrollY);
+    };
   }, []);
+
+  // Suppress the global swipe-back gesture while the sheet is open.
+  // The emoji quick-react row, the reply font picker, and the comment
+  // list itself all generate horizontal-ish swipes that the global
+  // swipe-back handler would otherwise catch and pop the user out of
+  // DreadFeed entirely. Reference-counted via the same helpers the post
+  // editor uses.
+  useEffect(() => {
+    beginSuppressSwipeBack();
+    return () => { endSuppressSwipeBack(); };
+  }, []);
+
+  // Track whether the scrollable comment list is at the very top. The
+  // drag-to-dismiss handler only kicks in when scrollTop is 0; otherwise
+  // a downward drag is just normal scrolling. IG works exactly this way.
+  const listScrollRef = useRef<HTMLDivElement | null>(null);
+  const isListAtTopRef = useRef(true);
+  const onListScroll = (e: React.UIEvent<HTMLDivElement>) => {
+    isListAtTopRef.current = (e.currentTarget.scrollTop || 0) <= 0;
+  };
+
+  // Touch handlers for drag-to-dismiss. v1.11 expanded these from the
+  // top handle area to the whole panel — the user can grab anywhere
+  // inside the sheet and pull down. But we only ACTUALLY start a drag
+  // if either (a) the inner comment list is scrolled to the very top
+  // (so we're not stealing a scroll-up gesture), OR (b) the touch
+  // landed somewhere that's not the scrollable list itself (like the
+  // emoji row or composer). Combining those two rules gives the IG
+  // feel: scroll comments normally, OR drag anywhere else to dismiss.
+  const dragLandedOnListRef = useRef(false);
+  const onTouchStartHandle = (e: React.TouchEvent) => {
+    if (e.touches.length !== 1) return;
+    dragStartYRef.current = e.touches[0].clientY;
+    // Did the touch land on (or inside) the scrollable list? If so we
+    // gate on isListAtTop. If not, we always allow the drag.
+    const target = e.target as HTMLElement;
+    const list = listScrollRef.current;
+    dragLandedOnListRef.current = !!(list && (list === target || list.contains(target)));
+  };
+  const onTouchMoveHandle = (e: React.TouchEvent) => {
+    if (dragStartYRef.current === null || e.touches.length !== 1) return;
+    const dy = e.touches[0].clientY - dragStartYRef.current;
+    // Only drag downward (positive dy). Negative just gets ignored.
+    if (dy <= 0) return;
+    // If the touch started inside the comment list and that list is
+    // not at scroll-top, this is a normal scroll gesture — leave it
+    // alone, don't translate the sheet.
+    if (dragLandedOnListRef.current && !isListAtTopRef.current) return;
+    setDragY(dy);
+  };
+  const onTouchEndHandle = () => {
+    const dy = dragY;
+    dragStartYRef.current = null;
+    dragLandedOnListRef.current = false;
+    setDragY(0);
+    if (dy > 120) {
+      // Past dismiss threshold — animate close.
+      animateClose();
+    }
+  };
 
   // Initial load — fetch comments and seed the parent's count.
   useEffect(() => {
@@ -7833,27 +8023,6 @@ function CommentSheet({ post, currentHandle, deviceId, onClose, onCountChange }:
     if (closing) return;
     setClosing(true);
     setTimeout(() => onClose(), 260); // matches CSS transition duration
-  };
-
-  // Touch handlers for drag-to-dismiss on the top handle area.
-  const onTouchStartHandle = (e: React.TouchEvent) => {
-    if (e.touches.length !== 1) return;
-    dragStartYRef.current = e.touches[0].clientY;
-  };
-  const onTouchMoveHandle = (e: React.TouchEvent) => {
-    if (dragStartYRef.current === null || e.touches.length !== 1) return;
-    const dy = e.touches[0].clientY - dragStartYRef.current;
-    // Only drag downward (positive dy). Cap so the sheet can't go up.
-    if (dy > 0) setDragY(dy);
-  };
-  const onTouchEndHandle = () => {
-    const dy = dragY;
-    dragStartYRef.current = null;
-    setDragY(0);
-    if (dy > 120) {
-      // Past dismiss threshold — animate close.
-      animateClose();
-    }
   };
 
   // Send a new comment to the server. Optimistically prepends to the
@@ -7993,21 +8162,25 @@ function CommentSheet({ post, currentHandle, deviceId, onClose, onCountChange }:
         style={S.commentSheetBackdrop}
         onClick={animateClose}
       />
-      {/* Sliding panel */}
+      {/* Sliding panel — touch handlers attached at panel level so the
+          user can drag anywhere inside the sheet (not just the top
+          handle) to dismiss. The handlers themselves gate on whether
+          the touch landed on the scrollable comment list AND whether
+          that list is currently at scrollTop=0; otherwise it's just a
+          normal scroll gesture. */}
       <div
         style={{
           ...S.commentSheetPanel,
           transform: `translateY(${translateY})`,
           transition: dragStartYRef.current === null ? 'transform 0.26s cubic-bezier(0.32, 0.72, 0, 1)' : 'none',
         }}
+        onTouchStart={onTouchStartHandle}
+        onTouchMove={onTouchMoveHandle}
+        onTouchEnd={onTouchEndHandle}
       >
-        {/* Drag handle area — also where the touchstart/move/end land */}
-        <div
-          style={S.commentSheetHandleArea}
-          onTouchStart={onTouchStartHandle}
-          onTouchMove={onTouchMoveHandle}
-          onTouchEnd={onTouchEndHandle}
-        >
+        {/* Drag handle area — visual indicator only now. The touch
+            handlers live on the panel above, not here. */}
+        <div style={S.commentSheetHandleArea}>
           <div style={S.commentSheetHandlePill} />
         </div>
 
@@ -8024,8 +8197,14 @@ function CommentSheet({ post, currentHandle, deviceId, onClose, onCountChange }:
           </button>
         </div>
 
-        {/* Scrollable comment list */}
-        <div style={S.commentSheetList}>
+        {/* Scrollable comment list. ref + onScroll feed the drag-dismiss
+            logic so we can tell whether a downward drag here should
+            dismiss the sheet or just be normal scrolling. */}
+        <div
+          ref={listScrollRef}
+          onScroll={onListScroll}
+          style={S.commentSheetList}
+        >
           {loading ? (
             <div style={S.commentSheetEmpty}>Loading…</div>
           ) : comments.length === 0 ? (
@@ -10735,16 +10914,16 @@ function AboutView({ onBack }: { onBack: () => void }) {
         <div style={S.aboutSectionHeader}>What this app does</div>
 
         <p style={S.aboutPara}>
-          <b>Notifies you when you're near a sinister site.</b> The app runs in the background and pings you
-          when you come within range of a haunting, crime scene, or other macabre location — even when the
-          app is closed. Set location access to "Always" for this to work.
+          <b>Notifies you when you're near a Dread Location.</b> The app runs in the background and pings
+          you when you come within range of a haunting, crime scene, or other macabre location — even when
+          the app is closed. Set location access to "Always" for this to work.
         </p>
         <p style={S.aboutPara}>
           <b>Tells the story behind every location.</b> Each site has its full history, exact coordinates,
           and turn-by-turn directions in your maps app.
         </p>
         <p style={S.aboutPara}>
-          <b>Lets you add your own locations.</b> Found a sinister spot we don't have? Submit it while
+          <b>Lets you add your own locations.</b> Found a Dread Location we don't have? Submit it while
           you're physically on-site — the app verifies your GPS and requires an on-site photo.
         </p>
         <p style={S.aboutPara}>
@@ -10755,24 +10934,25 @@ function AboutView({ onBack }: { onBack: () => void }) {
         <div style={S.aboutSectionHeader}>Getting started</div>
 
         <p style={S.aboutPara}>
-          <b>1. Sign in.</b> Tap Sign in with Apple on the welcome screen. Your Apple ID gets you signed
-          in — we don't ask for passwords or personal info.
+          <b>1. Just open the app.</b> No account needed to browse Dread Locations, see the map, or read
+          DreadFeed. Jump in and look around.
         </p>
         <p style={S.aboutPara}>
-          <b>2. Pick a handle.</b> This is your name across the app — on posts, comments, submissions, and
-          any sites you've added. You can claim any handle that's not already taken (3–20 characters).
-        </p>
-        <p style={S.aboutPara}>
-          <b>3. Grant location access.</b> Choose "Allow While Using App" the first time you open the map.
-          For background notifications when you're near a sinister site, go to iOS Settings → The Dread
+          <b>2. Grant location access.</b> Choose "Allow While Using App" the first time you open the map.
+          For background notifications when you're near a Dread Location, go to iOS Settings → The Dread
           Directory → Location → and switch to "Always".
         </p>
         <p style={S.aboutPara}>
-          <b>4. Allow notifications.</b> This lets the app ping you when you walk within range of a site,
+          <b>3. Allow notifications.</b> This lets the app ping you when you walk within range of a site,
           even if the app is closed.
         </p>
+        <p style={S.aboutPara}>
+          <b>4. Claim a handle when you're ready to participate.</b> To post to DreadFeed, comment, submit
+          a new Dread Location, or like other people's posts, you'll need a handle. Tap any of those
+          actions and the app will walk you through Sign in with Apple — it takes one tap.
+        </p>
 
-        <div style={S.aboutSectionHeader}>Browsing sinister sites</div>
+        <div style={S.aboutSectionHeader}>Browsing Dread Locations</div>
 
         <p style={S.aboutPara}>
           <b>The List.</b> Tap the list icon on the home screen to browse by category — True Crime,
@@ -15371,6 +15551,22 @@ const S: Record<string, React.CSSProperties> = {
     fontSize: 14,
     fontFamily: 'system-ui, -apple-system, sans-serif',
   },
+  // Same visual as postCaptionText but renders as a button that opens
+  // the comment sheet on tap. IG works this way — tapping the caption
+  // text takes you straight into comments. Removing button chrome so
+  // the user just sees plain caption text.
+  postCaptionTextBtn: {
+    color: '#F0EBE0',
+    fontSize: 14,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    background: 'none',
+    border: 'none',
+    padding: 0,
+    margin: 0,
+    cursor: 'pointer',
+    textAlign: 'left' as const,
+    display: 'inline',
+  },
   // Small numeric badge next to the comment icon — shows the comment
   // count when > 0. Sits to the right of the icon inside the same
   // button so it taps as a single target.
@@ -15393,6 +15589,40 @@ const S: Record<string, React.CSSProperties> = {
     border: 'none',
     cursor: 'pointer',
     textAlign: 'left' as const,
+  },
+  // Container for inline comment preview rows under each feed card.
+  // Sits between View-all link and the next post; small vertical
+  // padding keeps the section readable without crowding the photo grid.
+  postLatestComments: {
+    display: 'flex',
+    flexDirection: 'column' as const,
+    gap: 2,
+    padding: '0 14px 8px 14px',
+  },
+  // Single preview row. The whole row is a button so tap anywhere opens
+  // the sheet. Visual: handle bold, body inline — same IG layout.
+  postLatestCommentRow: {
+    display: 'block',
+    background: 'none',
+    border: 'none',
+    padding: 0,
+    margin: 0,
+    cursor: 'pointer',
+    textAlign: 'left' as const,
+    fontSize: 14,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    lineHeight: 1.35,
+    overflow: 'hidden' as const,
+    textOverflow: 'ellipsis' as const,
+    whiteSpace: 'nowrap' as const,
+    color: '#F0EBE0',
+  },
+  postLatestCommentHandle: {
+    fontWeight: 600,
+    color: '#F0EBE0',
+  },
+  postLatestCommentBody: {
+    color: '#F0EBE0',
   },
   // ---- Comment Sheet (IG-style bottom sheet) ----
   // Full-viewport overlay that catches taps for backdrop dismiss.
