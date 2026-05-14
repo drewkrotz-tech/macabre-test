@@ -5405,82 +5405,38 @@ function ExposureBottomBar({ active, onSelect }: {
 // pipeline (Sharp resize + EXIF strip + R2 upload) doesn't change.
 
 // ---- Sticker library ----
-// 12 horror stickers as inline SVG path strings. Drawing via
-// <svg><path d="..."/></svg> at runtime, baked to canvas at save time
-// via a Path2D pass for each placed sticker.
+// OpenMoji horror stickers via jsDelivr CDN. Licensed CC BY-SA 4.0 — credit
+// in the app About page is the only obligation. PNG format at 618x618px,
+// transparent background. We use 14 horror-relevant emoji codepoints
+// chosen for theme + recognizability.
 //
-// Each sticker gets a viewBox 100x100, a single fill color (defaults
-// red #DC2626 with some opacity variation), and an OPTIONAL stroke
-// for outlines on lighter shapes. Drawing the SVG to canvas uses an
-// <img> + data: URL pattern that works cleanly on iOS Safari.
+// Codepoints are uppercase hex with hyphens for ZWJ-joined sequences.
+// The CDN returns 404 for ZWJ joiners on some codepoints — if a sticker
+// fails to load at bake time, it's silently skipped from the output.
 type HorrorSticker = {
   id: string;
   name: string;
-  // Full SVG markup, sized 100x100. Rendered as an Image source for canvas.
-  svg: string;
+  // Full URL to the PNG. CORS is permitted from jsDelivr.
+  url: string;
 };
 
+const OPENMOJI_BASE = 'https://cdn.jsdelivr.net/npm/openmoji@15.1.0/color/618x618';
+
 const HORROR_STICKERS: HorrorSticker[] = [
-  {
-    id: 'skull',
-    name: 'Skull',
-    svg: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><path fill="#E5E5E5" d="M50 8C28 8 14 24 14 44c0 12 6 22 14 28v10c0 3 3 6 6 6h6v-8h4v8h12v-8h4v8h6c3 0 6-3 6-6V72c8-6 14-16 14-28C86 24 72 8 50 8z"/><circle cx="36" cy="44" r="8" fill="#1a1a1a"/><circle cx="64" cy="44" r="8" fill="#1a1a1a"/><path fill="#1a1a1a" d="M44 62l6-10 6 10-3 6h-6z"/><rect x="38" y="74" width="3" height="8" fill="#1a1a1a"/><rect x="48.5" y="74" width="3" height="8" fill="#1a1a1a"/><rect x="59" y="74" width="3" height="8" fill="#1a1a1a"/></svg>`,
-  },
-  {
-    id: 'ghost',
-    name: 'Ghost',
-    svg: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><path fill="#F5F5F5" d="M50 6C32 6 18 20 18 38v48l10-8 10 8 10-8 10 8 10-8 10 8 4-2V38C82 20 68 6 50 6z"/><circle cx="38" cy="36" r="6" fill="#1a1a1a"/><circle cx="62" cy="36" r="6" fill="#1a1a1a"/><ellipse cx="50" cy="56" rx="6" ry="8" fill="#1a1a1a"/></svg>`,
-  },
-  {
-    id: 'pumpkin',
-    name: 'Jack-o-lantern',
-    svg: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><path fill="#3a2a1a" d="M48 14h4v10h-4z"/><path fill="#2d5016" d="M52 16l8-6 2 4-6 6z"/><ellipse cx="50" cy="56" rx="38" ry="32" fill="#E07A1F"/><ellipse cx="22" cy="56" rx="14" ry="30" fill="#C5651A"/><ellipse cx="78" cy="56" rx="14" ry="30" fill="#C5651A"/><path fill="#1a0a00" d="M28 46l12 10-12 4z"/><path fill="#1a0a00" d="M72 46L60 56l12 4z"/><path fill="#1a0a00" d="M50 60l-6 10h12z"/><path fill="#1a0a00" d="M30 74q20-10 40 0v6q-20-6-40 0z"/><path fill="#1a0a00" d="M38 76l4 6M50 76v8M58 76l-4 6"/></svg>`,
-  },
-  {
-    id: 'bat',
-    name: 'Bat',
-    svg: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><path fill="#1a1a1a" d="M50 34c-4-4-8-6-14-6l-4 8q-12-8-26-2 8 8 14 18-6 0-12 6 14 4 22 14l8-10 4 8h16l4-8 8 10c8-10 22-14 22-14-6-6-12-6-12-6 6-10 14-18 14-18-14-6-26 2-26 2l-4-8c-6 0-10 2-14 6z"/><circle cx="44" cy="42" r="2" fill="#DC2626"/><circle cx="56" cy="42" r="2" fill="#DC2626"/></svg>`,
-  },
-  {
-    id: 'candle',
-    name: 'Candle',
-    svg: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><path fill="#FFC83A" d="M50 8c-4 6-8 10-8 16 0 5 4 8 8 8s8-3 8-8c0-6-4-10-8-16z"/><path fill="#FFE08A" d="M50 14c-2 4-4 6-4 10 0 3 2 4 4 4s4-1 4-4c0-4-2-6-4-10z"/><rect x="38" y="34" width="24" height="48" fill="#F0EBE0"/><rect x="38" y="34" width="24" height="3" fill="#D5D0C0"/><path fill="#F0EBE0" d="M36 78h28v4l-4 6H40l-4-6z"/><path fill="#D5D0C0" d="M40 38l-2 14 2 2 2-14z" opacity="0.6"/></svg>`,
-  },
-  {
-    id: 'handprint',
-    name: 'Bloody handprint',
-    svg: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><path fill="#8B0000" d="M30 50q0-8 8-8t8 8v-30q0-6 6-6t6 6v32q0-8 8-8t8 8v8q0-6 6-6t6 6v18q0 16-16 26l-26-2q-14-2-16-14l-6-22q-2-6 4-8t8 4l6 8z"/><circle cx="42" cy="22" r="2" fill="#8B0000" opacity="0.7"/><circle cx="50" cy="14" r="2" fill="#8B0000" opacity="0.5"/><circle cx="62" cy="20" r="2" fill="#8B0000" opacity="0.6"/></svg>`,
-  },
-  {
-    id: 'pentagram',
-    name: 'Pentagram',
-    svg: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle cx="50" cy="50" r="42" fill="none" stroke="#DC2626" stroke-width="3"/><path d="M50 10 L62 46 L98 46 L68 68 L80 100 L50 78 L20 100 L32 68 L2 46 L38 46 Z" transform="scale(0.7) translate(22 6)" fill="none" stroke="#DC2626" stroke-width="3" stroke-linejoin="round"/></svg>`,
-  },
-  {
-    id: 'tombstone',
-    name: 'RIP tombstone',
-    svg: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><path fill="#6B6B6B" d="M22 92V42q0-26 28-26t28 26v50z"/><path fill="#4B4B4B" d="M22 92V88h56v4z"/><text x="50" y="56" text-anchor="middle" font-family="serif" font-weight="700" font-size="20" fill="#1a1a1a">R.I.P</text><path fill="#1a1a1a" d="M44 64h12v2H44z"/><path fill="#1a1a1a" d="M40 70h20v2H40z"/></svg>`,
-  },
-  {
-    id: 'eyeball',
-    name: 'Eyeball',
-    svg: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle cx="50" cy="50" r="40" fill="#F5F5F5"/><circle cx="50" cy="50" r="40" fill="none" stroke="#DC2626" stroke-width="2"/><circle cx="50" cy="50" r="22" fill="#8B0000"/><circle cx="50" cy="50" r="12" fill="#1a1a1a"/><circle cx="46" cy="46" r="4" fill="#F5F5F5"/><path d="M30 30 Q20 50 30 70 M70 30 Q80 50 70 70" stroke="#DC2626" stroke-width="2" fill="none" opacity="0.5"/></svg>`,
-  },
-  {
-    id: 'raven',
-    name: 'Raven',
-    svg: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><path fill="#1a1a1a" d="M30 56q-8-4-8-14t10-14q4-2 10-2t10 2q4-4 12-4t14 4q8 4 8 12-2 8-8 12 6 4 6 12-2 10-12 14l-22 4q-14 0-18-10-2-8 0-14z"/><path fill="#FFC83A" d="M76 50l10-2-8 6z"/><circle cx="68" cy="46" r="2" fill="#DC2626"/></svg>`,
-  },
-  {
-    id: 'claws',
-    name: 'Claw marks',
-    svg: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><path fill="#8B0000" d="M18 18q4-4 8 0l30 70q2 4-4 4t-8-4z"/><path fill="#8B0000" d="M36 14q4-4 8 0l28 76q2 4-4 4t-8-4z"/><path fill="#8B0000" d="M56 16q4-4 8 0l24 72q2 4-4 4t-8-4z"/></svg>`,
-  },
-  {
-    id: 'spider',
-    name: 'Spider',
-    svg: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><path stroke="#1a1a1a" stroke-width="3" fill="none" stroke-linecap="round" d="M50 50L20 30M50 50L20 50M50 50L20 70M50 50L30 90M50 50L80 30M50 50L80 50M50 50L80 70M50 50L70 90"/><ellipse cx="50" cy="54" rx="16" ry="20" fill="#1a1a1a"/><circle cx="50" cy="42" r="10" fill="#1a1a1a"/><circle cx="46" cy="40" r="2" fill="#DC2626"/><circle cx="54" cy="40" r="2" fill="#DC2626"/></svg>`,
-  },
+  { id: 'skull',     name: 'Skull',           url: `${OPENMOJI_BASE}/1F480.png` },
+  { id: 'skullbones',name: 'Skull & bones',   url: `${OPENMOJI_BASE}/2620.png` },
+  { id: 'ghost',     name: 'Ghost',           url: `${OPENMOJI_BASE}/1F47B.png` },
+  { id: 'vampire',   name: 'Vampire',         url: `${OPENMOJI_BASE}/1F9DB.png` },
+  { id: 'zombie',    name: 'Zombie',          url: `${OPENMOJI_BASE}/1F9DF.png` },
+  { id: 'pumpkin',   name: 'Jack-o-lantern',  url: `${OPENMOJI_BASE}/1F383.png` },
+  { id: 'bat',       name: 'Bat',             url: `${OPENMOJI_BASE}/1F987.png` },
+  { id: 'spider',    name: 'Spider',          url: `${OPENMOJI_BASE}/1F577.png` },
+  { id: 'web',       name: 'Spider web',      url: `${OPENMOJI_BASE}/1F578.png` },
+  { id: 'crystalball',name: 'Crystal ball',   url: `${OPENMOJI_BASE}/1F52E.png` },
+  { id: 'candle',    name: 'Candle',          url: `${OPENMOJI_BASE}/1F56F.png` },
+  { id: 'coffin',    name: 'Coffin',          url: `${OPENMOJI_BASE}/26B0.png` },
+  { id: 'fire',      name: 'Fire',            url: `${OPENMOJI_BASE}/1F525.png` },
+  { id: 'eye',       name: 'Eye',             url: `${OPENMOJI_BASE}/1F441.png` },
 ];
 
 // Layers placed on the photo. Position is normalized (0-1) so layers
@@ -5512,29 +5468,68 @@ function makeLayerId() {
   return 'l_' + Math.random().toString(36).slice(2, 10);
 }
 
-// Bake the photo + filmstrip + layers into a JPEG File. canvasSize
-// determines output resolution — we target 1200px short edge to match
-// the server's Sharp resize so we don't waste bandwidth.
+// Filter presets — applied via canvas `filter` property at bake time
+// and via the equivalent CSS filter on the live preview. Keys match the
+// FILTER_PRESETS array entries.
+type FilterId = 'none' | 'foundFootage' | 'polaroid' | 'nightVision' | 'vhs' | 'crimeScene' | 'cursed';
+
+const FILTER_PRESETS: { id: FilterId; name: string; css: string }[] = [
+  { id: 'none',         name: 'Original',     css: 'none' },
+  { id: 'foundFootage', name: 'Found Footage',css: 'grayscale(0.4) sepia(0.25) hue-rotate(60deg) contrast(1.15) brightness(0.9)' },
+  { id: 'polaroid',     name: 'Polaroid',     css: 'sepia(0.6) contrast(0.95) brightness(1.05) saturate(0.85)' },
+  { id: 'nightVision',  name: 'Night Vision', css: 'grayscale(1) sepia(1) hue-rotate(60deg) saturate(8) brightness(0.8) contrast(1.4)' },
+  { id: 'vhs',          name: 'VHS',          css: 'contrast(1.2) saturate(1.4) brightness(0.95) hue-rotate(-5deg)' },
+  { id: 'crimeScene',   name: 'Crime Scene',  css: 'contrast(1.6) brightness(0.85) saturate(0.3)' },
+  { id: 'cursed',       name: 'Cursed',       css: 'contrast(1.4) saturate(1.6) hue-rotate(-15deg) brightness(0.88)' },
+];
+
+function filterCssFor(id: FilterId): string {
+  return FILTER_PRESETS.find((f) => f.id === id)?.css || 'none';
+}
+
+// Crop rectangle in normalized coords (0..1 of source).
+type CropRect = { x: number; y: number; w: number; h: number };
+const FULL_CROP: CropRect = { x: 0, y: 0, w: 1, h: 1 };
+
+// Bake the photo + crop + rotate + filter + filmstrip + layers into a JPEG File.
+// Order: crop → rotate → filter → filmstrip → stickers/text → JPEG export.
+// canvasSize targets 1200px max edge to match server Sharp resize.
 async function bakePostImage(opts: {
   sourceFile: File;
+  crop: CropRect;
+  rotation: 0 | 90 | 180 | 270;
+  filter: FilterId;
   filmstripOn: boolean;
   layers: EditorLayer[];
   stickers: HorrorSticker[];
 }): Promise<File> {
-  const { sourceFile, filmstripOn, layers, stickers } = opts;
+  const { sourceFile, crop, rotation, filter, filmstripOn, layers, stickers } = opts;
 
   // Load source image
   const sourceImg = await new Promise<HTMLImageElement>((resolve, reject) => {
     const img = new Image();
     img.onload = () => resolve(img);
-    img.onerror = (e) => reject(new Error('source image load failed'));
+    img.onerror = () => reject(new Error('source image load failed'));
     img.src = URL.createObjectURL(sourceFile);
   });
 
-  // Compute output dimensions — keep aspect ratio, longest side 1200.
+  // Compute cropped pixel rect on the source image.
+  const srcW = sourceImg.naturalWidth;
+  const srcH = sourceImg.naturalHeight;
+  const cropPxW = Math.max(1, Math.round(crop.w * srcW));
+  const cropPxH = Math.max(1, Math.round(crop.h * srcH));
+  const cropPxX = Math.round(crop.x * srcW);
+  const cropPxY = Math.round(crop.y * srcH);
+
+  // After rotation, dimensions may swap.
+  const isPortraitFromRotation = rotation === 90 || rotation === 270;
+  const postRotW = isPortraitFromRotation ? cropPxH : cropPxW;
+  const postRotH = isPortraitFromRotation ? cropPxW : cropPxH;
+
+  // Scale to max 1200 longest edge.
   const maxDim = 1200;
-  let outW = sourceImg.naturalWidth;
-  let outH = sourceImg.naturalHeight;
+  let outW = postRotW;
+  let outH = postRotH;
   if (outW > outH && outW > maxDim) {
     outH = Math.round(outH * (maxDim / outW));
     outW = maxDim;
@@ -5549,18 +5544,36 @@ async function bakePostImage(opts: {
   const ctx = canvas.getContext('2d');
   if (!ctx) throw new Error('canvas 2d unavailable');
 
-  // 1) Draw source photo
-  ctx.drawImage(sourceImg, 0, 0, outW, outH);
+  // 1) Apply filter (via ctx.filter — Safari iOS 15+ supports this).
+  // CSS filter syntax is the same we use on the preview img.
+  ctx.filter = filterCssFor(filter);
 
-  // 2) Filmstrip border overlay
+  // 2) Draw crop + rotate. We rotate the canvas around its center so
+  // the cropped region lands in [0,0,outW,outH] regardless of orientation.
+  ctx.save();
+  ctx.translate(outW / 2, outH / 2);
+  ctx.rotate((rotation * Math.PI) / 180);
+  // Draw the cropped region centered on the (now-rotated) canvas.
+  // Source rect comes from the original image; dest rect is the unrotated bounds.
+  const drawW = isPortraitFromRotation ? outH : outW;
+  const drawH = isPortraitFromRotation ? outW : outH;
+  ctx.drawImage(
+    sourceImg,
+    cropPxX, cropPxY, cropPxW, cropPxH,
+    -drawW / 2, -drawH / 2, drawW, drawH
+  );
+  ctx.restore();
+
+  // Reset filter so overlays draw clean.
+  ctx.filter = 'none';
+
+  // 3) Filmstrip border overlay
   if (filmstripOn) {
     const barH = Math.round(outH * 0.06);
-    // Top + bottom black bars
     ctx.fillStyle = '#0a0a0a';
     ctx.fillRect(0, 0, outW, barH);
     ctx.fillRect(0, outH - barH, outW, barH);
 
-    // Sprocket holes — rounded rects evenly spaced
     const holeW = Math.round(barH * 0.5);
     const holeH = Math.round(barH * 0.55);
     const holeY1 = Math.round((barH - holeH) / 2);
@@ -5571,7 +5584,6 @@ async function bakePostImage(opts: {
 
     ctx.fillStyle = '#F5EFE0';
     for (let x = startX; x + holeW < outW; x += totalStep) {
-      // Rounded-rect via path
       const r = Math.min(holeW, holeH) * 0.25;
       const drawHole = (yPos: number) => {
         ctx.beginPath();
@@ -5592,11 +5604,12 @@ async function bakePostImage(opts: {
     }
   }
 
-  // 3) Draw layers (stickers + text) in order
-  // Sticker base size = 16% of short edge
+  // 4) Draw layers (stickers + text) — these sit on top of crop/rotate/filter,
+  // so they appear at the position the user dragged them on the preview.
   const stickerBase = Math.round(Math.min(outW, outH) * 0.16);
 
-  // Pre-load all sticker SVGs as Image objects
+  // Pre-load PNG stickers needed by this post. crossOrigin='anonymous' so
+  // the canvas doesn't get tainted (JSDelivr serves the right CORS header).
   const stickerImgs = new Map<string, HTMLImageElement>();
   await Promise.all(
     Array.from(new Set(
@@ -5604,15 +5617,20 @@ async function bakePostImage(opts: {
     )).map(async (sid) => {
       const def = stickers.find((s) => s.id === sid);
       if (!def) return;
-      const blob = new Blob([def.svg], { type: 'image/svg+xml' });
-      const url = URL.createObjectURL(blob);
-      const img = await new Promise<HTMLImageElement>((resolve, reject) => {
-        const im = new Image();
-        im.onload = () => resolve(im);
-        im.onerror = () => reject(new Error('sticker svg load failed: ' + sid));
-        im.src = url;
-      });
-      stickerImgs.set(sid, img);
+      try {
+        const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+          const im = new Image();
+          im.crossOrigin = 'anonymous';
+          im.onload = () => resolve(im);
+          im.onerror = () => reject(new Error('sticker png load failed: ' + sid));
+          im.src = def.url;
+        });
+        stickerImgs.set(sid, img);
+      } catch (e) {
+        // Silently skip stickers that fail to load — better than failing
+        // the whole bake when one CDN asset is down.
+        console.warn('[editor] sticker load failed', sid, e);
+      }
     })
   );
 
@@ -5634,7 +5652,6 @@ async function bakePostImage(opts: {
       ctx.font = `700 ${fontSize}px "Jolly Lodger", serif`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
-      // Red shadow drop for visibility against any background
       ctx.shadowColor = '#DC2626';
       ctx.shadowBlur = Math.round(fontSize * 0.15);
       ctx.shadowOffsetX = Math.round(fontSize * 0.06);
@@ -5646,13 +5663,21 @@ async function bakePostImage(opts: {
     ctx.restore();
   }
 
-  // 4) Export to JPEG File
-  const blob = await new Promise<Blob | null>((resolve) => {
-    canvas.toBlob((b) => resolve(b), 'image/jpeg', 0.92);
-  });
+  // 5) Export to JPEG File. Note: if a cross-origin sticker tainted the
+  // canvas, toBlob throws — we catch that and rethrow with a clearer message.
+  let blob: Blob | null;
+  try {
+    blob = await new Promise<Blob | null>((resolve, reject) => {
+      canvas.toBlob((b) => {
+        if (!b) reject(new Error('toBlob returned null'));
+        else resolve(b);
+      }, 'image/jpeg', 0.92);
+    });
+  } catch (err: any) {
+    throw new Error('canvas export failed (possibly CORS): ' + (err?.message || err));
+  }
   if (!blob) throw new Error('canvas toBlob failed');
 
-  // Reuse the original filename root if available, force .jpg extension.
   const origName = sourceFile.name || 'post';
   const baseName = origName.replace(/\.[^.]+$/, '');
   return new File([blob], `${baseName}.jpg`, { type: 'image/jpeg' });
@@ -5665,13 +5690,18 @@ function ExposurePostEditor({ photoFile, onBack, onNext }: {
   onNext: (editedFile: File) => void;
 }) {
   const [filmstripOn, setFilmstripOn] = useState(true);
+  const [filterId, setFilterId] = useState<FilterId>('none');
+  const [crop, setCrop] = useState<CropRect>(FULL_CROP);
+  const [rotation, setRotation] = useState<0 | 90 | 180 | 270>(0);
   const [layers, setLayers] = useState<EditorLayer[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [tray, setTray] = useState<'stickers' | 'text' | null>(null);
+  // tray null = normal editor with stickers/text/filmstrip toolbar
+  // tray 'crop' / 'filter' = full-screen sub-tool
+  // tray 'stickers' / 'text' = bottom drawer
+  const [tray, setTray] = useState<'stickers' | 'text' | 'crop' | 'filter' | null>(null);
   const [textInput, setTextInput] = useState('');
   const [baking, setBaking] = useState(false);
 
-  // Preview area ref for hit-testing and drag math
   const previewRef = useRef<HTMLDivElement | null>(null);
   const previewUrl = useMemo(() => URL.createObjectURL(photoFile), [photoFile]);
   useEffect(() => () => URL.revokeObjectURL(previewUrl), [previewUrl]);
@@ -5701,7 +5731,7 @@ function ExposurePostEditor({ photoFile, onBack, onNext }: {
     setSelectedId(null);
   };
 
-  // Drag handler — pointer events normalize touch/mouse on iOS.
+  // Layer drag — pointer events normalize touch/mouse on iOS.
   const onLayerPointerDown = (e: React.PointerEvent, layerId: string) => {
     e.stopPropagation();
     setSelectedId(layerId);
@@ -5745,6 +5775,9 @@ function ExposurePostEditor({ photoFile, onBack, onNext }: {
     try {
       const baked = await bakePostImage({
         sourceFile: photoFile,
+        crop,
+        rotation,
+        filter: filterId,
         filmstripOn,
         layers,
         stickers: HORROR_STICKERS,
@@ -5756,9 +5789,47 @@ function ExposurePostEditor({ photoFile, onBack, onNext }: {
     }
   };
 
+  // ---- Crop sub-view ----
+  // Renders the image inside a wrapper sized to its display area, with a
+  // draggable rectangle overlay. State (`crop`) is normalized 0..1 of
+  // source dimensions so it's resolution-independent.
+  if (tray === 'crop') {
+    return (
+      <ExposureCropScreen
+        sourceUrl={previewUrl}
+        crop={crop}
+        rotation={rotation}
+        onChangeCrop={setCrop}
+        onChangeRotation={(r) => setRotation(r)}
+        onDone={() => setTray(null)}
+        onCancel={() => setTray(null)}
+      />
+    );
+  }
+
+  // Filter sub-view stays inline (just a horizontal scroll strip + preview).
+
+  // Compute live preview transform: apply filter via CSS filter, and
+  // rotate via CSS transform. Crop is approximated visually by
+  // object-position cropping. Since we use object-fit:contain in the
+  // base view, we instead show a "crop preview" mask while in editor.
+  const liveFilter = filterCssFor(filterId);
+  const liveTransform = rotation ? `rotate(${rotation}deg)` : undefined;
+
+  // The crop on live preview is shown via clip-path on the image so the
+  // user sees roughly what will be exported. Crop is in normalized coords
+  // (0..1) of source — clip-path inset uses % of the rendered image, which
+  // matches our source-normalized coords since object-fit:contain preserves
+  // aspect ratio. Crop applies BEFORE rotation in the bake, but for the
+  // preview we approximate with clip-path on the un-rotated image to
+  // avoid coordinate confusion.
+  const cropClip =
+    crop.x === 0 && crop.y === 0 && crop.w === 1 && crop.h === 1
+      ? undefined
+      : `inset(${crop.y * 100}% ${(1 - crop.x - crop.w) * 100}% ${(1 - crop.y - crop.h) * 100}% ${crop.x * 100}%)`;
+
   return (
     <>
-      {/* Header — back / Edit / Next */}
       <div style={S.igComposerHeader}>
         <button onClick={onBack} style={S.igComposerHeaderBtn} aria-label="Back" disabled={baking}>‹</button>
         <div style={S.igComposerHeaderTitle}>Edit</div>
@@ -5771,15 +5842,22 @@ function ExposurePostEditor({ photoFile, onBack, onNext }: {
         </button>
       </div>
 
-      {/* Preview area with layers overlaid */}
       <div
         ref={previewRef}
         style={S.editorPreviewWrap}
         onPointerDown={() => setSelectedId(null)}
       >
-        <img src={previewUrl} alt="" style={S.editorPreviewImg} />
+        <img
+          src={previewUrl}
+          alt=""
+          style={{
+            ...S.editorPreviewImg,
+            filter: liveFilter,
+            transform: liveTransform,
+            clipPath: cropClip,
+          }}
+        />
 
-        {/* Filmstrip visual overlay (purely cosmetic — actual bars are drawn at bake time) */}
         {filmstripOn && (
           <>
             <div style={S.editorFilmstripBarTop}>
@@ -5795,7 +5873,6 @@ function ExposurePostEditor({ photoFile, onBack, onNext }: {
           </>
         )}
 
-        {/* Layers */}
         {layers.map((layer) => {
           const isSel = layer.id === selectedId;
           const transform = `translate(-50%, -50%) rotate(${layer.rotation}deg) scale(${layer.scale})`;
@@ -5819,8 +5896,15 @@ function ExposurePostEditor({ photoFile, onBack, onNext }: {
                 key={layer.id}
                 style={wrapStyle}
                 onPointerDown={(e) => onLayerPointerDown(e, layer.id)}
-                dangerouslySetInnerHTML={{ __html: def.svg.replace('<svg ', '<svg width="80" height="80" ') }}
-              />
+              >
+                <img
+                  src={def.url}
+                  alt=""
+                  crossOrigin="anonymous"
+                  style={{ width: 80, height: 80, display: 'block', pointerEvents: 'none' }}
+                  draggable={false}
+                />
+              </div>
             );
           }
           return (
@@ -5844,7 +5928,6 @@ function ExposurePostEditor({ photoFile, onBack, onNext }: {
         })}
       </div>
 
-      {/* Layer controls — appear when a layer is selected */}
       {selectedId && (
         <div style={S.editorLayerControls}>
           <button style={S.editorLayerBtn} onClick={() => adjustScale(-0.15)} aria-label="Shrink">−</button>
@@ -5855,7 +5938,32 @@ function ExposurePostEditor({ photoFile, onBack, onNext }: {
         </div>
       )}
 
-      {/* Tray panels */}
+      {/* Filter strip — horizontal scroll of preset thumbs above toolbar */}
+      {tray === 'filter' && (
+        <div style={S.editorFilterStrip}>
+          {FILTER_PRESETS.map((p) => (
+            <button
+              key={p.id}
+              style={{
+                ...S.editorFilterCell,
+                outline: filterId === p.id ? '2px solid #FF3B5C' : '1px solid rgba(255,255,255,0.1)',
+              }}
+              onClick={() => setFilterId(p.id)}
+              aria-label={p.name}
+            >
+              <img
+                src={previewUrl}
+                alt=""
+                style={{ width: 56, height: 56, objectFit: 'cover', display: 'block', filter: p.css }}
+                draggable={false}
+              />
+              <span style={S.editorFilterLabel}>{p.name}</span>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* Sticker tray */}
       {tray === 'stickers' && (
         <div style={S.editorTray}>
           <div style={S.editorTrayHeader}>
@@ -5869,13 +5977,21 @@ function ExposurePostEditor({ photoFile, onBack, onNext }: {
                 style={S.editorStickerCell}
                 onClick={() => addSticker(s.id)}
                 aria-label={s.name}
-                dangerouslySetInnerHTML={{ __html: s.svg.replace('<svg ', '<svg width="48" height="48" ') }}
-              />
+              >
+                <img
+                  src={s.url}
+                  alt={s.name}
+                  crossOrigin="anonymous"
+                  style={{ width: 48, height: 48, display: 'block' }}
+                  draggable={false}
+                />
+              </button>
             ))}
           </div>
         </div>
       )}
 
+      {/* Text tray */}
       {tray === 'text' && (
         <div style={S.editorTray}>
           <div style={S.editorTrayHeader}>
@@ -5898,8 +6014,22 @@ function ExposurePostEditor({ photoFile, onBack, onNext }: {
         </div>
       )}
 
-      {/* Bottom toolbar */}
+      {/* Bottom toolbar — 5 tools: Crop, Filter, Frame, Stickers, Text */}
       <div style={S.editorToolbar}>
+        <button
+          style={{ ...S.editorToolBtn, color: (crop.w < 1 || crop.h < 1 || rotation !== 0) ? '#FF3B5C' : '#FFF' }}
+          onClick={() => setTray('crop')}
+        >
+          <span style={S.editorToolIcon}>⊡</span>
+          <span style={S.editorToolLabel}>Crop</span>
+        </button>
+        <button
+          style={{ ...S.editorToolBtn, color: tray === 'filter' ? '#FF3B5C' : (filterId !== 'none' ? '#FF8AA3' : '#FFF') }}
+          onClick={() => setTray((t) => (t === 'filter' ? null : 'filter'))}
+        >
+          <span style={S.editorToolIcon}>◐</span>
+          <span style={S.editorToolLabel}>Filter</span>
+        </button>
         <button
           style={{ ...S.editorToolBtn, color: filmstripOn ? '#FF3B5C' : '#888' }}
           onClick={() => setFilmstripOn((v) => !v)}
@@ -5921,6 +6051,284 @@ function ExposurePostEditor({ photoFile, onBack, onNext }: {
           <span style={S.editorToolIcon}>Aa</span>
           <span style={S.editorToolLabel}>Text</span>
         </button>
+      </div>
+    </>
+  );
+}
+
+// ---------- ExposureCropScreen ----------
+// Standalone full-screen crop tool. Image rendered behind a darkened
+// scrim with a transparent crop window over the center. Edges/corners
+// are draggable, body is draggable for repositioning. 90° rotate button
+// in the top toolbar. "Done" applies the crop and returns. "Cancel"
+// reverts to whatever crop was already set.
+//
+// Crop is in normalized image coords (0..1). The screen tracks its own
+// `working` state and commits on Done.
+function ExposureCropScreen({ sourceUrl, crop, rotation, onChangeCrop, onChangeRotation, onDone, onCancel }: {
+  sourceUrl: string;
+  crop: CropRect;
+  rotation: 0 | 90 | 180 | 270;
+  onChangeCrop: (c: CropRect) => void;
+  onChangeRotation: (r: 0 | 90 | 180 | 270) => void;
+  onDone: () => void;
+  onCancel: () => void;
+}) {
+  const [working, setWorking] = useState<CropRect>(crop);
+  const [workingRotation, setWorkingRotation] = useState<0 | 90 | 180 | 270>(rotation);
+  const wrapRef = useRef<HTMLDivElement | null>(null);
+  // We measure the rendered image bounds (object-fit:contain) so drag math
+  // works in image-space, not in the wrapper's letterbox-space.
+  const [imgRect, setImgRect] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
+  const imgRef = useRef<HTMLImageElement | null>(null);
+
+  useEffect(() => {
+    const measure = () => {
+      const wrap = wrapRef.current;
+      const img = imgRef.current;
+      if (!wrap || !img || !img.complete) return;
+      const wrapR = wrap.getBoundingClientRect();
+      // object-fit:contain — image's display rect is centered in wrap
+      const naturalRatio = img.naturalWidth / img.naturalHeight;
+      const wrapRatio = wrapR.width / wrapR.height;
+      let dispW: number, dispH: number;
+      if (naturalRatio > wrapRatio) {
+        dispW = wrapR.width;
+        dispH = wrapR.width / naturalRatio;
+      } else {
+        dispH = wrapR.height;
+        dispW = wrapR.height * naturalRatio;
+      }
+      const left = (wrapR.width - dispW) / 2;
+      const top = (wrapR.height - dispH) / 2;
+      setImgRect({ left, top, width: dispW, height: dispH });
+    };
+    measure();
+    window.addEventListener('resize', measure);
+    return () => window.removeEventListener('resize', measure);
+  }, [sourceUrl]);
+
+  // Drag handlers for crop window. Mode = which part is being dragged.
+  type DragMode = 'move' | 'tl' | 'tr' | 'bl' | 'br';
+  const startDrag = (e: React.PointerEvent, mode: DragMode) => {
+    e.stopPropagation();
+    if (!imgRect) return;
+    const target = e.currentTarget as HTMLElement;
+    target.setPointerCapture(e.pointerId);
+    const startCrop = { ...working };
+    const startX = e.clientX;
+    const startY = e.clientY;
+
+    const move = (ev: PointerEvent) => {
+      if (!imgRect) return;
+      const dx = (ev.clientX - startX) / imgRect.width;
+      const dy = (ev.clientY - startY) / imgRect.height;
+      let { x, y, w, h } = startCrop;
+      if (mode === 'move') {
+        x = Math.max(0, Math.min(1 - w, x + dx));
+        y = Math.max(0, Math.min(1 - h, y + dy));
+      } else if (mode === 'tl') {
+        const newX = Math.max(0, Math.min(x + w - 0.1, x + dx));
+        const newY = Math.max(0, Math.min(y + h - 0.1, y + dy));
+        w = w - (newX - x);
+        h = h - (newY - y);
+        x = newX;
+        y = newY;
+      } else if (mode === 'tr') {
+        const newY = Math.max(0, Math.min(y + h - 0.1, y + dy));
+        const newW = Math.max(0.1, Math.min(1 - x, w + dx));
+        h = h - (newY - y);
+        y = newY;
+        w = newW;
+      } else if (mode === 'bl') {
+        const newX = Math.max(0, Math.min(x + w - 0.1, x + dx));
+        w = w - (newX - x);
+        x = newX;
+        h = Math.max(0.1, Math.min(1 - y, h + dy));
+      } else if (mode === 'br') {
+        w = Math.max(0.1, Math.min(1 - x, w + dx));
+        h = Math.max(0.1, Math.min(1 - y, h + dy));
+      }
+      setWorking({ x, y, w, h });
+    };
+    const up = () => {
+      target.removeEventListener('pointermove', move as any);
+      target.removeEventListener('pointerup', up as any);
+      target.removeEventListener('pointercancel', up as any);
+    };
+    target.addEventListener('pointermove', move as any);
+    target.addEventListener('pointerup', up as any);
+    target.addEventListener('pointercancel', up as any);
+  };
+
+  const applyPreset = (ratio: number | 'free' | 'original') => {
+    if (ratio === 'free') return; // free leaves the crop alone
+    if (ratio === 'original') {
+      setWorking(FULL_CROP);
+      return;
+    }
+    // Set a centered crop matching the requested aspect ratio.
+    // Aspect ratio = w/h. We need a rectangle inside [0,1]x[0,1] of
+    // the SOURCE image (which has its own aspect). The crop is in
+    // normalized source-image coords, so we have to factor that in.
+    const img = imgRef.current;
+    const srcAspect = img && img.naturalHeight ? img.naturalWidth / img.naturalHeight : 1;
+    // We want display crop = ratio (w/h in display pixels)
+    // Source-normalized crop w / h must satisfy:
+    //   (w * srcW) / (h * srcH) = ratio
+    //   w / h = ratio * (srcH / srcW) = ratio / srcAspect
+    const normRatio = ratio / srcAspect;
+    let cw: number, ch: number;
+    if (normRatio >= 1) {
+      cw = 1;
+      ch = 1 / normRatio;
+    } else {
+      ch = 1;
+      cw = normRatio;
+    }
+    const cx = (1 - cw) / 2;
+    const cy = (1 - ch) / 2;
+    setWorking({ x: cx, y: cy, w: cw, h: ch });
+  };
+
+  const rotate90 = () => {
+    const next: 0 | 90 | 180 | 270 = (((workingRotation + 90) % 360) as 0 | 90 | 180 | 270);
+    setWorkingRotation(next);
+  };
+
+  const onDoneClick = () => {
+    onChangeCrop(working);
+    onChangeRotation(workingRotation);
+    onDone();
+  };
+
+  // Compute crop overlay pixel rect from working state + imgRect
+  const overlayRect = imgRect ? {
+    left: imgRect.left + working.x * imgRect.width,
+    top: imgRect.top + working.y * imgRect.height,
+    width: working.w * imgRect.width,
+    height: working.h * imgRect.height,
+  } : null;
+
+  return (
+    <>
+      <div style={S.igComposerHeader}>
+        <button onClick={onCancel} style={S.igComposerHeaderBtn} aria-label="Cancel">Cancel</button>
+        <div style={S.igComposerHeaderTitle}>Crop</div>
+        <button onClick={onDoneClick} style={{ ...S.igComposerHeaderNext, color: '#3B9DFF', cursor: 'pointer' }}>Done</button>
+      </div>
+
+      <div ref={wrapRef} style={S.editorCropWrap}>
+        <img
+          ref={imgRef}
+          src={sourceUrl}
+          alt=""
+          onLoad={() => {
+            // re-measure once loaded
+            const w = wrapRef.current?.getBoundingClientRect();
+            const img = imgRef.current;
+            if (!w || !img) return;
+            const naturalRatio = img.naturalWidth / img.naturalHeight;
+            const wrapRatio = w.width / w.height;
+            let dispW: number, dispH: number;
+            if (naturalRatio > wrapRatio) {
+              dispW = w.width;
+              dispH = w.width / naturalRatio;
+            } else {
+              dispH = w.height;
+              dispW = w.height * naturalRatio;
+            }
+            setImgRect({ left: (w.width - dispW) / 2, top: (w.height - dispH) / 2, width: dispW, height: dispH });
+          }}
+          style={{
+            ...S.editorCropImg,
+            transform: workingRotation ? `rotate(${workingRotation}deg)` : undefined,
+          }}
+          draggable={false}
+        />
+
+        {/* Dark scrim everywhere except inside crop */}
+        {overlayRect && (
+          <div
+            style={{
+              position: 'absolute',
+              inset: 0,
+              pointerEvents: 'none',
+              background: `linear-gradient(rgba(0,0,0,0.55),rgba(0,0,0,0.55))`,
+              WebkitMaskImage: `linear-gradient(#000, #000), linear-gradient(#000, #000)`,
+              WebkitMaskComposite: 'xor' as any,
+              maskComposite: 'exclude' as any,
+              clipPath: `polygon(
+                0% 0%, 0% 100%, ${overlayRect.left}px 100%, ${overlayRect.left}px ${overlayRect.top}px,
+                ${overlayRect.left + overlayRect.width}px ${overlayRect.top}px,
+                ${overlayRect.left + overlayRect.width}px ${overlayRect.top + overlayRect.height}px,
+                ${overlayRect.left}px ${overlayRect.top + overlayRect.height}px,
+                ${overlayRect.left}px 100%, 100% 100%, 100% 0%
+              )`,
+            }}
+          />
+        )}
+
+        {/* Crop window */}
+        {overlayRect && (
+          <div
+            style={{
+              position: 'absolute',
+              left: overlayRect.left,
+              top: overlayRect.top,
+              width: overlayRect.width,
+              height: overlayRect.height,
+              border: '1px solid rgba(255,255,255,0.9)',
+              boxShadow: '0 0 0 1px rgba(0,0,0,0.4)',
+              cursor: 'move',
+              touchAction: 'none',
+            }}
+            onPointerDown={(e) => startDrag(e, 'move')}
+          >
+            {/* Rule-of-thirds gridlines */}
+            <div style={{ position: 'absolute', left: 0, right: 0, top: '33.33%', height: 1, background: 'rgba(255,255,255,0.3)', pointerEvents: 'none' }} />
+            <div style={{ position: 'absolute', left: 0, right: 0, top: '66.66%', height: 1, background: 'rgba(255,255,255,0.3)', pointerEvents: 'none' }} />
+            <div style={{ position: 'absolute', top: 0, bottom: 0, left: '33.33%', width: 1, background: 'rgba(255,255,255,0.3)', pointerEvents: 'none' }} />
+            <div style={{ position: 'absolute', top: 0, bottom: 0, left: '66.66%', width: 1, background: 'rgba(255,255,255,0.3)', pointerEvents: 'none' }} />
+            {/* Corner handles */}
+            {(['tl','tr','bl','br'] as const).map((c) => (
+              <div
+                key={c}
+                style={{
+                  position: 'absolute',
+                  width: 28,
+                  height: 28,
+                  ...(c === 'tl' ? { left: -14, top: -14, cursor: 'nwse-resize' } : {}),
+                  ...(c === 'tr' ? { right: -14, top: -14, cursor: 'nesw-resize' } : {}),
+                  ...(c === 'bl' ? { left: -14, bottom: -14, cursor: 'nesw-resize' } : {}),
+                  ...(c === 'br' ? { right: -14, bottom: -14, cursor: 'nwse-resize' } : {}),
+                  touchAction: 'none',
+                }}
+                onPointerDown={(e) => startDrag(e, c)}
+              >
+                <div style={{
+                  position: 'absolute',
+                  inset: 8,
+                  background: '#FFFFFF',
+                  borderRadius: 2,
+                  boxShadow: '0 0 0 2px rgba(0,0,0,0.4)',
+                  pointerEvents: 'none',
+                }} />
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Aspect ratio + rotate row */}
+      <div style={S.editorCropRow}>
+        <button style={S.editorCropChip} onClick={() => applyPreset('free')}>Free</button>
+        <button style={S.editorCropChip} onClick={() => applyPreset('original')}>Original</button>
+        <button style={S.editorCropChip} onClick={() => applyPreset(1)}>1:1</button>
+        <button style={S.editorCropChip} onClick={() => applyPreset(4/5)}>4:5</button>
+        <button style={S.editorCropChip} onClick={() => applyPreset(16/9)}>16:9</button>
+        <button style={S.editorCropChip} onClick={() => applyPreset(9/16)}>9:16</button>
+        <button style={S.editorCropChip} onClick={rotate90} aria-label="Rotate 90 degrees">⟳</button>
       </div>
     </>
   );
@@ -14876,6 +15284,75 @@ const S: Record<string, React.CSSProperties> = {
     fontWeight: 700,
     cursor: 'pointer',
     fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+
+  // ---- Crop screen ----
+  editorCropWrap: {
+    flex: 1,
+    position: 'relative' as const,
+    backgroundColor: '#000',
+    overflow: 'hidden' as const,
+    touchAction: 'none' as const,
+  },
+  editorCropImg: {
+    position: 'absolute' as const,
+    inset: 0,
+    width: '100%',
+    height: '100%',
+    objectFit: 'contain' as const,
+    userSelect: 'none' as const,
+    pointerEvents: 'none' as const,
+  },
+  editorCropRow: {
+    display: 'flex',
+    gap: 8,
+    padding: '10px 12px 16px',
+    overflowX: 'auto' as const,
+    backgroundColor: '#000',
+    borderTop: '1px solid #1a1a1a',
+  },
+  editorCropChip: {
+    flexShrink: 0,
+    padding: '8px 14px',
+    backgroundColor: 'rgba(255,255,255,0.06)',
+    border: '1px solid rgba(255,255,255,0.12)',
+    borderRadius: 18,
+    color: '#F0EBE0',
+    fontSize: 13,
+    fontWeight: 600,
+    cursor: 'pointer',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    letterSpacing: '0.04em',
+  },
+
+  // ---- Filter strip ----
+  // Horizontal scroll row of preview thumbnails. Sits above the toolbar
+  // when the Filter tool is active.
+  editorFilterStrip: {
+    display: 'flex',
+    gap: 10,
+    padding: '10px 12px',
+    overflowX: 'auto' as const,
+    backgroundColor: '#0a0a0a',
+    borderTop: '1px solid #1a1a1a',
+  },
+  editorFilterCell: {
+    flexShrink: 0,
+    display: 'flex',
+    flexDirection: 'column' as const,
+    alignItems: 'center',
+    gap: 4,
+    padding: 4,
+    backgroundColor: 'transparent',
+    borderRadius: 8,
+    cursor: 'pointer',
+  },
+  editorFilterLabel: {
+    fontSize: 10,
+    color: '#F0EBE0',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    letterSpacing: '0.04em',
+    textTransform: 'uppercase' as const,
   },
   postComposerSubmitDisabled: {
     flex: 1.4,
