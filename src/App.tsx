@@ -6676,6 +6676,278 @@ function ExposureSearchView({ allPosts, currentHandle, deviceId, sites, onSelect
   );
 }
 
+// ---------- PhotoLightbox ----------
+// Full-screen image viewer for tapping into a feed post photo. Renders
+// the photo at its native aspect ratio, fit to screen, on a black
+// backdrop. Supports:
+//   - Pinch-to-zoom (1x to 4x)
+//   - Pan when zoomed in
+//   - Double-tap to zoom in (2x) / back to fit (1x)
+//   - Swipe down to dismiss (when at 1x, not zoomed)
+//   - Tap close button (X) to dismiss
+//
+// Implementation notes:
+//   - Single-pointer touch = drag (pan if zoomed, swipe-down dismiss if not)
+//   - Two-pointer touch = pinch (scale + translate around pinch center)
+//   - We use raw touch events for pinch because PointerEvents don't give
+//     us reliable simultaneous pinch tracking on iOS WebKit. Touch events
+//     are the established cross-iOS way to handle multi-touch gestures.
+//   - When zoomed out (scale=1), pan is locked and vertical drag triggers
+//     dismiss. When zoomed in, pan is enabled and swipe-down is disabled
+//     (otherwise the user can't pan up).
+//   - Background opacity tracks dismiss-drag progress for a nice fade-out
+//     feel — drag down 100px → backdrop at 70%, drag 250px → dismissed.
+function PhotoLightbox({ imageUrl, onClose }: {
+  imageUrl: string;
+  onClose: () => void;
+}) {
+  const [scale, setScale] = useState(1);
+  const [tx, setTx] = useState(0);
+  const [ty, setTy] = useState(0);
+  const [dismissDrag, setDismissDrag] = useState(0); // y-offset while swiping to dismiss
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  // Refs hold gesture state between events without re-rendering.
+  const gestureRef = useRef<{
+    mode: 'idle' | 'pan' | 'pinch' | 'dismiss';
+    startX: number;
+    startY: number;
+    startTx: number;
+    startTy: number;
+    startDist: number;
+    startScale: number;
+    pinchCx: number;        // pinch center at gesture start (image-space)
+    pinchCy: number;
+    lastTapTime: number;
+  }>({
+    mode: 'idle',
+    startX: 0, startY: 0,
+    startTx: 0, startTy: 0,
+    startDist: 0, startScale: 1,
+    pinchCx: 0, pinchCy: 0,
+    lastTapTime: 0,
+  });
+
+  // Lock body scroll while open. Restore on unmount.
+  useEffect(() => {
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => { document.body.style.overflow = prev; };
+  }, []);
+
+  // Esc to close (desktop nicety).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  // Helper — distance between two touches.
+  const touchDist = (a: Touch, b: Touch) =>
+    Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+
+  // Clamp pan so the image can't be dragged off-screen entirely. Bound
+  // is roughly (scale-1) * half-of-container-dimension on each axis.
+  const clampPan = (nextTx: number, nextTy: number, atScale: number) => {
+    const c = containerRef.current;
+    if (!c) return { tx: nextTx, ty: nextTy };
+    const w = c.clientWidth;
+    const h = c.clientHeight;
+    const maxX = Math.max(0, (atScale - 1) * w / 2);
+    const maxY = Math.max(0, (atScale - 1) * h / 2);
+    return {
+      tx: Math.max(-maxX, Math.min(maxX, nextTx)),
+      ty: Math.max(-maxY, Math.min(maxY, nextTy)),
+    };
+  };
+
+  const onTouchStart = (e: React.TouchEvent) => {
+    const g = gestureRef.current;
+    if (e.touches.length === 2) {
+      // Pinch start
+      const [t1, t2] = [e.touches[0], e.touches[1]];
+      g.mode = 'pinch';
+      g.startDist = touchDist(t1, t2);
+      g.startScale = scale;
+      g.startTx = tx;
+      g.startTy = ty;
+      g.pinchCx = (t1.clientX + t2.clientX) / 2;
+      g.pinchCy = (t1.clientY + t2.clientY) / 2;
+    } else if (e.touches.length === 1) {
+      const t = e.touches[0];
+      // Double-tap detection — two single-taps within 300ms.
+      const now = Date.now();
+      if (now - g.lastTapTime < 300) {
+        // Toggle zoom 1x <-> 2x at tap point.
+        if (scale > 1) {
+          setScale(1); setTx(0); setTy(0);
+        } else {
+          const c = containerRef.current;
+          if (c) {
+            const r = c.getBoundingClientRect();
+            const cx = r.left + r.width / 2;
+            const cy = r.top + r.height / 2;
+            const newScale = 2;
+            // Translate so the tapped point stays under the finger.
+            const newTx = (cx - t.clientX) * (newScale - 1);
+            const newTy = (cy - t.clientY) * (newScale - 1);
+            const clamped = clampPan(newTx, newTy, newScale);
+            setScale(newScale);
+            setTx(clamped.tx);
+            setTy(clamped.ty);
+          }
+        }
+        g.lastTapTime = 0;
+        g.mode = 'idle';
+        return;
+      }
+      g.lastTapTime = now;
+      g.startX = t.clientX;
+      g.startY = t.clientY;
+      g.startTx = tx;
+      g.startTy = ty;
+      // If zoomed in, single-pointer = pan. If at 1x, single-pointer =
+      // candidate for swipe-down-dismiss; we wait for movement to decide.
+      g.mode = scale > 1 ? 'pan' : 'dismiss';
+    }
+  };
+
+  const onTouchMove = (e: React.TouchEvent) => {
+    const g = gestureRef.current;
+    if (g.mode === 'pinch' && e.touches.length === 2) {
+      const [t1, t2] = [e.touches[0], e.touches[1]];
+      const dist = touchDist(t1, t2);
+      const rawScale = g.startScale * (dist / g.startDist);
+      const newScale = Math.max(1, Math.min(4, rawScale));
+      // Keep the pinch center stable under the fingers.
+      const cx = (t1.clientX + t2.clientX) / 2;
+      const cy = (t1.clientY + t2.clientY) / 2;
+      const dx = cx - g.pinchCx;
+      const dy = cy - g.pinchCy;
+      const clamped = clampPan(g.startTx + dx, g.startTy + dy, newScale);
+      setScale(newScale);
+      setTx(clamped.tx);
+      setTy(clamped.ty);
+    } else if (g.mode === 'pan' && e.touches.length === 1) {
+      const t = e.touches[0];
+      const dx = t.clientX - g.startX;
+      const dy = t.clientY - g.startY;
+      const clamped = clampPan(g.startTx + dx, g.startTy + dy, scale);
+      setTx(clamped.tx);
+      setTy(clamped.ty);
+    } else if (g.mode === 'dismiss' && e.touches.length === 1) {
+      const t = e.touches[0];
+      const dy = t.clientY - g.startY;
+      const dx = t.clientX - g.startX;
+      // Only count downward drag as dismiss; horizontal swipes do nothing.
+      // Allow some upward drag too so accidental tiny upward drift doesn't
+      // feel sticky. Anything > 12px down enters the dismiss visual state.
+      if (dy > 0 && Math.abs(dx) < dy * 1.5) {
+        setDismissDrag(dy);
+      } else {
+        setDismissDrag(0);
+      }
+    }
+  };
+
+  const onTouchEnd = (e: React.TouchEvent) => {
+    const g = gestureRef.current;
+    if (g.mode === 'dismiss') {
+      // Commit dismiss if dragged > 120px, otherwise snap back.
+      if (dismissDrag > 120) {
+        onClose();
+      } else {
+        setDismissDrag(0);
+      }
+    }
+    if (e.touches.length === 0) {
+      g.mode = 'idle';
+    } else if (e.touches.length === 1 && g.mode === 'pinch') {
+      // Lifted one finger out of a pinch — convert to pan if zoomed,
+      // else idle. Reset pan anchor to the remaining finger.
+      const t = e.touches[0];
+      g.startX = t.clientX;
+      g.startY = t.clientY;
+      g.startTx = tx;
+      g.startTy = ty;
+      g.mode = scale > 1 ? 'pan' : 'idle';
+    }
+  };
+
+  // Backdrop opacity fades with dismiss drag. 1 at rest, 0 fully dragged.
+  const backdropAlpha = Math.max(0.4, 1 - dismissDrag / 300);
+
+  return createPortal(
+    <div
+      ref={containerRef}
+      onTouchStart={onTouchStart}
+      onTouchMove={onTouchMove}
+      onTouchEnd={onTouchEnd}
+      onClick={(e) => {
+        // Plain click on backdrop (not on image) = dismiss. We check
+        // target to avoid dismissing when tapping the image itself,
+        // which is the normal way users interact with the viewer.
+        if (e.target === e.currentTarget) onClose();
+      }}
+      style={{
+        position: 'fixed',
+        inset: 0,
+        backgroundColor: `rgba(0,0,0,${backdropAlpha})`,
+        zIndex: 10000,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        overflow: 'hidden',
+        touchAction: 'none',
+        userSelect: 'none',
+      }}
+    >
+      {/* Close (X) button. Always available regardless of zoom state. */}
+      <button
+        onClick={(e) => { e.stopPropagation(); onClose(); }}
+        aria-label="Close"
+        style={{
+          position: 'absolute',
+          top: 'calc(env(safe-area-inset-top, 0px) + 12px)',
+          right: 12,
+          width: 40,
+          height: 40,
+          borderRadius: 20,
+          backgroundColor: 'rgba(0,0,0,0.5)',
+          border: '1px solid rgba(255,255,255,0.2)',
+          color: '#fff',
+          fontSize: 20,
+          fontWeight: 700,
+          cursor: 'pointer',
+          zIndex: 2,
+          backdropFilter: 'blur(6px)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+        }}
+      >
+        ✕
+      </button>
+
+      <img
+        src={imageUrl}
+        alt=""
+        draggable={false}
+        style={{
+          maxWidth: '100%',
+          maxHeight: '100%',
+          objectFit: 'contain',
+          display: 'block',
+          transform: `translate(${tx}px, ${ty + dismissDrag}px) scale(${scale})`,
+          transition: gestureRef.current.mode === 'idle' ? 'transform 0.2s ease-out' : 'none',
+          transformOrigin: 'center center',
+          pointerEvents: 'none',
+        }}
+      />
+    </div>,
+    document.body
+  );
+}
+
 // Single post card inside the feed. Owns its own like state so toggling
 // is fast and doesn't trigger a parent re-render of the whole list.
 function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap, onPostRemoved }: {
@@ -6706,6 +6978,9 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap,
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   // Local-hide fallback when no onPostRemoved callback is wired.
   const [localHidden, setLocalHidden] = useState(false);
+  // Lightbox state — tapping the photo opens a full-screen viewer with
+  // pinch-zoom, pan, and swipe-down dismiss. See PhotoLightbox above.
+  const [lightboxOpen, setLightboxOpen] = useState(false);
 
   // Follow state — only relevant for other people's posts. Inline
   // button matches IG: "Follow" → "Following" after tap. Server is the
@@ -6852,9 +7127,26 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap,
         >⋯</button>
       </div>
 
-      {/* Photo — edge-to-edge with slightly rounded corners (per request).
-          objectFit cover keeps aspect ratio without letterboxing. */}
-      <img src={post.photoUrl} alt="" style={S.postPhoto} />
+      {/* Photo — edge-to-edge with slightly rounded corners. 4:5 portrait
+          crop in the feed; tap to open the full-aspect lightbox viewer
+          with pinch-zoom and pan. The wrapping button gets keyboard +
+          screen-reader semantics for free. */}
+      <button
+        type="button"
+        onClick={() => setLightboxOpen(true)}
+        aria-label="View photo fullscreen"
+        style={{
+          padding: 0,
+          margin: 0,
+          border: 'none',
+          background: 'transparent',
+          cursor: 'pointer',
+          display: 'block',
+          width: '100%',
+        }}
+      >
+        <img src={post.photoUrl} alt="" style={S.postPhoto} draggable={false} />
+      </button>
 
       {/* Actions row — Instagram-style line icons: heart, comment (disabled
           for now, real comments later), share. All outlined SVGs at equal
@@ -7066,6 +7358,15 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap,
             setReportOpen(false);
             showToast('Thanks — report sent', 'success');
           }}
+        />
+      )}
+
+      {/* Full-screen photo viewer — opens when user taps the post photo.
+          Pinch-zoom, pan when zoomed, double-tap zoom, swipe-down dismiss. */}
+      {lightboxOpen && (
+        <PhotoLightbox
+          imageUrl={post.photoUrl}
+          onClose={() => setLightboxOpen(false)}
         />
       )}
     </div>
@@ -15444,7 +15745,7 @@ const S: Record<string, React.CSSProperties> = {
   mapBackBtn: {
     position: 'absolute' as const,
     left: 12,
-    bottom: 12,
+    top: 12,
     zIndex: 2,
     width: 36,
     height: 36,
@@ -15838,14 +16139,12 @@ const S: Record<string, React.CSSProperties> = {
   // Radius selector row beneath the NearbyView header. Five chips for the
   // available radii plus an optional Reset chip that appears when the user
   // has long-pressed to drop a custom search center on the map.
-  // Left padding leaves room for the circular back button (left:12 + 36w +
-  // ~8 gap) so the "5 MI" chip never sits beneath it on narrow phones.
   radiusRow: {
     display: 'flex',
     flexWrap: 'wrap' as const,
     justifyContent: 'center' as const,
     gap: 6,
-    padding: '8px 12px 4px 56px',
+    padding: '8px 12px 4px',
   },
   radiusChip: {
     background: 'transparent',
