@@ -95,6 +95,14 @@ workflows:
       - name: Inject Info.plist permission strings
         script: |
           PLIST="ios/App/App/Info.plist"
+          # Force the user-facing app name to "The Dread Directory" regardless
+          # of what Capacitor wrote during npx cap add ios. CFBundleDisplayName
+          # is what iOS shows on the home screen and Settings; CFBundleName is
+          # used internally. Patching both keeps everything consistent.
+          plutil -replace CFBundleDisplayName -string "The Dread Directory" "$PLIST" || \
+            plutil -insert CFBundleDisplayName -string "The Dread Directory" "$PLIST"
+          plutil -replace CFBundleName -string "The Dread Directory" "$PLIST" || \
+            plutil -insert CFBundleName -string "The Dread Directory" "$PLIST"
           plutil -insert NSLocationWhenInUseUsageDescription -string "The Dread Directory uses your location to show you nearby haunted, historical, and macabre sites." "$PLIST" || \
             plutil -replace NSLocationWhenInUseUsageDescription -string "The Dread Directory uses your location to show you nearby haunted, historical, and macabre sites." "$PLIST"
           plutil -insert NSLocationAlwaysAndWhenInUseUsageDescription -string "The Dread Directory needs background location access to notify you when you're near a sinister site, even when the app is closed." "$PLIST" || \
@@ -266,6 +274,14 @@ workflows:
       - name: Inject Info.plist permission strings
         script: |
           PLIST="ios/App/App/Info.plist"
+          # Force the user-facing app name to "The Dread Directory" regardless
+          # of what Capacitor wrote during npx cap add ios. CFBundleDisplayName
+          # is what iOS shows on the home screen and Settings; CFBundleName is
+          # used internally. Patching both keeps everything consistent.
+          plutil -replace CFBundleDisplayName -string "The Dread Directory" "$PLIST" || \
+            plutil -insert CFBundleDisplayName -string "The Dread Directory" "$PLIST"
+          plutil -replace CFBundleName -string "The Dread Directory" "$PLIST" || \
+            plutil -insert CFBundleName -string "The Dread Directory" "$PLIST"
           plutil -insert NSLocationWhenInUseUsageDescription -string "The Dread Directory uses your location to show you nearby haunted, historical, and macabre sites." "$PLIST" || \
             plutil -replace NSLocationWhenInUseUsageDescription -string "The Dread Directory uses your location to show you nearby haunted, historical, and macabre sites." "$PLIST"
           plutil -insert NSLocationAlwaysAndWhenInUseUsageDescription -string "The Dread Directory needs background location access to notify you when you're near a sinister site, even when the app is closed." "$PLIST" || \

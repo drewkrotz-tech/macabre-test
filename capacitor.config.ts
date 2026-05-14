@@ -2,7 +2,7 @@ import type { CapacitorConfig } from '@capacitor/cli';
 
 const config: CapacitorConfig = {
   appId: 'com.sinistertrivia.macabretest',
-  appName: 'Macabre Test',
+  appName: 'The Dread Directory',
   webDir: 'dist',
   server: {
     androidScheme: 'https',
