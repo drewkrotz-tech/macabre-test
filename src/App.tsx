@@ -1685,6 +1685,7 @@ const TILE_RED = '#FF3B3B';
 import cellCrime      from './assets/cell-crime.jpg';
 import cellHaunting   from './assets/cell-haunting.jpg';
 import cellCult       from './assets/cell-cult.jpg';
+import cellUfo        from './assets/cell-ufo.jpg';
 import cellKiller     from './assets/cell-killer.jpg';
 import cellFilm       from './assets/cell-film.jpg';
 import cellHistorical from './assets/cell-historical.jpg';
@@ -1715,9 +1716,9 @@ const CATEGORIES: { key: CategoryKey; label: string; gridIndex: number; cascadeO
   { key: 'haunting',   label: 'Hauntings',      gridIndex: 2, cascadeOrder: 1, borderColor: WHITE,    image: cellHaunting   },
   // UFO Sightings replaced Cults in v1.11. Server-side migration runs on
   // boot to move legacy category='cult' sites to category='crime'. The
-  // image asset still imports as cellCult here for now — swap the file
-  // at src/assets/cell-cult.jpg with a UFO-themed image when ready.
-  { key: 'ufo',        label: 'UFO Sightings',  gridIndex: 3, cascadeOrder: 4, borderColor: WHITE,    image: cellCult       },
+  // tile image is a vintage 1960s UFO Polaroid that lives at
+  // src/assets/cell-ufo.jpg.
+  { key: 'ufo',        label: 'UFO Sightings',  gridIndex: 3, cascadeOrder: 4, borderColor: WHITE,    image: cellUfo        },
   { key: 'killer',     label: 'Serial Killers', gridIndex: 4, cascadeOrder: 2, borderColor: TILE_RED, image: cellKiller     },
   { key: 'historical', label: 'Grave Sites',    gridIndex: 5, cascadeOrder: 3, borderColor: TILE_RED, image: cellHistorical },
 ];
