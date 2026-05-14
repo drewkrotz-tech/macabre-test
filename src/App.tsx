@@ -15745,7 +15745,7 @@ const S: Record<string, React.CSSProperties> = {
   mapBackBtn: {
     position: 'absolute' as const,
     left: 12,
-    top: 12,
+    bottom: 12,
     zIndex: 2,
     width: 36,
     height: 36,
@@ -16139,12 +16139,14 @@ const S: Record<string, React.CSSProperties> = {
   // Radius selector row beneath the NearbyView header. Five chips for the
   // available radii plus an optional Reset chip that appears when the user
   // has long-pressed to drop a custom search center on the map.
+  // Small left-pad nudges the chips right just enough to clear the
+  // bottom-left back button, without wrapping "100 MI" to a second line.
   radiusRow: {
     display: 'flex',
     flexWrap: 'wrap' as const,
     justifyContent: 'center' as const,
     gap: 6,
-    padding: '8px 12px 4px',
+    padding: '8px 12px 4px 24px',
   },
   radiusChip: {
     background: 'transparent',
