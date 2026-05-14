@@ -1625,6 +1625,18 @@ let _listLevelMemory: _ListLevelSnapshot | null = null;
 // pop normally."
 let _listSwipeBackHook: (() => boolean) | null = null;
 
+// When non-zero, the global swipe-back touch handler bails on touchstart.
+// Used by full-screen modal flows like the post editor where horizontal
+// swipes are part of the in-screen UI (font picker, filter strip, sticker
+// drawer scroll) and must not pop the nav stack. Reference-counted (set on
+// mount/unmount via beginSuppressSwipeBack/endSuppressSwipeBack) so
+// nested suppressors don't accidentally re-enable each other.
+let _swipeBackSuppressCount = 0;
+function beginSuppressSwipeBack() { _swipeBackSuppressCount++; }
+function endSuppressSwipeBack() {
+  _swipeBackSuppressCount = Math.max(0, _swipeBackSuppressCount - 1);
+}
+
 // ---------- Toasts ----------
 // Lightweight global toast system. Any component can call showToast(msg)
 // and a small notification slides up from above the bottom bar for ~2.5
@@ -2517,6 +2529,7 @@ export default function App() {
     };
 
     const onStart = (e: TouchEvent) => {
+      if (_swipeBackSuppressCount > 0) return;
       if (!e.touches || e.touches.length !== 1) return;
       const tch = e.touches[0];
       startX = tch.clientX;
@@ -5797,6 +5810,17 @@ function ExposurePostEditor({ photoFile, onBack, onNext }: {
   const previewRef = useRef<HTMLDivElement | null>(null);
   const previewUrl = useMemo(() => URL.createObjectURL(photoFile), [photoFile]);
   useEffect(() => () => URL.revokeObjectURL(previewUrl), [previewUrl]);
+
+  // Disable the global swipe-back gesture while the editor is open.
+  // Horizontal swipes inside the editor (font picker, filter strip, sticker
+  // drawer scroll, dragging stickers/text across the canvas) would otherwise
+  // be hijacked by the swipe-back handler and pop the user back to the
+  // pick-photo screen mid-edit, losing all their work. Reference-counted so
+  // nested editors (if we ever add one) don't fight each other.
+  useEffect(() => {
+    beginSuppressSwipeBack();
+    return () => { endSuppressSwipeBack(); };
+  }, []);
 
   const addSticker = (stickerId: string) => {
     setLayers((prev) => [
