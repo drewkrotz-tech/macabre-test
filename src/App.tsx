@@ -721,9 +721,13 @@ type SocialPost = {
 };
 
 // One comment on a post. Returned by GET /comments/post/:postId.
+// parentId carries IG-style reply structure: null for top-level
+// comments, set to the root top-level comment id for replies. Replies
+// are always one level deep (server flattens reply-to-reply chains).
 type SocialComment = {
   id: string;
   postId: string;
+  parentId?: string | null;
   handle: string;
   body: string;
   createdAt: string;
@@ -926,7 +930,7 @@ async function apiFetchComments(postId: string): Promise<SocialComment[]> {
 
 // Create a new comment on a post. Server auto-approves and updates the
 // parent post's cached commentCount.
-async function apiCreateComment(args: { postId: string; handle: string; deviceId: string; body: string }): Promise<{ ok: boolean; comment?: SocialComment; reason?: string }> {
+async function apiCreateComment(args: { postId: string; handle: string; deviceId: string; body: string; parentId?: string | null }): Promise<{ ok: boolean; comment?: SocialComment; reason?: string }> {
   try {
     const res = await fetch(`${API_BASE}/comments`, {
       method: 'POST',
@@ -1628,8 +1632,7 @@ let _listSwipeBackHook: (() => boolean) | null = null;
 // When non-zero, the global swipe-back touch handler bails on touchstart.
 // Used by full-screen modal flows like the post editor where horizontal
 // swipes are part of the in-screen UI (font picker, filter strip, sticker
-// drawer scroll) and must not pop the nav stack. Reference-counted (set on
-// mount/unmount via beginSuppressSwipeBack/endSuppressSwipeBack) so
+// drawer scroll) and must not pop the nav stack. Reference-counted so
 // nested suppressors don't accidentally re-enable each other.
 let _swipeBackSuppressCount = 0;
 function beginSuppressSwipeBack() { _swipeBackSuppressCount++; }
@@ -1699,12 +1702,16 @@ import backSound from './assets/back.mp3';
 // Submit button). A celebratory cue distinct from the regular click.
 import bellSound from './assets/bell.mp3';
 
-type CategoryKey = 'crime' | 'film' | 'haunting' | 'cult' | 'killer' | 'historical';
+type CategoryKey = 'crime' | 'film' | 'haunting' | 'ufo' | 'killer' | 'historical';
 const CATEGORIES: { key: CategoryKey; label: string; gridIndex: number; cascadeOrder: number; borderColor: string; image: string }[] = [
   { key: 'crime',      label: 'True Crime',     gridIndex: 0, cascadeOrder: 0, borderColor: TILE_RED, image: cellCrime      },
   { key: 'film',       label: 'Film Locations', gridIndex: 1, cascadeOrder: 5, borderColor: TILE_RED, image: cellFilm       },
   { key: 'haunting',   label: 'Hauntings',      gridIndex: 2, cascadeOrder: 1, borderColor: WHITE,    image: cellHaunting   },
-  { key: 'cult',       label: 'Cults',          gridIndex: 3, cascadeOrder: 4, borderColor: WHITE,    image: cellCult       },
+  // UFO Sightings replaced Cults in v1.11. Server-side migration runs on
+  // boot to move legacy category='cult' sites to category='crime'. The
+  // image asset still imports as cellCult here for now — swap the file
+  // at src/assets/cell-cult.jpg with a UFO-themed image when ready.
+  { key: 'ufo',        label: 'UFO Sightings',  gridIndex: 3, cascadeOrder: 4, borderColor: WHITE,    image: cellCult       },
   { key: 'killer',     label: 'Serial Killers', gridIndex: 4, cascadeOrder: 2, borderColor: TILE_RED, image: cellKiller     },
   { key: 'historical', label: 'Grave Sites',    gridIndex: 5, cascadeOrder: 3, borderColor: TILE_RED, image: cellHistorical },
 ];
@@ -1713,7 +1720,7 @@ const CATEGORY_COLOR: Record<CategoryKey, string> = {
   crime:      '#FF3B3B',
   film:       '#FF9D2E',
   haunting:   '#3FA9FF',
-  cult:       '#34D058',
+  ufo:        '#34D058',
   killer:     '#A45CFF',
   historical: '#FFD93B',
 };
@@ -5815,8 +5822,7 @@ function ExposurePostEditor({ photoFile, onBack, onNext }: {
   // Horizontal swipes inside the editor (font picker, filter strip, sticker
   // drawer scroll, dragging stickers/text across the canvas) would otherwise
   // be hijacked by the swipe-back handler and pop the user back to the
-  // pick-photo screen mid-edit, losing all their work. Reference-counted so
-  // nested editors (if we ever add one) don't fight each other.
+  // pick-photo screen mid-edit, losing all their work.
   useEffect(() => {
     beginSuppressSwipeBack();
     return () => { endSuppressSwipeBack(); };
@@ -7747,6 +7753,16 @@ function CommentSheet({ post, currentHandle, deviceId, onClose, onCountChange }:
   // the report modal opens.
   const [menuCommentId, setMenuCommentId] = useState<string | null>(null);
   const [reportComment, setReportComment] = useState<SocialComment | null>(null);
+  // Reply state. When non-null, the composer shows a "Replying to @X"
+  // pill and the next submit sends parentId pointing at this comment.
+  // We always store the ROOT top-level comment id here (the server
+  // would flatten it anyway), so even if the user taps Reply on a reply,
+  // the next message threads correctly under the original parent.
+  const [replyingTo, setReplyingTo] = useState<{ parentId: string; handle: string } | null>(null);
+  // Set of top-level comment ids whose replies are currently expanded.
+  // IG default: replies are hidden behind a "View N replies" toggle.
+  // Tapping toggles inclusion in this set.
+  const [expandedReplies, setExpandedReplies] = useState<Set<string>>(new Set());
 
   // Mount transition — set `mounted` true on next frame so the
   // translateY(100%) initial style gets a chance to commit before the
@@ -7754,6 +7770,19 @@ function CommentSheet({ post, currentHandle, deviceId, onClose, onCountChange }:
   useEffect(() => {
     const id = requestAnimationFrame(() => setMounted(true));
     return () => cancelAnimationFrame(id);
+  }, []);
+
+  // Lock body scroll while the sheet is open. Without this, even with
+  // overscrollBehavior:contain on the list, the underlying feed can
+  // scroll if the user starts a drag outside the list (e.g. on the
+  // composer or the emoji row). Locking the body prevents bleed-through
+  // completely. We snapshot and restore the previous overflow value so
+  // we don't permanently change anything if another scroll lock is in
+  // play (e.g. from a different modal).
+  useEffect(() => {
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => { document.body.style.overflow = prev; };
   }, []);
 
   // Initial load — fetch comments and seed the parent's count.
@@ -7834,9 +7863,15 @@ function CommentSheet({ post, currentHandle, deviceId, onClose, onCountChange }:
     if (!body || !currentHandle || !deviceId || submitting) return;
     setSubmitting(true);
     const tempId = `temp_${Date.now()}`;
+    // If we're in reply mode, capture the parentId so it lands on both
+    // the optimistic row and the server request. Clearing replyingTo
+    // happens after we read it, so a re-render mid-submit doesn't drop
+    // the link.
+    const parentIdForThisSubmit = replyingTo ? replyingTo.parentId : null;
     const optimistic: SocialComment = {
       id: tempId,
       postId: post.id,
+      parentId: parentIdForThisSubmit,
       handle: currentHandle,
       body,
       createdAt: new Date().toISOString(),
@@ -7849,12 +7884,24 @@ function CommentSheet({ post, currentHandle, deviceId, onClose, onCountChange }:
       return next;
     });
     setDraft('');
+    // If this was a reply, auto-expand the parent so the user sees their
+    // own reply appear in context instead of being hidden behind the
+    // "View N replies" toggle.
+    if (parentIdForThisSubmit) {
+      setExpandedReplies((prev) => {
+        const next = new Set(prev);
+        next.add(parentIdForThisSubmit);
+        return next;
+      });
+    }
+    setReplyingTo(null);
 
     const result = await apiCreateComment({
       postId: post.id,
       handle: currentHandle,
       deviceId,
       body,
+      parentId: parentIdForThisSubmit,
     });
     setSubmitting(false);
 
@@ -7920,8 +7967,11 @@ function CommentSheet({ post, currentHandle, deviceId, onClose, onCountChange }:
   };
 
   // Quick emoji row above the input. Tapping inserts the emoji into the
-  // draft at the cursor position (or end if no cursor — simpler).
-  const QUICK_EMOJIS = ['❤️', '🙌', '🔥', '👏', '😢', '😍', '😮', '😂'];
+  // draft at the cursor position (or end if no cursor — simpler). v1.11
+  // expanded from 8 generic emojis (hearts/smileys) to a 20-emoji horror
+  // set that fits the app's tone. The row is horizontally scrollable in
+  // the render so we can keep adding without the row wrapping.
+  const QUICK_EMOJIS = ['💀', '👻', '👁️', '🩸', '🕯️', '🪦', '🦇', '🕷️', '🕸️', '🧛', '🧟', '🔪', '⚰️', '🎃', '🌙', '🖤', '🩻', '🧠', '🦴', '🛸'];
   const insertEmoji = (emoji: string) => setDraft((prev) => prev + emoji);
 
   // Body of the sheet. Combines backdrop + sliding panel. The backdrop
@@ -7984,13 +8034,41 @@ function CommentSheet({ post, currentHandle, deviceId, onClose, onCountChange }:
               <br />
               <span style={{ opacity: 0.6, fontSize: 13 }}>Be the first to comment.</span>
             </div>
-          ) : (
-            comments.map((c) => {
+          ) : (() => {
+            // Split into top-level vs replies. We keep both in stable
+            // chronological order (oldest-first) since the server already
+            // sorts that way; we just group replies under their parent.
+            // Comments with a parentId that doesn't match any top-level
+            // comment in the visible set (e.g. parent was hidden by a
+            // block) fall through to render as top-level so they're not
+            // lost.
+            const visibleIds = new Set(comments.map((c) => c.id));
+            const topLevel: SocialComment[] = [];
+            const repliesByParent = new Map<string, SocialComment[]>();
+            for (const c of comments) {
+              if (c.parentId && visibleIds.has(c.parentId)) {
+                const arr = repliesByParent.get(c.parentId) || [];
+                arr.push(c);
+                repliesByParent.set(c.parentId, arr);
+              } else {
+                topLevel.push(c);
+              }
+            }
+
+            const renderCommentRow = (c: SocialComment, isReply: boolean) => {
               const likeState = commentLikes.get(c.id) || { liked: false, count: c.likeCount || 0 };
               const isOwnComment = !!currentHandle && currentHandle.toLowerCase() === (c.handle || '').toLowerCase();
               return (
-                <div key={c.id} style={S.commentRow}>
-                  <img src={exposureIconUrl} alt="" style={S.commentAvatar} />
+                <div
+                  key={c.id}
+                  style={{
+                    ...S.commentRow,
+                    // Indent replies. paddingLeft on the row pushes the avatar
+                    // and everything else right, IG-style nested look.
+                    ...(isReply ? { paddingLeft: 56 } : null),
+                  }}
+                >
+                  <img src={exposureIconUrl} alt="" style={isReply ? S.commentAvatarReply : S.commentAvatar} />
                   <div style={S.commentBodyCol}>
                     <div style={S.commentMetaLine}>
                       <span style={S.commentHandle}>{c.handle}</span>
@@ -8000,6 +8078,34 @@ function CommentSheet({ post, currentHandle, deviceId, onClose, onCountChange }:
                       )}
                     </div>
                     <div style={S.commentBodyText}>{c.body}</div>
+                    {/* Reply link — visible on every comment (top-level OR
+                        reply). Replies-to-replies are flattened by the
+                        server, but the UX of replying to a specific person
+                        in a thread still feels natural. We prefill the
+                        composer with @handle to give the new comment
+                        social context. */}
+                    {!!currentHandle && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          // For replies, we want the threading to attach
+                          // to the same ROOT as the comment being replied
+                          // to. parentId on a reply already points at
+                          // root; on a top-level it's null, so use the
+                          // comment's own id.
+                          const rootId = c.parentId || c.id;
+                          setReplyingTo({ parentId: rootId, handle: c.handle });
+                          // Prefill draft with @handle if not already
+                          // there, leaving a trailing space so the user
+                          // can start typing immediately.
+                          setDraft((prev) => {
+                            const tag = `@${c.handle} `;
+                            return prev.includes(tag) ? prev : tag;
+                          });
+                        }}
+                        style={S.commentReplyBtn}
+                      >Reply</button>
+                    )}
                   </div>
                   <button
                     onClick={() => toggleCommentLike(c.id)}
@@ -8019,10 +8125,6 @@ function CommentSheet({ post, currentHandle, deviceId, onClose, onCountChange }:
                       <span style={S.commentLikeCount}>{likeState.count}</span>
                     )}
                   </button>
-                  {/* 3-dot menu — only on other people's comments. Own
-                      comments don't surface Report/Block options (the
-                      viewer's own row with a Delete control lives via
-                      a different code path elsewhere). */}
                   {!isOwnComment && (
                     <button
                       onClick={() => setMenuCommentId(c.id)}
@@ -8032,8 +8134,40 @@ function CommentSheet({ post, currentHandle, deviceId, onClose, onCountChange }:
                   )}
                 </div>
               );
-            })
-          )}
+            };
+
+            return topLevel.map((c) => {
+              const replies = repliesByParent.get(c.id) || [];
+              const isExpanded = expandedReplies.has(c.id);
+              return (
+                <div key={c.id}>
+                  {renderCommentRow(c, false)}
+                  {replies.length > 0 && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setExpandedReplies((prev) => {
+                            const next = new Set(prev);
+                            if (next.has(c.id)) next.delete(c.id);
+                            else next.add(c.id);
+                            return next;
+                          });
+                        }}
+                        style={S.commentRepliesToggle}
+                      >
+                        <span style={S.commentRepliesToggleLine} />
+                        {isExpanded
+                          ? `Hide replies`
+                          : `View ${replies.length} ${replies.length === 1 ? 'reply' : 'replies'}`}
+                      </button>
+                      {isExpanded && replies.map((r) => renderCommentRow(r, true))}
+                    </>
+                  )}
+                </div>
+              );
+            });
+          })()}
         </div>
 
         {/* Emoji quick-react row */}
@@ -8049,6 +8183,29 @@ function CommentSheet({ post, currentHandle, deviceId, onClose, onCountChange }:
           ))}
         </div>
 
+        {/* "Replying to @X" pill — shown only when replyingTo is set.
+            Tapping the X clears the reply state and the @prefix from
+            the draft, returning the composer to top-level mode. */}
+        {replyingTo && (
+          <div style={S.commentReplyPill}>
+            <span style={S.commentReplyPillText}>Replying to <span style={S.commentReplyPillHandle}>@{replyingTo.handle}</span></span>
+            <button
+              type="button"
+              onClick={() => {
+                setReplyingTo(null);
+                // Strip the @handle prefix if it's still at the start of
+                // the draft. Leave any text the user typed after it.
+                setDraft((prev) => {
+                  const tag = `@${replyingTo.handle} `;
+                  return prev.startsWith(tag) ? prev.slice(tag.length) : prev;
+                });
+              }}
+              style={S.commentReplyPillClose}
+              aria-label="Cancel reply"
+            >✕</button>
+          </div>
+        )}
+
         {/* Composer row — avatar + input + Post button */}
         <div style={S.commentSheetComposer}>
           <img src={exposureIconUrl} alt="" style={S.commentSheetComposerAvatar} />
@@ -8056,7 +8213,7 @@ function CommentSheet({ post, currentHandle, deviceId, onClose, onCountChange }:
             type="text"
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
-            placeholder={currentHandle ? `Add a comment for ${post.handle}...` : 'Claim a handle to comment'}
+            placeholder={currentHandle ? (replyingTo ? `Reply to ${replyingTo.handle}...` : `Add a comment for ${post.handle}...`) : 'Claim a handle to comment'}
             disabled={!currentHandle || submitting}
             maxLength={500}
             style={S.commentSheetComposerInput}
@@ -8073,7 +8230,7 @@ function CommentSheet({ post, currentHandle, deviceId, onClose, onCountChange }:
               disabled={submitting}
               style={S.commentSheetComposerPostBtn}
             >
-              {submitting ? '...' : 'Post'}
+              {submitting ? '...' : (replyingTo ? 'Reply' : 'Post')}
             </button>
           )}
         </div>
@@ -10571,43 +10728,124 @@ function AboutView({ onBack }: { onBack: () => void }) {
 
       <div style={S.aboutBody}>
         <p style={S.aboutPara}>
-          <b>Sinister Locations</b> is a field guide to the macabre — historic crimes, hauntings, horror film locations,
-          cults, serial killers, and unsettling history hiding all around you.
+          <b>The Dread Directory</b> is a field guide to the macabre — historic crimes, hauntings, horror
+          film locations, UFO sightings, serial killers, and unsettling history hiding all around you.
         </p>
 
-        <div style={S.aboutSectionHeader}>What This App Does</div>
+        <div style={S.aboutSectionHeader}>What this app does</div>
 
         <p style={S.aboutPara}>
-          <b>Notifies you when you're near sinister sites.</b> The app runs in the background and pings you when
-          you come within range of a haunting, crime scene, or other macabre location — even when the app is closed.
-          Set location access to "Always" for this to work.
+          <b>Notifies you when you're near a sinister site.</b> The app runs in the background and pings you
+          when you come within range of a haunting, crime scene, or other macabre location — even when the
+          app is closed. Set location access to "Always" for this to work.
         </p>
         <p style={S.aboutPara}>
-          <b>Tells the story behind every location.</b> Each site has its full history, exact coordinates, and
-          turn-by-turn directions in your maps app.
+          <b>Tells the story behind every location.</b> Each site has its full history, exact coordinates,
+          and turn-by-turn directions in your maps app.
         </p>
         <p style={S.aboutPara}>
-          <b>Lets you claim visits.</b> Stand within 100 feet of any site and tap "I'm Here" to log your visit.
-          Visits earn you badges and rank you on the Dread Leaders board.
+          <b>Lets you add your own locations.</b> Found a sinister spot we don't have? Submit it while
+          you're physically on-site — the app verifies your GPS and requires an on-site photo.
         </p>
         <p style={S.aboutPara}>
-          <b>Lets you add your own locations.</b> Found a sinister spot we don't have? Tap Submit a Location while
-          you're physically on-site — the app verifies your GPS and requires an on-site photo. Approved entries
-          are credited to your handle permanently.
+          <b>DreadFeed.</b> An in-app social feed for posting horror photos, captioning your visits,
+          commenting, and reacting to other users' posts.
+        </p>
+
+        <div style={S.aboutSectionHeader}>Getting started</div>
+
+        <p style={S.aboutPara}>
+          <b>1. Sign in.</b> Tap Sign in with Apple on the welcome screen. Your Apple ID gets you signed
+          in — we don't ask for passwords or personal info.
         </p>
         <p style={S.aboutPara}>
-          <b>Tracks your achievements.</b> Earn tiered badges for submissions and visits. Unlock special badges
-          for milestones like visiting all six categories or reaching new states.
+          <b>2. Pick a handle.</b> This is your name across the app — on posts, comments, submissions, and
+          any sites you've added. You can claim any handle that's not already taken (3–20 characters).
+        </p>
+        <p style={S.aboutPara}>
+          <b>3. Grant location access.</b> Choose "Allow While Using App" the first time you open the map.
+          For background notifications when you're near a sinister site, go to iOS Settings → The Dread
+          Directory → Location → and switch to "Always".
+        </p>
+        <p style={S.aboutPara}>
+          <b>4. Allow notifications.</b> This lets the app ping you when you walk within range of a site,
+          even if the app is closed.
+        </p>
+
+        <div style={S.aboutSectionHeader}>Browsing sinister sites</div>
+
+        <p style={S.aboutPara}>
+          <b>The List.</b> Tap the list icon on the home screen to browse by category — True Crime,
+          Hauntings, Film Locations, UFO Sightings, Serial Killers, and Grave Sites. Drill into a category,
+          then a state, then a site to see its full lore.
+        </p>
+        <p style={S.aboutPara}>
+          <b>The Map.</b> Tap the map icon on a category screen to see all sites in that category around
+          you. Pinch to zoom, tap any pin for a quick preview, tap "View Details" for the full story.
+        </p>
+        <p style={S.aboutPara}>
+          <b>Directions.</b> On any site's detail page, tap Directions to open Apple Maps with turn-by-turn
+          routing to that exact spot.
+        </p>
+
+        <div style={S.aboutSectionHeader}>Submitting a new site</div>
+
+        <p style={S.aboutPara}>
+          <b>Be physically on-site.</b> Submission requires GPS verification within 100 meters of the
+          location you're claiming. This keeps the directory honest.
+        </p>
+        <p style={S.aboutPara}>
+          <b>Tap Submit.</b> From the home screen, tap the submit option. The app opens the camera,
+          captures your current GPS, and walks you through naming the site, picking a category, writing
+          its lore, and adding a verification photo.
+        </p>
+        <p style={S.aboutPara}>
+          <b>Wait for approval.</b> Every submission goes to admin review for moderation. Once approved,
+          your site appears in the directory permanently — credited to your handle.
+        </p>
+
+        <div style={S.aboutSectionHeader}>Using DreadFeed</div>
+
+        <p style={S.aboutPara}>
+          <b>The feed.</b> Tap the DreadFeed icon on the home screen to see a chronological feed of horror
+          photos posted by other users. Tap a photo to see it full-size with its caption.
+        </p>
+        <p style={S.aboutPara}>
+          <b>Posting from a site.</b> On any site's detail page (after you've physically been there), tap
+          "Post to DreadFeed" to attach a photo and caption to that location. These posts are GPS-verified
+          and admin-moderated.
+        </p>
+        <p style={S.aboutPara}>
+          <b>Freeform posts.</b> Tap the ➕ icon on the DreadFeed tab to post any horror photo with a
+          caption — no location required. Add stickers, text, filters, and frames in the in-app editor.
+        </p>
+        <p style={S.aboutPara}>
+          <b>Comments and replies.</b> Tap the comment icon under any post to read the thread. Tap Reply
+          under a comment to thread your response. Comments support 20 horror emojis from the quick row.
+        </p>
+        <p style={S.aboutPara}>
+          <b>Reporting and blocking.</b> Tap the ⋯ on any post or comment to report content that violates
+          the rules or block the user who posted it. Blocked users' content disappears across the whole
+          app for you.
+        </p>
+
+        <div style={S.aboutSectionHeader}>Account &amp; privacy</div>
+
+        <p style={S.aboutPara}>
+          <b>What we store.</b> Your handle, the sites you've submitted, the posts you've made, your
+          comments, your likes, and the device that owns your handle. That's it. No email, no real name,
+          no contacts.
+        </p>
+        <p style={S.aboutPara}>
+          <b>Delete everything.</b> From the home screen, go to Account → Delete account. This permanently
+          removes your handle, all your posts, all your comments, every site you submitted, and every
+          like you cast. It cannot be undone.
         </p>
 
         <div style={S.aboutSectionHeader}>About</div>
 
         <p style={S.aboutPara}>
           Part of the Sinister family — alongside Sinister Trivia and the Sinister Vids YouTube channel.
-        </p>
-        <p style={S.aboutPara}>
-          User submissions require an on-site photo and GPS verification. Approved entries are credited to the submitter
-          permanently.
         </p>
 
         <div style={{ marginTop: 24 }}>
@@ -10672,7 +10910,7 @@ const CATEGORY_PIN_GLYPH: Record<CategoryKey, string> = {
   haunting:   '👻',
   killer:     '💀',
   crime:      '🔪',
-  cult:       '🕯',
+  ufo:        '🛸',
   film:       '🎬',
   historical: '🪦',
 };
@@ -15238,12 +15476,16 @@ const S: Record<string, React.CSSProperties> = {
     justifyContent: 'center',
     padding: 0,
   },
-  // Scrollable list region.
+  // Scrollable list region. overscrollBehavior:'contain' is the key fix
+  // for v1.11 — without it, iOS Safari chains scroll events to the body
+  // when the list reaches its top or bottom, causing the feed underneath
+  // to scroll. Containing the scroll keeps it isolated to this region.
   commentSheetList: {
     flex: 1,
     overflowY: 'auto' as const,
     padding: '8px 0 12px 0',
     WebkitOverflowScrolling: 'touch' as any,
+    overscrollBehavior: 'contain' as const,
   },
   commentSheetEmpty: {
     textAlign: 'center' as const,
@@ -15266,6 +15508,81 @@ const S: Record<string, React.CSSProperties> = {
     borderRadius: '50%',
     objectFit: 'cover' as const,
     pointerEvents: 'none' as const,
+  },
+  // Smaller avatar for nested reply rows. The indented row already has
+  // a 56px paddingLeft pushing it inward; a 28px avatar keeps the visual
+  // rhythm right without making the row look cramped.
+  commentAvatarReply: {
+    width: 28,
+    height: 28,
+    minWidth: 28,
+    borderRadius: '50%',
+    objectFit: 'cover' as const,
+    pointerEvents: 'none' as const,
+  },
+  // "Reply" link under each comment body. Plain text, low-prominence
+  // gray so it doesn't compete with the comment itself.
+  commentReplyBtn: {
+    background: 'none',
+    border: 'none',
+    padding: '4px 0 0 0',
+    margin: 0,
+    color: '#888888',
+    fontSize: 12,
+    fontWeight: 600,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+    alignSelf: 'flex-start',
+  },
+  // "View N replies" / "Hide replies" toggle. IG mimics this with a
+  // short horizontal line followed by the text, indented to align with
+  // where the parent comment's body starts (i.e. past the avatar gutter).
+  commentRepliesToggle: {
+    background: 'none',
+    border: 'none',
+    margin: '2px 0 8px 56px',
+    padding: '4px 0',
+    color: '#888888',
+    fontSize: 12,
+    fontWeight: 600,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    gap: 10,
+  },
+  commentRepliesToggleLine: {
+    display: 'inline-block',
+    width: 24,
+    height: 1,
+    backgroundColor: '#555555',
+  },
+  // "Replying to @X" pill that sits above the composer when in reply mode.
+  commentReplyPill: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: '6px 14px',
+    backgroundColor: '#262626',
+    borderTop: '1px solid #2a2a2a',
+    fontSize: 12,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  commentReplyPillText: {
+    color: '#aaaaaa',
+  },
+  commentReplyPillHandle: {
+    color: '#ffffff',
+    fontWeight: 600,
+  },
+  commentReplyPillClose: {
+    background: 'none',
+    border: 'none',
+    color: '#aaaaaa',
+    fontSize: 14,
+    cursor: 'pointer',
+    padding: 4,
+    lineHeight: 1,
   },
   commentBodyCol: {
     flex: 1,
@@ -15326,13 +15643,19 @@ const S: Record<string, React.CSSProperties> = {
     fontSize: 11,
     fontFamily: 'system-ui, -apple-system, sans-serif',
   },
-  // Quick-emoji row above the input. 8 buttons spread evenly.
+  // Quick-emoji row above the input. v1.11: 20 horror emojis, horizontally
+  // scrollable since "space-around" packing 20 of these would shrink them
+  // to thumbnails. flex-start + overflow-x lets the row read at native size
+  // and lets users swipe through. flexShrink:0 on the button keeps each
+  // emoji from squishing.
   commentSheetEmojiRow: {
     display: 'flex',
-    justifyContent: 'space-around',
     alignItems: 'center',
+    gap: 4,
     padding: '10px 8px 8px 8px',
     borderTop: '1px solid #2a2a2a',
+    overflowX: 'auto',
+    WebkitOverflowScrolling: 'touch',
   },
   commentSheetEmojiBtn: {
     backgroundColor: 'transparent',
@@ -15341,6 +15664,7 @@ const S: Record<string, React.CSSProperties> = {
     fontSize: 24,
     padding: 4,
     lineHeight: 1,
+    flexShrink: 0,
   },
   // Composer row at the bottom: avatar + input + Post button.
   // Uses safe-area-inset-bottom so it doesn't collide with the iOS
