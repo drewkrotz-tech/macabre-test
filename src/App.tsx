@@ -2277,6 +2277,15 @@ export default function App() {
         // (from home) still records home below it, so swipe-back from
         // any peer always lands on home.
         const homePeers = new Set(['list', 'social', 'leaders', 'about']);
+        // DreadFeed-context views — every screen that lives "inside"
+        // the DreadFeed mini-app. When the user returns to the social
+        // root (the feed), we strip these off the top of the history
+        // stack so swipe-back from the feed goes straight to whatever
+        // was OUTSIDE DreadFeed (usually home), never back into the
+        // DreadFeed sub-views the user already navigated past.
+        const dreadFeedSubViews = new Set([
+          'social', 'userProfile', 'post', 'badges', 'settings', 'notifications',
+        ]);
         const prevIsPeer = homePeers.has(prev.name);
         const nextIsPeer = homePeers.has(next.name);
         if (opts?.replace) {
@@ -2291,6 +2300,20 @@ export default function App() {
         } else {
           _navHistory.current.push({ view: prev, scrollY: sy });
           if (_navHistory.current.length > 50) _navHistory.current.shift();
+        }
+        // Whenever the destination is the DreadFeed root (social), the
+        // stack should hold only entries from BEFORE the user entered
+        // DreadFeed. Pop any DreadFeed-sub-view entries off the top.
+        // This handles the case where the user navigates social →
+        // userProfile → post, then taps the DreadFeed home tab from
+        // inside a sub-view — we'd otherwise push userProfile onto the
+        // stack and a subsequent swipe-back from social would land on
+        // userProfile instead of home.
+        if (next.name === 'social') {
+          const stack = _navHistory.current;
+          while (stack.length > 0 && dreadFeedSubViews.has(stack[stack.length - 1].view.name)) {
+            stack.pop();
+          }
         }
       }
       return next;
@@ -3191,16 +3214,14 @@ export default function App() {
           DetailView is excluded because the page already has Get Directions
           + Claim Visit as its primary actions; layering the bottom bar on
           top makes the page feel busy and competes with those CTAs. */}
-      {/* HomeBottomBar should only appear on the home page and the
-          home-page peer views (list, about, leaders). It must NOT show
-          on any DreadFeed-context screen (social, userProfile, post,
-          badges) — those screens are part of the DreadFeed mini-app
-          and render their own IG-style ExposureBottomBar instead.
-          Showing both bars stacks them and confuses navigation. */}
-      {view.name !== 'nearby' && view.name !== 'detail' && view.name !== 'submit'
-        && view.name !== 'social' && view.name !== 'userProfile'
-        && view.name !== 'post' && view.name !== 'badges'
-        && view.name !== 'settings' && (
+      {/* HomeBottomBar appears ONLY on the main home page. Previously it
+          also rendered on home-peer views (list, about, leaders) but that
+          made those pages feel cluttered — the home bar's 4 large icons
+          competed visually with the list/leaders content. Each non-home
+          view has its own back/nav affordances and doesn't need the home
+          bar layered on top. Per-screen IG-style bars (e.g. on DreadFeed)
+          are rendered by those views themselves. */}
+      {view.name === 'home' && (
         <HomeBottomBar
           onSubmit={goSubmit}
           onList={goList}
@@ -14429,11 +14450,14 @@ const S: Record<string, React.CSSProperties> = {
     opacity: 0.6,
   },
   // Photo — slightly rounded corners (8px) per request. Edge-to-edge
-  // otherwise. aspectRatio 1:1 keeps cards predictable on a vertical feed.
+  // otherwise. 4:5 portrait matches Instagram's default feed aspect ratio
+  // (1080×1350), giving taller cards that show more of vertical phone
+  // photos without needing a tap-to-expand. Wider source images get
+  // center-cropped on the sides via objectFit: cover, same as IG.
   postPhoto: {
     width: '100%',
     display: 'block',
-    aspectRatio: '1 / 1',
+    aspectRatio: '4 / 5',
     objectFit: 'cover' as const,
     backgroundColor: '#111',
     borderRadius: 8,
@@ -15814,12 +15838,14 @@ const S: Record<string, React.CSSProperties> = {
   // Radius selector row beneath the NearbyView header. Five chips for the
   // available radii plus an optional Reset chip that appears when the user
   // has long-pressed to drop a custom search center on the map.
+  // Left padding leaves room for the circular back button (left:12 + 36w +
+  // ~8 gap) so the "5 MI" chip never sits beneath it on narrow phones.
   radiusRow: {
     display: 'flex',
     flexWrap: 'wrap' as const,
     justifyContent: 'center' as const,
     gap: 6,
-    padding: '8px 12px 4px',
+    padding: '8px 12px 4px 56px',
   },
   radiusChip: {
     background: 'transparent',
