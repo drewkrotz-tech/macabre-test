@@ -7,6 +7,9 @@
 # and patches project.pbxproj using a python one-liner to point each App
 # target config at the entitlements file. The python approach avoids the
 # YAML/sed tab-character mess and is more reliable across pbxproj layouts.
+# AppIcon assets are copied from resources/AppIcon.appiconset/ into the
+# Capacitor-generated iOS folder so home-screen and notification icons
+# survive the npx cap add ios scaffolding.
 # =============================================================================
 workflows:
   ios-unsigned-build:
@@ -27,6 +30,23 @@ workflows:
       - name: Add iOS platform (Capacitor)
         script: |
           npx cap add ios
+      - name: Copy AppIcon assets into iOS asset catalog
+        script: |
+          # npx cap add ios regenerates ios/ from scratch on every build, so any
+          # AppIcon files committed directly into ios/App/App/Assets.xcassets/
+          # get nuked. We keep the source-of-truth set in resources/AppIcon.appiconset/
+          # and copy it into the freshly-scaffolded location here, AFTER the
+          # cap add step and BEFORE the Xcode build.
+          SRC="resources/AppIcon.appiconset"
+          DEST="ios/App/App/Assets.xcassets/AppIcon.appiconset"
+          if [ ! -d "$SRC" ]; then
+            echo "ERROR: $SRC does not exist in repo. App icon will be generic."
+            exit 1
+          fi
+          mkdir -p "$DEST"
+          cp -R "$SRC"/* "$DEST"/
+          echo "--- AppIcon files in iOS asset catalog ---"
+          ls -la "$DEST"
       - name: Inject Info.plist permission strings
         script: |
           PLIST="ios/App/App/Info.plist"
@@ -136,6 +156,23 @@ workflows:
       - name: Add iOS platform (Capacitor)
         script: |
           npx cap add ios
+      - name: Copy AppIcon assets into iOS asset catalog
+        script: |
+          # npx cap add ios regenerates ios/ from scratch on every build, so any
+          # AppIcon files committed directly into ios/App/App/Assets.xcassets/
+          # get nuked. We keep the source-of-truth set in resources/AppIcon.appiconset/
+          # and copy it into the freshly-scaffolded location here, AFTER the
+          # cap add step and BEFORE the Xcode build.
+          SRC="resources/AppIcon.appiconset"
+          DEST="ios/App/App/Assets.xcassets/AppIcon.appiconset"
+          if [ ! -d "$SRC" ]; then
+            echo "ERROR: $SRC does not exist in repo. App icon will be generic."
+            exit 1
+          fi
+          mkdir -p "$DEST"
+          cp -R "$SRC"/* "$DEST"/
+          echo "--- AppIcon files in iOS asset catalog ---"
+          ls -la "$DEST"
       - name: Inject Info.plist permission strings
         script: |
           PLIST="ios/App/App/Info.plist"
