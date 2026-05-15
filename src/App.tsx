@@ -3806,25 +3806,6 @@ type _SocialFeedSnapshot = {
 let _socialFeedMemory: _SocialFeedSnapshot | null = null;
 const SOCIAL_FEED_MEMORY_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
-// ---- Feed-wide video audio (v1.17) ----
-// IG-style: once the user unmutes a video in the feed, every subsequent
-// video plays with audio until they re-mute. A module-level flag lets
-// every <video> in the feed observe the same source of truth without
-// prop-drilling. Listener registry so live <video> elements can react
-// when the user toggles audio on a different card.
-let _socialFeedAudioOn = false;
-const _socialFeedAudioListeners = new Set<(on: boolean) => void>();
-function setSocialFeedAudio(on: boolean) {
-  _socialFeedAudioOn = on;
-  for (const fn of _socialFeedAudioListeners) {
-    try { fn(on); } catch { /* silent */ }
-  }
-}
-function subscribeSocialFeedAudio(fn: (on: boolean) => void): () => void {
-  _socialFeedAudioListeners.add(fn);
-  return () => { _socialFeedAudioListeners.delete(fn); };
-}
-
 // ---------- Settings View ----------
 // Reached from a gear icon on your own DreadFeed profile. Centralizes
 // the account management surface that App Store guideline 5.1.1(v)
@@ -7894,43 +7875,29 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap,
                 key={i}
                 src={url}
                 style={S.postPhoto}
-                // Initial mute state reads the shared flag. After mount,
-                // the ref callback below also keeps it in sync. We keep
-                // the attribute (rather than always defaulting to muted)
-                // so a video added mid-session inherits the current
-                // feed-wide audio choice on first render.
-                muted={!_socialFeedAudioOn}
+                // Always mounts muted. User can tap the native mute
+                // button on the controls to hear audio for that ONE
+                // video. As soon as it scrolls out of view it pauses
+                // AND re-mutes (see IntersectionObserver below) so
+                // (a) the next video in view doesn't have lingering
+                // audio carry-over, and (b) coming back to this video
+                // starts silent again. Simpler than IG's remember-mute
+                // model and avoids audio-blast on app reopen.
+                muted
                 autoPlay
                 playsInline
                 controls
                 preload="metadata"
-                // v1.17: pause when scrolled out of view. IG/TikTok do
-                // the same — once a user unmutes a video and keeps
-                // scrolling, the audio (and decoder cost) shouldn't
-                // continue off-screen. Threshold 0.25: at least a
-                // quarter of the video must be on screen to keep
-                // playing. Returning into view resumes — but only if
-                // we haven't already hit the 3-play cap.
-                //
-                // Also (v1.17): subscribe to the shared audio flag so
-                // toggling mute on ANY video propagates to all others
-                // in the feed — same as IG.
+                // v1.17: pause when scrolled out of view (≥75% off
+                // screen). On exit we also force .muted = true so the
+                // next time this video comes back into view, or any
+                // other video the user scrolls to, it starts silent.
+                // Returning to view auto-resumes unless we hit the
+                // 3-play cap.
                 ref={(el) => {
                   if (!el) return;
-                  // Guard against re-attaching on re-render.
                   if (el.dataset.viewObs === '1') return;
                   el.dataset.viewObs = '1';
-                  // Sync with current feed-wide audio state on mount.
-                  el.muted = !_socialFeedAudioOn;
-                  // Listen for the shared flag flipping; sync this el.
-                  // We don't tear down the subscription — feed cards
-                  // unmount when the user leaves SocialView, at which
-                  // point the listener becomes orphaned. The Set will
-                  // hold them until GC reclaims the closure, which is
-                  // fine for a feed-scoped flag.
-                  subscribeSocialFeedAudio((on) => {
-                    if (el.isConnected) el.muted = !on;
-                  });
                   if (typeof IntersectionObserver === 'undefined') return;
                   const io = new IntersectionObserver(
                     (entries) => {
@@ -7942,24 +7909,15 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap,
                             v.play().catch(() => { /* autoplay may block — silent */ });
                           }
                         } else {
+                          // Leaving the viewport: pause + reset to muted.
                           if (!v.paused) v.pause();
+                          v.muted = true;
                         }
                       }
                     },
                     { threshold: 0.25 }
                   );
                   io.observe(el);
-                }}
-                // volumechange fires when the user taps the native
-                // controls' mute button (or any change to .muted). If
-                // the user just unmuted/muted, propagate that to every
-                // other video in the feed via the shared flag.
-                onVolumeChange={(e) => {
-                  const el = e.currentTarget as HTMLVideoElement;
-                  const wantAudioOn = !el.muted;
-                  if (wantAudioOn !== _socialFeedAudioOn) {
-                    setSocialFeedAudio(wantAudioOn);
-                  }
                 }}
                 // data attribute tracks how many full plays we've seen.
                 // onEnded fires per playthrough; we manually re-trigger
