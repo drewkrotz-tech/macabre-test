@@ -15948,6 +15948,10 @@ const S: Record<string, React.CSSProperties> = {
     backgroundColor: '#0a0a0a',
     minHeight: '100vh',
     color: '#F0EBE0',
+    // Push content below the iOS status bar / notch. env() inset
+    // resolves to ~44-50px on modern iPhones; fallback ~50px keeps
+    // it sane on devices/browsers that don't expose the env var.
+    paddingTop: 'env(safe-area-inset-top, 50px)' as any,
   },
   hashtagHeader: {
     display: 'flex',
