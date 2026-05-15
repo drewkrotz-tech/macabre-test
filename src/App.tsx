@@ -7021,8 +7021,15 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
                 <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" />
                 <circle cx="12" cy="13" r="4" />
               </svg>
-              <div style={S.igPickPromptLabel}>Tap to choose a photo</div>
+              <div style={S.igPickPromptLabel}>Tap to choose a photo or video</div>
               <div style={S.igPickPromptHint}>From your camera or library</div>
+              {/* Limits notice — keeps users from wondering why a long
+                  or huge video silently fails to upload. Phrased as
+                  "videos should be ~10s, max 20MB" since the server
+                  enforces size strictly but is loose on duration. */}
+              <div style={S.igPickPromptHintSmall}>
+                Videos: up to ~10 seconds, max 20MB
+              </div>
             </button>
           )}
         </>
@@ -9263,16 +9270,52 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
         </div>
       ) : (
         <div style={S.profileGrid}>
-          {posts.map((p) => (
-            <button
-              key={p.id}
-              onClick={() => onSelectPost(p.id, posts.map((x) => x.id), posts)}
-              style={S.profileGridCell}
-              aria-label={`Open post: ${p.caption.slice(0, 40)}`}
-            >
-              <img src={p.photoUrl} alt="" style={S.profileGridImg} loading="lazy" />
-            </button>
-          ))}
+          {posts.map((p) => {
+            // Detect video posts. Server sends mediaTypes parallel to
+            // photoUrls; if not present (pre-v1.13 posts), default to
+            // photo. We also sniff the URL extension as a fallback for
+            // posts whose mediaTypes got dropped somewhere along the
+            // way. For the grid we only care about the FIRST slot —
+            // carousels show their cover here.
+            const firstType =
+              (Array.isArray((p as any).mediaTypes) && (p as any).mediaTypes[0]) ||
+              (/\.(mp4|mov)(\?|$)/i.test(p.photoUrl) ? 'video' : 'photo');
+            const isVideo = firstType === 'video';
+            return (
+              <button
+                key={p.id}
+                onClick={() => onSelectPost(p.id, posts.map((x) => x.id), posts)}
+                style={S.profileGridCell}
+                aria-label={`Open post: ${p.caption.slice(0, 40)}`}
+              >
+                {isVideo ? (
+                  // Static first-frame thumbnail. preload="metadata"
+                  // tells the browser to fetch just enough bytes for
+                  // the poster frame, NOT the whole video. No autoplay,
+                  // no controls — this is a grid thumbnail, not a
+                  // player. Tap goes to the full post view where it
+                  // plays properly.
+                  <>
+                    <video
+                      src={p.photoUrl}
+                      style={S.profileGridImg}
+                      preload="metadata"
+                      muted
+                      playsInline
+                    />
+                    {/* ▶ overlay in the corner so users see it's a video */}
+                    <div style={S.profileGridVideoBadge} aria-hidden="true">
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="#ffffff">
+                        <path d="M8 5v14l11-7z" />
+                      </svg>
+                    </div>
+                  </>
+                ) : (
+                  <img src={p.photoUrl} alt="" style={S.profileGridImg} loading="lazy" />
+                )}
+              </button>
+            );
+          })}
         </div>
       )}
 
@@ -15653,6 +15696,22 @@ const S: Record<string, React.CSSProperties> = {
     WebkitUserSelect: 'none' as const,
     WebkitTouchCallout: 'none' as const,
   },
+  // Small ▶ badge overlaid on video-post thumbnails in the profile grid.
+  // Anchored to the top-right corner. Visually consistent with IG's
+  // little corner indicator for Reels/video posts in the profile grid.
+  profileGridVideoBadge: {
+    position: 'absolute' as const,
+    top: 6,
+    right: 6,
+    width: 22,
+    height: 22,
+    borderRadius: '50%',
+    backgroundColor: 'rgba(0,0,0,0.55)',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    pointerEvents: 'none' as const,
+  },
   // ---- Post detail (IG-style swipe-through viewer) ----
   // Small chip just below the brand header showing "N / total" so the
   // user has IG-style orientation while swiping between posts.
@@ -16638,6 +16697,15 @@ const S: Record<string, React.CSSProperties> = {
   igPickPromptHint: {
     fontSize: 13,
     color: '#888',
+  },
+  // Smaller secondary hint specifically for the video size/duration
+  // notice. Sits below the main hint, dimmer and slightly italic so
+  // it reads as supplementary info rather than a primary instruction.
+  igPickPromptHintSmall: {
+    fontSize: 11,
+    color: '#666',
+    marginTop: 8,
+    fontStyle: 'italic' as const,
   },
   igPickPreviewWrap: {
     flex: 1,
