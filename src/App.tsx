@@ -708,6 +708,9 @@ type SocialPost = {
   // v1.13: parallel to photoUrls, identifying which slots are videos.
   // Defaults to all 'photo' for pre-v1.13 posts.
   mediaTypes?: Array<'photo' | 'video'>;
+  // v1.14: hashtags extracted from caption at write time, lowercased
+  // and deduped. Older posts have no value (treated as empty array).
+  hashtags?: string[];
   createdAt: string;
   approvedAt: string;
   likeCount: number;
@@ -855,6 +858,18 @@ async function apiFollowing(handle: string): Promise<HandleEntry[]> {
 async function apiFetchPostsByHandle(handle: string): Promise<SocialPost[]> {
   try {
     const res = await fetch(`${API_BASE}/posts/handle/${encodeURIComponent(handle)}`);
+    const data = await res.json();
+    return Array.isArray(data?.posts) ? data.posts : [];
+  } catch { return []; }
+}
+
+// v1.14: all approved posts tagged with the given hashtag, newest first.
+// Server lowercases the tag before matching, and we trust its filtering
+// — no client-side post-processing needed.
+async function apiFetchPostsByHashtag(tag: string): Promise<SocialPost[]> {
+  try {
+    const cleaned = tag.replace(/^#/, '').toLowerCase();
+    const res = await fetch(`${API_BASE}/posts/hashtag/${encodeURIComponent(cleaned)}`);
     const data = await res.json();
     return Array.isArray(data?.posts) ? data.posts : [];
   } catch { return []; }
@@ -2322,6 +2337,7 @@ type View =
   | { name: 'list' }
   | { name: 'social' }
   | { name: 'userProfile'; handle: string }
+  | { name: 'hashtag'; tag: string }
   | { name: 'post'; postId: string; postList?: string[]; preloadedPosts?: SocialPost[] }
   | { name: 'notifications' }
   | { name: 'settings' };
@@ -3003,6 +3019,7 @@ export default function App() {
             onSelectSite={goDetail}
             onBack={goHome}
             onSelectHandle={(h) => setView({ name: 'userProfile', handle: h })}
+            onSelectHashtag={(tag) => setView({ name: 'hashtag', tag })}
             onSelectPost={(postId, postList, preloadedPosts) => setView({ name: 'post', postId, postList, preloadedPosts })}
             onHandleClaimed={setHandle}
             onSelectSettings={() => setView({ name: 'settings' })}
@@ -3035,6 +3052,17 @@ export default function App() {
           />
         ),
       };
+    } else if (v.name === 'hashtag') {
+      return {
+        key: `hashtag:${v.tag}`,
+        element: (
+          <HashtagView
+            tag={v.tag}
+            onSelectPost={(postId, postList, preloadedPosts) => setView({ name: 'post', postId, postList, preloadedPosts })}
+            onBack={goBack}
+          />
+        ),
+      };
     } else if (v.name === 'post') {
       return {
         key: `post:${v.postId}`,
@@ -3048,6 +3076,7 @@ export default function App() {
             sites={sites}
             onSelectSite={goDetail}
             onSelectHandle={(h) => setView({ name: 'userProfile', handle: h })}
+            onSelectHashtag={(tag) => setView({ name: 'hashtag', tag })}
             onSelectExposureTab={(tab) => {
               // Tapping a bottom-bar tab from inside post detail jumps
               // back to eXposure on that sub-tab. Updating the module-
@@ -5045,7 +5074,7 @@ function DreadFeedClaimScreen({ deviceId, onClaimed }: {
 }
 
 
-function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, onBack, onSelectHandle, onSelectPost, onHandleClaimed, onSelectSettings, onSelectNotifications }: {
+function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, onBack, onSelectHandle, onSelectHashtag, onSelectPost, onHandleClaimed, onSelectSettings, onSelectNotifications }: {
   handle: string | null;
   deviceId: string | null;
   sites: SinisterSite[];
@@ -5053,6 +5082,9 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
   onSelectSite: (site: SinisterSite) => void;
   onBack: () => void;
   onSelectHandle: (handle: string) => void;
+  // v1.14: tapping a hashtag in any caption inside SocialView routes to
+  // the dedicated HashtagView for that tag.
+  onSelectHashtag: (tag: string) => void;
   onSelectPost: (postId: string, postList?: string[], preloadedPosts?: SocialPost[]) => void;
   // Called when the user successfully claims a handle from the inline
   // ClaimHandleScreen in the Profile tab. The parent App lifts this
@@ -5429,6 +5461,7 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
                     if (s) onSelectSite(s);
                   }}
                   onHandleTap={() => onSelectHandle(p.handle)}
+                  onHashtagTap={(tag) => onSelectHashtag(tag)}
                   onPostRemoved={(postId) => {
                     setPosts((prev) => prev.filter((x) => x.id !== postId));
                   }}
@@ -5454,6 +5487,7 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
           sites={sites}
           onSelectSite={onSelectSite}
           onSelectHandle={onSelectHandle}
+          onSelectHashtag={onSelectHashtag}
         />
       )}
 
@@ -7110,13 +7144,14 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
 // Search sub-screen inside eXposure. Text input filters loaded posts by
 // caption / handle. The sticky search bar lives just above the black
 // bottom bar; results scroll above it.
-function ExposureSearchView({ allPosts, currentHandle, deviceId, sites, onSelectSite, onSelectHandle }: {
+function ExposureSearchView({ allPosts, currentHandle, deviceId, sites, onSelectSite, onSelectHandle, onSelectHashtag }: {
   allPosts: SocialPost[];
   currentHandle: string | null;
   deviceId: string | null;
   sites: SinisterSite[];
   onSelectSite: (site: SinisterSite) => void;
   onSelectHandle: (handle: string) => void;
+  onSelectHashtag: (tag: string) => void;
 }) {
   const [query, setQuery] = useState('');
 
@@ -7163,6 +7198,7 @@ function ExposureSearchView({ allPosts, currentHandle, deviceId, sites, onSelect
                 if (s) onSelectSite(s);
               }}
               onHandleTap={() => onSelectHandle(p.handle)}
+              onHashtagTap={(tag) => onSelectHashtag(tag)}
             />
           ))}
         </div>
@@ -7463,12 +7499,16 @@ function PhotoLightbox({ imageUrl, onClose }: {
 
 // Single post card inside the feed. Owns its own like state so toggling
 // is fast and doesn't trigger a parent re-render of the whole list.
-function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap, onPostRemoved }: {
+function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap, onHashtagTap, onPostRemoved }: {
   post: SocialPost;
   currentHandle: string | null;
   deviceId: string | null;
   onSiteTap: () => void;
   onHandleTap: () => void;
+  // v1.14: called when the user taps a hashtag in the caption. Parent
+  // should navigate to the hashtag view. Optional — if omitted, hashtag
+  // taps are a no-op (still visually distinct, just don't navigate).
+  onHashtagTap?: (tag: string) => void;
   // Optional. Called when the user hides or deletes this post — parent
   // should remove it from its post list so it doesn't re-render. If
   // omitted, the card hides itself locally.
@@ -7934,15 +7974,22 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap,
       )}
 
       {/* Caption — handle in bold inline with caption text, like IG.
-          Tapping the handle goes to profile; tapping the caption TEXT
-          (the actual words) opens the comment sheet, IG-style. */}
+          Tapping the handle goes to profile; tapping a hashtag goes to
+          that tag's view; tapping plain caption text opens the comment
+          sheet. CaptionWithTags renders the body and stops propagation
+          on tag taps so plain-text taps still bubble. */}
       <div style={S.postCaptionLine}>
         <button onClick={onHandleTap} style={S.postCaptionHandle}>{post.handle}</button>
-        <button
-          type="button"
+        <span
           onClick={() => setCommentsOpen(true)}
-          style={S.postCaptionTextBtn}
-        > {post.caption}</button>
+          style={S.postCaptionText}
+        >
+          {' '}
+          <CaptionWithTags
+            text={post.caption}
+            onTagTap={(tag) => onHashtagTap && onHashtagTap(tag)}
+          />
+        </span>
       </div>
 
       {/* "View all N comments" link, IG-style — appears below the
@@ -8905,17 +8952,184 @@ function ExposureBrandHeader({ unreadCount, onTapBell }: {
 //
 // Layout (top to bottom):
 //   1. Header bar — @handle centered, neon purple in Jolly Lodger
-//   2. Profile row — large avatar on left, Posts/Visits counts on right
-//   3. Bio line (currently just a placeholder — no bio field yet)
-//   4. Action row — "View Badges" button (and a Share button placeholder)
-//   5. Tab strip — single grid icon for now (active)
-//   6. 3-column square grid of approved post thumbnails
-//   7. Tap a thumbnail → opens single-post detail view
+// ---- CaptionWithTags (v1.14) ----
+// Splits a caption string into plain text + tappable hashtag spans. Used
+// in feed cards and post-detail captions. The regex matches the same
+// shape the server extracts: # followed by 2-30 word chars, at start or
+// preceded by whitespace. Render-only — does not mutate the caption.
+function CaptionWithTags({
+  text,
+  onTagTap,
+  baseStyle,
+  tagStyle,
+}: {
+  text: string;
+  onTagTap?: (tag: string) => void;
+  baseStyle?: React.CSSProperties;
+  tagStyle?: React.CSSProperties;
+}) {
+  // Tokenize. Walk the string; every match becomes a tag span, every gap
+  // becomes a text span. Preserve whitespace by including the leading
+  // separator char inside the text span (split-at-match approach).
+  const re = /(^|\s)#([A-Za-z0-9_]{2,30})/g;
+  const parts: Array<{ kind: 'text'; value: string } | { kind: 'tag'; value: string }> = [];
+  let lastIdx = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const matchStart = m.index;
+    const sep = m[1];           // leading whitespace or empty
+    const tag = m[2];
+    const textBefore = text.slice(lastIdx, matchStart) + sep;
+    if (textBefore) parts.push({ kind: 'text', value: textBefore });
+    parts.push({ kind: 'tag', value: tag });
+    lastIdx = matchStart + m[0].length;
+  }
+  if (lastIdx < text.length) parts.push({ kind: 'text', value: text.slice(lastIdx) });
+
+  // No hashtags — render plain text in one span. Avoids a wrapper.
+  if (parts.length === 0 || parts.every((p) => p.kind === 'text')) {
+    return <span style={baseStyle}>{text}</span>;
+  }
+
+  return (
+    <span style={baseStyle}>
+      {parts.map((p, i) => {
+        if (p.kind === 'text') return <span key={i}>{p.value}</span>;
+        return (
+          <button
+            key={i}
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              if (onTagTap) onTagTap(p.value);
+            }}
+            style={{
+              background: 'none',
+              border: 'none',
+              padding: 0,
+              margin: 0,
+              color: '#3FA9FF',
+              cursor: 'pointer',
+              font: 'inherit',
+              ...tagStyle,
+            }}
+          >
+            #{p.value}
+          </button>
+        );
+      })}
+    </span>
+  );
+}
+
+// ---- HashtagView (v1.14) ----
+// Dedicated screen shown when the user taps a hashtag anywhere in the
+// app (feed caption, post detail caption, etc). Loads /posts/hashtag/:tag
+// and renders the IG-style 3-column thumbnail grid. Tap a thumbnail to
+// open the post in the standard post detail view.
+function HashtagView({
+  tag,
+  onSelectPost,
+  onBack,
+}: {
+  tag: string;
+  onSelectPost: (postId: string, postList?: string[], preloadedPosts?: SocialPost[]) => void;
+  onBack: () => void;
+}) {
+  const [posts, setPosts] = useState<SocialPost[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    apiFetchPostsByHashtag(tag).then((p) => {
+      if (cancelled) return;
+      setPosts(p);
+      setLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [tag]);
+
+  return (
+    <div style={S.hashtagViewWrap}>
+      {/* Header — back arrow + #tag title + count */}
+      <div style={S.hashtagHeader}>
+        <button
+          type="button"
+          onClick={onBack}
+          style={S.hashtagBackBtn}
+          aria-label="Back"
+        >
+          ←
+        </button>
+        <div style={S.hashtagHeaderText}>
+          <div style={S.hashtagHeaderTitle}>#{tag}</div>
+          <div style={S.hashtagHeaderSub}>
+            {loading ? 'Loading…' : `${posts.length} ${posts.length === 1 ? 'post' : 'posts'}`}
+          </div>
+        </div>
+      </div>
+
+      {/* Grid — same 3-column shape as profile grid */}
+      {!loading && posts.length === 0 ? (
+        <div style={S.hashtagEmpty}>
+          No posts yet for #{tag}.
+        </div>
+      ) : (
+        <div style={S.profileGrid}>
+          {posts.map((p) => {
+            const firstType =
+              (Array.isArray((p as any).mediaTypes) && (p as any).mediaTypes[0]) ||
+              (/\.(mp4|mov)(\?|$)/i.test(p.photoUrl) ? 'video' : 'photo');
+            const isVideo = firstType === 'video';
+            return (
+              <button
+                key={p.id}
+                onClick={() => onSelectPost(p.id, posts.map((x) => x.id), posts)}
+                style={S.profileGridCell}
+                aria-label={`Open post: ${p.caption.slice(0, 40)}`}
+              >
+                {isVideo ? (
+                  <>
+                    <video
+                      src={`${p.photoUrl}#t=0.1`}
+                      style={S.profileGridImg}
+                      preload="metadata"
+                      muted
+                      playsInline
+                      onLoadedMetadata={(e) => {
+                        try { e.currentTarget.currentTime = 0.1; } catch { /* silent */ }
+                      }}
+                    />
+                    <div style={S.profileGridVideoBadge} aria-hidden="true">
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="#ffffff">
+                        <path d="M8 5v14l11-7z" />
+                      </svg>
+                    </div>
+                  </>
+                ) : (
+                  <img src={p.photoUrl} alt="" style={S.profileGridImg} loading="lazy" />
+                )}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+// ---- UserProfileView ----
+// Profile screen for a single handle. Shows:
+//   1. Header — large avatar on left, Posts/Visits counts on right
+//   2. Bio line
+//   3. Action row — "View Badges" button (and a Share button placeholder)
+//   4. Tab strip — single grid icon for now (active)
+//   5. 3-column square grid of approved post thumbnails
+//   6. Tap a thumbnail → opens single-post detail view
 //
 // Data sources:
 //   - GET /badges/:handle for visit count
-//   - GET /posts/handle/:handle for the grid (new server endpoint —
-//     replaces the old "fetch full feed and filter client-side" trick)
+//   - GET /posts/handle/:handle for the grid
 function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSelectSite, onSelectBadges, onSelectPost, onSelectHandle, onSelectExposureTab, onSelectSettings, onBack, embedded }: {
   profileHandle: string;
   currentHandle: string | null;
@@ -9297,11 +9511,24 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
                   // plays properly.
                   <>
                     <video
-                      src={p.photoUrl}
+                      // Append #t=0.1 to the URL — iOS Safari treats this
+                      // as a media fragment "seek to 0.1s on load" and
+                      // renders that frame as the poster. Without this,
+                      // mobile Safari shows a black frame until the user
+                      // presses play (which we don't want here — it's a
+                      // grid thumbnail, never played in place).
+                      src={`${p.photoUrl}#t=0.1`}
                       style={S.profileGridImg}
                       preload="metadata"
                       muted
                       playsInline
+                      // Belt-and-suspenders: if the hash trick is ignored
+                      // for any reason, force a tiny seek once metadata
+                      // is available. Either path renders the first
+                      // frame.
+                      onLoadedMetadata={(e) => {
+                        try { e.currentTarget.currentTime = 0.1; } catch { /* silent */ }
+                      }}
                     />
                     {/* ▶ overlay in the corner so users see it's a video */}
                     <div style={S.profileGridVideoBadge} aria-hidden="true">
@@ -9832,7 +10059,7 @@ function HandleListSheet({ mode, forHandle, currentHandle, onClose, onSelectHand
 // Preloaded posts arrive from the caller (UserProfileView already has
 // them). Falls back to fetching when no preload is available (e.g. deep
 // link in the future).
-function PostDetailView({ postId, postList, preloadedPosts, currentHandle, deviceId, sites, onSelectSite, onSelectHandle, onSelectExposureTab, onBack }: {
+function PostDetailView({ postId, postList, preloadedPosts, currentHandle, deviceId, sites, onSelectSite, onSelectHandle, onSelectHashtag, onSelectExposureTab, onBack }: {
   postId: string;
   postList?: string[];
   preloadedPosts?: SocialPost[];
@@ -9841,6 +10068,7 @@ function PostDetailView({ postId, postList, preloadedPosts, currentHandle, devic
   sites: SinisterSite[];
   onSelectSite: (site: SinisterSite) => void;
   onSelectHandle: (handle: string) => void;
+  onSelectHashtag: (tag: string) => void;
   onSelectExposureTab: (tab: 'feed' | 'search' | 'post' | 'profile') => void;
   onBack: () => void;
 }) {
@@ -9937,6 +10165,7 @@ function PostDetailView({ postId, postList, preloadedPosts, currentHandle, devic
                   if (s) onSelectSite(s);
                 }}
                 onHandleTap={() => onSelectHandle(p.handle)}
+                onHashtagTap={(tag) => onSelectHashtag(tag)}
               />
             </div>
           ))}
@@ -15712,6 +15941,56 @@ const S: Record<string, React.CSSProperties> = {
     justifyContent: 'center',
     pointerEvents: 'none' as const,
   },
+  // ---- HashtagView (v1.14) ----
+  // Dedicated screen for a single #tag. Header on top, then the same
+  // 3-column thumbnail grid the profile view uses.
+  hashtagViewWrap: {
+    backgroundColor: '#0a0a0a',
+    minHeight: '100vh',
+    color: '#F0EBE0',
+  },
+  hashtagHeader: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 12,
+    padding: '14px 12px 12px',
+    borderBottom: '1px solid rgba(255,255,255,0.06)',
+  },
+  hashtagBackBtn: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    background: 'transparent',
+    border: 'none',
+    color: '#F0EBE0',
+    fontSize: 24,
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexShrink: 0,
+  },
+  hashtagHeaderText: {
+    display: 'flex',
+    flexDirection: 'column' as const,
+  },
+  hashtagHeaderTitle: {
+    fontSize: 20,
+    fontWeight: 700,
+    color: '#F0EBE0',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  hashtagHeaderSub: {
+    fontSize: 13,
+    color: '#888',
+    marginTop: 2,
+  },
+  hashtagEmpty: {
+    padding: '40px 20px',
+    textAlign: 'center' as const,
+    color: '#888',
+    fontSize: 14,
+  },
   // ---- Post detail (IG-style swipe-through viewer) ----
   // Small chip just below the brand header showing "N / total" so the
   // user has IG-style orientation while swiping between posts.
@@ -16025,6 +16304,7 @@ const S: Record<string, React.CSSProperties> = {
     color: '#F0EBE0',
     fontSize: 14,
     fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
   },
   // Same visual as postCaptionText but renders as a button that opens
   // the comment sheet on tap. IG works this way — tapping the caption
