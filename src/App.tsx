@@ -705,6 +705,9 @@ type SocialPost = {
   // this when present; falls back to single photoUrl on older API
   // responses or single-photo posts.
   photoUrls?: string[];
+  // v1.13: parallel to photoUrls, identifying which slots are videos.
+  // Defaults to all 'photo' for pre-v1.13 posts.
+  mediaTypes?: Array<'photo' | 'video'>;
   createdAt: string;
   approvedAt: string;
   likeCount: number;
@@ -5990,6 +5993,23 @@ function ExposurePostEditor({ photoFile, onBack, onNext }: {
       l.id === selectedId ? { ...l, rotation: (l.rotation + delta) % 360 } : l
     ));
   };
+  // Absolute setters used by the slider controls. Clamped the same way
+  // the +/− buttons would have been. Named setLayerScale/setLayerRotation
+  // to avoid colliding with the editor's overall image-rotation state.
+  const setLayerScale = (value: number) => {
+    if (!selectedId) return;
+    const clamped = Math.max(0.3, Math.min(3, value));
+    setLayers((prev) => prev.map((l) =>
+      l.id === selectedId ? { ...l, scale: clamped } : l
+    ));
+  };
+  const setLayerRotation = (value: number) => {
+    if (!selectedId) return;
+    // Slider range -180..180; bake's ctx.rotate accepts any radian value.
+    setLayers((prev) => prev.map((l) =>
+      l.id === selectedId ? { ...l, rotation: value } : l
+    ));
+  };
   // Re-skin the currently selected text layer with a different font face.
   // No-op if the selection is a sticker or nothing is selected. Also nudges
   // the "default for next text layer" so the user's last font choice
@@ -6222,15 +6242,55 @@ function ExposurePostEditor({ photoFile, onBack, onNext }: {
         );
       })()}
 
-      {selectedId && (
-        <div style={S.editorLayerControls}>
-          <button style={S.editorLayerBtn} onClick={() => adjustScale(-0.15)} aria-label="Shrink">−</button>
-          <button style={S.editorLayerBtn} onClick={() => adjustScale(0.15)} aria-label="Grow">+</button>
-          <button style={S.editorLayerBtn} onClick={() => adjustRotation(-15)} aria-label="Rotate left">↺</button>
-          <button style={S.editorLayerBtn} onClick={() => adjustRotation(15)} aria-label="Rotate right">↻</button>
-          <button style={{ ...S.editorLayerBtn, color: '#FF4D4D' }} onClick={deleteSelected} aria-label="Delete">🗑</button>
-        </div>
-      )}
+      {selectedId && (() => {
+        // Read the current selected layer once so the sliders reflect
+        // its actual scale/rotation. If nothing's selected the block
+        // doesn't render (outer && guard).
+        const sel = layers.find((l) => l.id === selectedId);
+        if (!sel) return null;
+        // Stop propagation on touch events so dragging the slider
+        // doesn't trigger the global swipe-back gesture.
+        const stopBubble = (e: React.TouchEvent | React.PointerEvent) => e.stopPropagation();
+        return (
+          <div style={S.editorLayerControls}>
+            <div style={S.editorSliderRow}>
+              <span style={S.editorSliderIcon} aria-hidden="true">⤢</span>
+              <input
+                type="range"
+                min={0.3}
+                max={3}
+                step={0.01}
+                value={sel.scale}
+                onChange={(e) => setLayerScale(parseFloat(e.target.value))}
+                onTouchStart={stopBubble}
+                onTouchMove={stopBubble}
+                onTouchEnd={stopBubble}
+                onPointerDown={stopBubble}
+                style={S.editorSlider}
+                aria-label="Size"
+              />
+            </div>
+            <div style={S.editorSliderRow}>
+              <span style={S.editorSliderIcon} aria-hidden="true">↻</span>
+              <input
+                type="range"
+                min={-180}
+                max={180}
+                step={1}
+                value={sel.rotation}
+                onChange={(e) => setLayerRotation(parseFloat(e.target.value))}
+                onTouchStart={stopBubble}
+                onTouchMove={stopBubble}
+                onTouchEnd={stopBubble}
+                onPointerDown={stopBubble}
+                style={S.editorSlider}
+                aria-label="Rotation"
+              />
+            </div>
+            <button style={S.editorLayerDeleteBtn} onClick={deleteSelected} aria-label="Delete">🗑</button>
+          </div>
+        );
+      })()}
 
       {/* Filter strip — horizontal scroll of preset thumbs above toolbar */}
       {tray === 'filter' && (
@@ -6700,6 +6760,10 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
   // Server stores them as a carousel.
   const [extraPhotos, setExtraPhotos] = useState<File[]>([]);
   const [extraPreviews, setExtraPreviews] = useState<string[]>([]);
+  // v1.13: when the user picks a video instead of a photo, this flag
+  // routes the flow around the editor (which only handles images).
+  // Set by onPhotoChange when a video/* file lands.
+  const [isVideoPick, setIsVideoPick] = useState(false);
   const [caption, setCaption] = useState('');
   const [submitting, setSubmitting] = useState(false);
   // Three-stage flow: pick photo → edit (filmstrip/stickers/text) →
@@ -6720,20 +6784,55 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
   // Server enforces 1-280 char caption.
   const canShare = !!editedFile && captionTrim.length >= 1 && captionTrim.length <= 280 && !submitting && !!handle && !!deviceId;
 
-  // Accept up to 10 photos in one pick. First photo becomes the primary
-  // (editable); rest are uploaded raw alongside in the carousel.
+  // Accept up to 10 photos OR one video in a single pick. v1.13 added
+  // video support. Rules:
+  //   - All photos = carousel post (1-10 slots)
+  //   - One video = single-slot video post (no carousel)
+  //   - Mixed photos+video in one pick = rejected (we don't render
+  //     mixed carousels)
+  //   - Multiple videos in one pick = first one wins, rest dropped
+  // The first photo (if any) becomes the editable primary that goes
+  // through the editor. Extras ride along raw.
   const MAX_PHOTOS = 10;
+  const MAX_VIDEO_BYTES = 20 * 1024 * 1024;     // 20 MB hard cap, mirrors server
   const onPhotoChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const fl = e.target.files;
     if (!fl || fl.length === 0) return;
-    const arr = Array.from(fl).slice(0, MAX_PHOTOS);
-    setPhotoFile(arr[0]);
-    setPhotoPreview(URL.createObjectURL(arr[0]));
-    // Clean up old extra-preview URLs to avoid memory leaks.
+    const arr = Array.from(fl);
+    const photos = arr.filter((f) => f.type.startsWith('image/'));
+    const videos = arr.filter((f) => f.type.startsWith('video/'));
+
+    if (photos.length > 0 && videos.length > 0) {
+      showToast('Pick photos OR a video, not both', 'error');
+      return;
+    }
+    if (videos.length > 0) {
+      const v = videos[0];
+      if (v.size > MAX_VIDEO_BYTES) {
+        showToast(`Video too large (max ${Math.round(MAX_VIDEO_BYTES / 1024 / 1024)}MB). Trim it first in Photos.`, 'error');
+        return;
+      }
+      // Video post path: skip the editor entirely. Store the video as
+      // "photoFile" for the upload step (server routes by mimetype).
+      // No extras for video posts (v1).
+      setPhotoFile(v);
+      setPhotoPreview(URL.createObjectURL(v));
+      extraPreviews.forEach((u) => URL.revokeObjectURL(u));
+      setExtraPhotos([]);
+      setExtraPreviews([]);
+      setIsVideoPick(true);
+      return;
+    }
+
+    // Photo post path — up to 10 photos.
+    const trimmed = photos.slice(0, MAX_PHOTOS);
+    setPhotoFile(trimmed[0]);
+    setPhotoPreview(URL.createObjectURL(trimmed[0]));
     extraPreviews.forEach((u) => URL.revokeObjectURL(u));
-    const extras = arr.slice(1);
+    const extras = trimmed.slice(1);
     setExtraPhotos(extras);
     setExtraPreviews(extras.map((f) => URL.createObjectURL(f)));
+    setIsVideoPick(false);
   };
 
   const openPicker = () => {
@@ -6743,6 +6842,17 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
 
   const onNext = () => {
     if (!photoFile) return;
+    if (isVideoPick) {
+      // Video posts skip the editor entirely — there's nothing to edit
+      // (no filters/stickers/text on video in v1). The picked video file
+      // IS the file we upload, so we set it as editedFile directly and
+      // jump to the caption stage.
+      if (editedPreview) URL.revokeObjectURL(editedPreview);
+      setEditedFile(photoFile);
+      setEditedPreview(URL.createObjectURL(photoFile));
+      setStage('caption');
+      return;
+    }
     setStage('edit');
   };
 
@@ -6816,7 +6926,7 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
       <input
         ref={fileRef}
         type="file"
-        accept="image/*"
+        accept="image/*,video/*"
         multiple
         style={{ display: 'none' }}
         onChange={onPhotoChange}
@@ -6849,13 +6959,26 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
               going into the carousel. */}
           {photoPreview ? (
             <div style={S.igPickPreviewWrap}>
-              <img src={photoPreview} alt="" style={S.igPickPreviewImg} />
+              {isVideoPick ? (
+                <video
+                  src={photoPreview}
+                  style={S.igPickPreviewImg}
+                  muted
+                  autoPlay
+                  playsInline
+                  loop
+                />
+              ) : (
+                <img src={photoPreview} alt="" style={S.igPickPreviewImg} />
+              )}
               <button
                 type="button"
                 onClick={openPicker}
                 style={S.igPickChangeBtn}
               >
-                {extraPhotos.length > 0 ? `${extraPhotos.length + 1} photos · Change` : 'Change photo'}
+                {isVideoPick
+                  ? 'Video selected · Change'
+                  : (extraPhotos.length > 0 ? `${extraPhotos.length + 1} photos · Change` : 'Change photo')}
               </button>
               {extraPhotos.length > 0 && (
                 <div style={{
@@ -6922,11 +7045,24 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
             <div style={{ width: 40 }} />
           </div>
 
-          {/* Smaller centered preview + caption field below */}
+          {/* Smaller centered preview + caption field below. For video
+              posts the preview is a muted, looping <video> so the user
+              sees what they're about to share. */}
           <div style={S.igCaptionBody}>
             <div style={S.igCaptionPreviewRow}>
               {editedPreview && (
-                <img src={editedPreview} alt="" style={S.igCaptionPreviewImg} />
+                isVideoPick ? (
+                  <video
+                    src={editedPreview}
+                    style={S.igCaptionPreviewImg}
+                    muted
+                    autoPlay
+                    playsInline
+                    loop
+                  />
+                ) : (
+                  <img src={editedPreview} alt="" style={S.igCaptionPreviewImg} />
+                )
               )}
               <textarea
                 value={caption}
@@ -7548,8 +7684,46 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap,
         const photos = (post.photoUrls && post.photoUrls.length > 0)
           ? post.photoUrls
           : [post.photoUrl];
+        // Parallel array of media types. Defaults to all 'photo' for
+        // backwards-compat with pre-v1.13 posts that don't carry it.
+        const types = (post.mediaTypes && post.mediaTypes.length === photos.length)
+          ? post.mediaTypes
+          : photos.map(() => 'photo');
         const isCarousel = photos.length > 1;
+
+        // Renders a single slot. Photo = <img>; video = <video> with
+        // autoplay-muted-loop. The video element is its own native
+        // tap-to-fullscreen surface; we don't wrap it in the lightbox
+        // button because the controls would conflict.
+        const renderSlot = (url: string, type: string, i: number) => {
+          if (type === 'video') {
+            return (
+              <video
+                key={i}
+                src={url}
+                style={S.postPhoto}
+                muted
+                autoPlay
+                loop
+                playsInline
+                controls
+                preload="metadata"
+              />
+            );
+          }
+          return <img key={i} src={url} alt="" style={S.postPhoto} draggable={false} />;
+        };
+
         if (!isCarousel) {
+          const type = types[0] || 'photo';
+          if (type === 'video') {
+            // Single video — render directly, no wrapping button.
+            return (
+              <div style={{ width: '100%', display: 'block' }}>
+                {renderSlot(photos[0], 'video', 0)}
+              </div>
+            );
+          }
           return (
             <button
               type="button"
@@ -7565,7 +7739,7 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap,
                 width: '100%',
               }}
             >
-              <img src={photos[0]} alt="" style={S.postPhoto} draggable={false} />
+              {renderSlot(photos[0], 'photo', 0)}
             </button>
           );
         }
@@ -7573,8 +7747,10 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap,
           <div style={S.postCarouselWrap}>
             <div
               style={S.postCarouselScroller}
+              onTouchStart={(e) => e.stopPropagation()}
+              onTouchMove={(e) => e.stopPropagation()}
+              onTouchEnd={(e) => e.stopPropagation()}
               onScroll={(e) => {
-                // Track which slide is centered for the dots indicator.
                 const el = e.currentTarget;
                 const w = el.clientWidth;
                 if (w > 0) {
@@ -7583,17 +7759,27 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap,
                 }
               }}
             >
-              {photos.map((url, i) => (
-                <button
-                  key={i}
-                  type="button"
-                  onClick={() => setLightboxOpen(true)}
-                  aria-label={`View photo ${i + 1} of ${photos.length} fullscreen`}
-                  style={S.postCarouselSlide}
-                >
-                  <img src={url} alt="" style={S.postPhoto} draggable={false} />
-                </button>
-              ))}
+              {photos.map((url, i) => {
+                const type = types[i] || 'photo';
+                if (type === 'video') {
+                  return (
+                    <div key={i} style={S.postCarouselSlide}>
+                      {renderSlot(url, 'video', i)}
+                    </div>
+                  );
+                }
+                return (
+                  <button
+                    key={i}
+                    type="button"
+                    onClick={() => setLightboxOpen(true)}
+                    aria-label={`View photo ${i + 1} of ${photos.length} fullscreen`}
+                    style={S.postCarouselSlide}
+                  >
+                    {renderSlot(url, 'photo', i)}
+                  </button>
+                );
+              })}
             </div>
             {/* Page dots */}
             <div style={S.postCarouselDots}>
@@ -7607,7 +7793,6 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap,
                 />
               ))}
             </div>
-            {/* "1/4" badge in the top-right corner — IG shows this on carousels */}
             <div style={S.postCarouselBadge}>
               {carouselIndex + 1}/{photos.length}
             </div>
@@ -16589,16 +16774,60 @@ const S: Record<string, React.CSSProperties> = {
     backgroundColor: '#F5EFE0',
     borderRadius: 3,
   },
+  // Slider-based size/rotation controls (v1.13). The two rows + delete
+  // button stack vertically over the bottom toolbar, with a translucent
+  // black panel so they read against any background image.
   editorLayerControls: {
     position: 'absolute' as const,
     bottom: 96,
     left: 12,
     right: 12,
     display: 'flex',
-    justifyContent: 'center',
-    gap: 6,
+    flexDirection: 'column' as const,
+    gap: 8,
+    padding: '10px 12px',
+    backgroundColor: 'rgba(0,0,0,0.72)',
+    borderRadius: 12,
+    backdropFilter: 'blur(8px)',
+    WebkitBackdropFilter: 'blur(8px)',
+    border: '1px solid rgba(255,255,255,0.12)',
     zIndex: 5,
   },
+  editorSliderRow: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 10,
+  },
+  editorSliderIcon: {
+    color: '#FFFFFF',
+    fontSize: 18,
+    width: 22,
+    textAlign: 'center' as const,
+    flexShrink: 0,
+  },
+  // Native range slider styled to match the dark editor chrome. The
+  // appearance: none + WebkitAppearance: none combo strips iOS Safari's
+  // default styling so our gradient track and pink thumb show through.
+  editorSlider: {
+    flex: 1,
+    height: 32,
+    accentColor: '#FF3B5C',
+    background: 'transparent',
+    margin: 0,
+  },
+  // Delete button sits below the sliders, full-width, with red text.
+  editorLayerDeleteBtn: {
+    height: 36,
+    borderRadius: 8,
+    backgroundColor: 'rgba(255,77,77,0.15)',
+    border: '1px solid rgba(255,77,77,0.4)',
+    color: '#FF4D4D',
+    fontSize: 16,
+    fontWeight: 600,
+    cursor: 'pointer',
+  },
+  // (legacy editorLayerBtn kept so existing +/− style references in
+  // any code I missed don't break — safe to remove later)
   editorLayerBtn: {
     width: 44,
     height: 44,
