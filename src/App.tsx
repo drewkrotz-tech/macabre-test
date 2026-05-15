@@ -701,6 +701,10 @@ type SocialPost = {
   avatarUrl?: string | null;
   caption: string;
   photoUrl: string;
+  // v1.12 carousel posts: array of 1..N photo URLs. The post card uses
+  // this when present; falls back to single photoUrl on older API
+  // responses or single-photo posts.
+  photoUrls?: string[];
   createdAt: string;
   approvedAt: string;
   likeCount: number;
@@ -999,8 +1003,13 @@ async function apiDeleteComment(args: { commentId: string; handle: string; devic
 //     Server verifies GPS within 100m, post enters pending review.
 //   - Freeform: pass freeform=true and omit siteId / GPS. Server
 //     auto-approves and the post hits the feed immediately.
+// v1.12: photo is the primary (edited) image. extras is an optional
+// array of unedited additional photos that ride along as carousel slots
+// 2..N. The server stores them in photoR2Keys[] with the primary at
+// index 0.
 async function apiCreatePost(args: {
   photo: Blob;
+  extras?: Blob[];
   handle: string;
   deviceId: string;
   caption: string;
@@ -1011,7 +1020,16 @@ async function apiCreatePost(args: {
 }): Promise<{ ok: boolean; postId?: string; reason?: string }> {
   try {
     const fd = new FormData();
-    fd.append('photo', args.photo, 'post.jpg');
+    // Send the primary on BOTH fields — `photo` for backwards-compat
+    // with any legacy server, AND as the first entry in `photos` for
+    // v1.12+ servers that expect the multi-field. Servers running both
+    // schemas dedupe in the normalizeFiles middleware.
+    fd.append('photos', args.photo, 'post-0.jpg');
+    if (args.extras && args.extras.length > 0) {
+      args.extras.forEach((blob, i) => {
+        fd.append('photos', blob, `post-${i + 1}.jpg`);
+      });
+    }
     fd.append('handle', args.handle);
     fd.append('deviceId', args.deviceId);
     fd.append('caption', args.caption);
@@ -2045,31 +2063,31 @@ function buildStyleCss() {
    - The native iOS overlay scrollbar (this is the thin grey one
      that briefly appears during scroll). It can't be hidden via
      CSS in all iOS versions, but recent versions DO honor
-     scrollbar-width: none on the scrolling element. */
-body[data-view="detail"]::-webkit-scrollbar,
-body[data-view="about"]::-webkit-scrollbar,
-body[data-view="leaders"]::-webkit-scrollbar,
-body[data-view="detail"]::-webkit-scrollbar-thumb,
-body[data-view="about"]::-webkit-scrollbar-thumb,
-body[data-view="leaders"]::-webkit-scrollbar-thumb,
-body[data-view="detail"]::-webkit-scrollbar-track,
-body[data-view="about"]::-webkit-scrollbar-track,
-body[data-view="leaders"]::-webkit-scrollbar-track,
-html[data-view="detail"]::-webkit-scrollbar,
-html[data-view="about"]::-webkit-scrollbar,
-html[data-view="leaders"]::-webkit-scrollbar {
+     scrollbar-width: none on the scrolling element.
+
+   v1.12 globalized this from per-view (detail/about/leaders) to
+   everywhere. The white scrollbar was still showing up on DreadFeed,
+   the home screen, and any other view that wasn't in the enumerated
+   list. There's no view where we WANT to show a scrollbar — they all
+   look cheap on iOS — so the global rule is correct. */
+html::-webkit-scrollbar,
+body::-webkit-scrollbar,
+html::-webkit-scrollbar-thumb,
+body::-webkit-scrollbar-thumb,
+html::-webkit-scrollbar-track,
+body::-webkit-scrollbar-track,
+*::-webkit-scrollbar,
+*::-webkit-scrollbar-thumb,
+*::-webkit-scrollbar-track {
   display: none !important;
   width: 0 !important;
   height: 0 !important;
   -webkit-appearance: none !important;
   background: transparent !important;
 }
-body[data-view="detail"],
-body[data-view="about"],
-body[data-view="leaders"],
-html[data-view="detail"],
-html[data-view="about"],
-html[data-view="leaders"] {
+html,
+body,
+* {
   scrollbar-width: none !important;
   -ms-overflow-style: none !important;
 }
@@ -6675,6 +6693,13 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
   const fileRef = useRef<HTMLInputElement>(null);
   const [photoFile, setPhotoFile] = useState<File | null>(null);
   const [photoPreview, setPhotoPreview] = useState<string | null>(null);
+  // v1.12 multi-photo support. The first picked photo (photoFile) is
+  // the "primary" — it goes through the editor (filter/frame/stickers/
+  // text). Additional photos are extras that ride along untouched. IG
+  // works this way: photo 1 is the cover, the rest are uploaded raw.
+  // Server stores them as a carousel.
+  const [extraPhotos, setExtraPhotos] = useState<File[]>([]);
+  const [extraPreviews, setExtraPreviews] = useState<string[]>([]);
   const [caption, setCaption] = useState('');
   const [submitting, setSubmitting] = useState(false);
   // Three-stage flow: pick photo → edit (filmstrip/stickers/text) →
@@ -6695,11 +6720,20 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
   // Server enforces 1-280 char caption.
   const canShare = !!editedFile && captionTrim.length >= 1 && captionTrim.length <= 280 && !submitting && !!handle && !!deviceId;
 
+  // Accept up to 10 photos in one pick. First photo becomes the primary
+  // (editable); rest are uploaded raw alongside in the carousel.
+  const MAX_PHOTOS = 10;
   const onPhotoChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const f = e.target.files && e.target.files[0];
-    if (!f) return;
-    setPhotoFile(f);
-    setPhotoPreview(URL.createObjectURL(f));
+    const fl = e.target.files;
+    if (!fl || fl.length === 0) return;
+    const arr = Array.from(fl).slice(0, MAX_PHOTOS);
+    setPhotoFile(arr[0]);
+    setPhotoPreview(URL.createObjectURL(arr[0]));
+    // Clean up old extra-preview URLs to avoid memory leaks.
+    extraPreviews.forEach((u) => URL.revokeObjectURL(u));
+    const extras = arr.slice(1);
+    setExtraPhotos(extras);
+    setExtraPreviews(extras.map((f) => URL.createObjectURL(f)));
   };
 
   const openPicker = () => {
@@ -6736,6 +6770,7 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
     setSubmitting(true);
     const result = await apiCreatePost({
       photo: editedFile,
+      extras: extraPhotos,    // v1.12: carousel extras (raw, unedited)
       handle,
       deviceId,
       caption: captionTrim,
@@ -6772,13 +6807,17 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
 
   return createPortal(
     <div style={S.igComposerScreen}>
-      {/* Hidden file input — same trick as before. accept="image/*" plus
-          no capture attribute lets iOS show the full picker (Photo
-          Library / Take Photo / Choose File). */}
+      {/* Hidden file input — multi-select enabled in v1.12 for IG-style
+          carousel posts. The user picks 1 to 10 photos at once; photo 1
+          becomes the editable "primary" and the rest ride along as raw
+          carousel extras. accept="image/*" plus no capture attribute
+          lets iOS show the full picker (Photo Library / Take Photo /
+          Choose File). */}
       <input
         ref={fileRef}
         type="file"
         accept="image/*"
+        multiple
         style={{ display: 'none' }}
         onChange={onPhotoChange}
       />
@@ -6804,7 +6843,10 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
           </div>
 
           {/* Big preview area — either tap-to-pick prompt or the selected
-              photo. Edge-to-edge, square aspect ratio like IG. */}
+              photo. Edge-to-edge, square aspect ratio like IG. v1.12:
+              when the user picks multiple photos, a thumbnail strip of
+              the extras shows below the primary so they can see what's
+              going into the carousel. */}
           {photoPreview ? (
             <div style={S.igPickPreviewWrap}>
               <img src={photoPreview} alt="" style={S.igPickPreviewImg} />
@@ -6813,8 +6855,35 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
                 onClick={openPicker}
                 style={S.igPickChangeBtn}
               >
-                Change photo
+                {extraPhotos.length > 0 ? `${extraPhotos.length + 1} photos · Change` : 'Change photo'}
               </button>
+              {extraPhotos.length > 0 && (
+                <div style={{
+                  display: 'flex',
+                  gap: 6,
+                  padding: '10px 12px',
+                  overflowX: 'auto',
+                  WebkitOverflowScrolling: 'touch' as any,
+                }}>
+                  {/* Primary thumbnail with a "1" badge */}
+                  <div style={{ position: 'relative', flexShrink: 0 }}>
+                    <img
+                      src={photoPreview}
+                      alt=""
+                      style={{ width: 60, height: 60, objectFit: 'cover', borderRadius: 6, border: '2px solid #FF3B5C' }}
+                    />
+                  </div>
+                  {extraPreviews.map((url, i) => (
+                    <div key={i} style={{ position: 'relative', flexShrink: 0 }}>
+                      <img
+                        src={url}
+                        alt=""
+                        style={{ width: 60, height: 60, objectFit: 'cover', borderRadius: 6, border: '1px solid rgba(255,255,255,0.15)' }}
+                      />
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           ) : (
             <button
@@ -7282,6 +7351,9 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap,
   // Lightbox state — tapping the photo opens a full-screen viewer with
   // pinch-zoom, pan, and swipe-down dismiss. See PhotoLightbox above.
   const [lightboxOpen, setLightboxOpen] = useState(false);
+  // For multi-photo carousel posts: which slide (0-indexed) is centered.
+  // Drives the page-dots indicator and the "1/N" badge in the corner.
+  const [carouselIndex, setCarouselIndex] = useState(0);
   // Repost state — server-backed. Optimistic toggle on tap, rollback
   // on failure. Status is fetched on mount so reloads show the correct
   // filled/empty icon for the current user.
@@ -7466,26 +7538,82 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap,
         >⋯</button>
       </div>
 
-      {/* Photo — edge-to-edge with slightly rounded corners. 4:5 portrait
-          crop in the feed; tap to open the full-aspect lightbox viewer
-          with pinch-zoom and pan. The wrapping button gets keyboard +
-          screen-reader semantics for free. */}
-      <button
-        type="button"
-        onClick={() => setLightboxOpen(true)}
-        aria-label="View photo fullscreen"
-        style={{
-          padding: 0,
-          margin: 0,
-          border: 'none',
-          background: 'transparent',
-          cursor: 'pointer',
-          display: 'block',
-          width: '100%',
-        }}
-      >
-        <img src={post.photoUrl} alt="" style={S.postPhoto} draggable={false} />
-      </button>
+      {/* Photo(s) — single-photo posts render one image edge-to-edge;
+          multi-photo posts (v1.12 carousels) render a horizontal snap-
+          scroll strip with page dots underneath. Tap any photo to open
+          the full-aspect lightbox viewer with pinch-zoom and pan.
+          We use CSS scroll-snap so the gesture feels native — no JS
+          touch handling, no jank. */}
+      {(() => {
+        const photos = (post.photoUrls && post.photoUrls.length > 0)
+          ? post.photoUrls
+          : [post.photoUrl];
+        const isCarousel = photos.length > 1;
+        if (!isCarousel) {
+          return (
+            <button
+              type="button"
+              onClick={() => setLightboxOpen(true)}
+              aria-label="View photo fullscreen"
+              style={{
+                padding: 0,
+                margin: 0,
+                border: 'none',
+                background: 'transparent',
+                cursor: 'pointer',
+                display: 'block',
+                width: '100%',
+              }}
+            >
+              <img src={photos[0]} alt="" style={S.postPhoto} draggable={false} />
+            </button>
+          );
+        }
+        return (
+          <div style={S.postCarouselWrap}>
+            <div
+              style={S.postCarouselScroller}
+              onScroll={(e) => {
+                // Track which slide is centered for the dots indicator.
+                const el = e.currentTarget;
+                const w = el.clientWidth;
+                if (w > 0) {
+                  const idx = Math.round(el.scrollLeft / w);
+                  if (idx !== carouselIndex) setCarouselIndex(idx);
+                }
+              }}
+            >
+              {photos.map((url, i) => (
+                <button
+                  key={i}
+                  type="button"
+                  onClick={() => setLightboxOpen(true)}
+                  aria-label={`View photo ${i + 1} of ${photos.length} fullscreen`}
+                  style={S.postCarouselSlide}
+                >
+                  <img src={url} alt="" style={S.postPhoto} draggable={false} />
+                </button>
+              ))}
+            </div>
+            {/* Page dots */}
+            <div style={S.postCarouselDots}>
+              {photos.map((_, i) => (
+                <span
+                  key={i}
+                  style={{
+                    ...S.postCarouselDot,
+                    ...(i === carouselIndex ? S.postCarouselDotActive : null),
+                  }}
+                />
+              ))}
+            </div>
+            {/* "1/4" badge in the top-right corner — IG shows this on carousels */}
+            <div style={S.postCarouselBadge}>
+              {carouselIndex + 1}/{photos.length}
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Actions row — Instagram-style line icons: heart, comment (disabled
           for now, real comments later), share. All outlined SVGs at equal
@@ -11364,9 +11492,14 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
     // Tapping a Reset button or the dot itself clears pinCenter and snaps
     // it back to the real location.
     if (userAnnotationRef.current) {
-      // Only sync to livePos when we're NOT in dragged mode — otherwise
-      // we'd yank the dot back to the user's real location every GPS update.
-      if (!pinCenter) {
+      // Only sync to livePos when we're NOT in dragged mode AND not
+      // currently mid-drag. If pinCenter is null the user either
+      // hasn't dragged at all (sync OK), OR they're partway through
+      // a drag where pinCenter hasn't been committed yet (sync NOT
+      // OK — we'd snap the dot out from under the finger). The
+      // dragInProgressRef flag, set by the drag-start listener below,
+      // is what tells us about that second case.
+      if (!pinCenter && !dragInProgressRef.current) {
         userAnnotationRef.current.coordinate = new mk.Coordinate(livePos.lat, livePos.lng);
       }
     } else {
@@ -11392,33 +11525,56 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
   // annotation, not the map, so we attach it once after the dot exists.
   // We use a layout effect tied to a sentinel so it re-binds if the dot
   // is ever recreated.
+  //
+  // CRITICAL: we ALSO bind drag-start. While a drag is in progress,
+  // GPS updates keep arriving and the effects above/below would happily
+  // overwrite dot.coordinate with livePos, yanking the dot back to the
+  // user's real location mid-drag. The dragInProgressRef flag lets those
+  // effects skip the sync while the finger is down.
   const dragHandlerBoundRef = useRef(false);
+  const dragInProgressRef = useRef(false);
   useEffect(() => {
     const map = mapRef.current;
     const mk = (window as any).mapkit;
     const dot = userAnnotationRef.current;
     if (!map || !mk || !dot || dragHandlerBoundRef.current) return;
+    const onDragStart = () => {
+      dragInProgressRef.current = true;
+    };
     const onDragEnd = () => {
+      dragInProgressRef.current = false;
       const c = dot.coordinate;
       if (!c) return;
       playPop();
       setPinCenter({ lat: c.latitude, lng: c.longitude });
       setSelectedSite(null);
     };
-    try { dot.addEventListener('drag-end', onDragEnd); dragHandlerBoundRef.current = true; } catch { /* silent */ }
+    try {
+      dot.addEventListener('drag-start', onDragStart);
+      dot.addEventListener('drag-end', onDragEnd);
+      dragHandlerBoundRef.current = true;
+    } catch { /* silent */ }
     return () => {
-      try { dot.removeEventListener('drag-end', onDragEnd); } catch { /* silent */ }
+      try {
+        dot.removeEventListener('drag-start', onDragStart);
+        dot.removeEventListener('drag-end', onDragEnd);
+      } catch { /* silent */ }
       dragHandlerBoundRef.current = false;
+      dragInProgressRef.current = false;
     };
   }, [livePos, mapReady]); // re-evaluate after first livePos arrives (when dot gets created)
 
   // Recolor the user dot to reflect dragged vs. at-real-location state.
   // Red = you've dragged it to search a different area. Blue = at your
   // real GPS location. Also moves the dot to pinCenter when dragged.
+  // Skipped entirely while a drag is in progress — the dot's coordinate
+  // is being controlled by the user's finger right now; touching it
+  // from here would snap it out from under them.
   useEffect(() => {
     const mk = (window as any).mapkit;
     const dot = userAnnotationRef.current;
     if (!mk || !dot) return;
+    if (dragInProgressRef.current) return;
     if (pinCenter) {
       dot.coordinate = new mk.Coordinate(pinCenter.lat, pinCenter.lng);
       dot.color = '#d92a2a';
@@ -15499,6 +15655,80 @@ const S: Record<string, React.CSSProperties> = {
     objectFit: 'cover' as const,
     backgroundColor: '#111',
     borderRadius: 8,
+  },
+  // ---- Multi-photo carousel (v1.12) ----
+  // Wraps the scroller + dots + "1/N" badge. Position relative so the
+  // badge can anchor top-right over the photos.
+  postCarouselWrap: {
+    position: 'relative' as const,
+    width: '100%',
+  },
+  // Horizontal snap-scroller. Each slide is 100% width; the browser
+  // snaps to the nearest one when the user releases their finger.
+  // scrollbar is hidden globally so the white bar never shows here.
+  postCarouselScroller: {
+    display: 'flex',
+    overflowX: 'auto' as const,
+    overflowY: 'hidden' as const,
+    scrollSnapType: 'x mandatory' as const,
+    WebkitOverflowScrolling: 'touch' as any,
+    overscrollBehaviorX: 'contain' as const,
+    width: '100%',
+  },
+  // Single slide inside the scroller. Each takes full width; snaps to
+  // start so the active photo always aligns to the left edge. Width
+  // and minWidth both set to 100% — flexbox needs both to behave
+  // correctly with overflow.
+  postCarouselSlide: {
+    flex: '0 0 100%',
+    width: '100%',
+    minWidth: '100%',
+    scrollSnapAlign: 'start' as const,
+    padding: 0,
+    margin: 0,
+    border: 'none',
+    background: 'transparent',
+    cursor: 'pointer',
+    display: 'block',
+  },
+  // Page dots, absolute-positioned below the photo area. Translucent
+  // white circles, the active one is solid blue (matches IG).
+  postCarouselDots: {
+    position: 'absolute' as const,
+    bottom: 8,
+    left: 0,
+    right: 0,
+    display: 'flex',
+    justifyContent: 'center',
+    gap: 4,
+    pointerEvents: 'none' as const,
+  },
+  postCarouselDot: {
+    width: 6,
+    height: 6,
+    borderRadius: '50%',
+    backgroundColor: 'rgba(255,255,255,0.45)',
+    transition: 'background-color 0.2s ease',
+  },
+  postCarouselDotActive: {
+    backgroundColor: '#3FA9FF',
+  },
+  // "1/4" badge top-right of the photo. Same translucent-black pill
+  // IG uses on carousels.
+  postCarouselBadge: {
+    position: 'absolute' as const,
+    top: 10,
+    right: 10,
+    padding: '2px 8px',
+    backgroundColor: 'rgba(0,0,0,0.6)',
+    color: '#ffffff',
+    fontSize: 12,
+    fontWeight: 600,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    borderRadius: 12,
+    backdropFilter: 'blur(4px)',
+    WebkitBackdropFilter: 'blur(4px)',
+    pointerEvents: 'none' as const,
   },
   // Actions row — Instagram-style outlined icons, left-aligned with
   // share pushed to the right via the spacer between buttons.
