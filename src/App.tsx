@@ -7865,9 +7865,9 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap,
         const isCarousel = photos.length > 1;
 
         // Renders a single slot. Photo = <img>; video = <video> with
-        // autoplay-muted-loop. The video element is its own native
-        // tap-to-fullscreen surface; we don't wrap it in the lightbox
-        // button because the controls would conflict.
+        // autoplay-muted. v1.16: instead of looping forever, count plays
+        // via onEnded and stop after 3. Saves battery + cuts the
+        // annoying "video that won't stop" UX when scrolled past.
         const renderSlot = (url: string, type: string, i: number) => {
           if (type === 'video') {
             return (
@@ -7877,10 +7877,27 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap,
                 style={S.postPhoto}
                 muted
                 autoPlay
-                loop
                 playsInline
                 controls
                 preload="metadata"
+                // data attribute tracks how many full plays we've seen.
+                // onEnded fires per playthrough; we manually re-trigger
+                // play() up to 3 times, then stop and leave the video
+                // paused on its last frame.
+                onPlay={(e) => {
+                  const el = e.currentTarget as HTMLVideoElement;
+                  if (!el.dataset.playCount) el.dataset.playCount = '0';
+                }}
+                onEnded={(e) => {
+                  const el = e.currentTarget as HTMLVideoElement;
+                  const n = parseInt(el.dataset.playCount || '0', 10) + 1;
+                  el.dataset.playCount = String(n);
+                  if (n < 3) {
+                    el.currentTime = 0;
+                    el.play().catch(() => { /* silent — autoplay may be blocked */ });
+                  }
+                  // else: leave paused on final frame.
+                }}
               />
             );
           }
@@ -9363,6 +9380,12 @@ function DMThreadView({
   const [draft, setDraft] = useState('');
   const [sending, setSending] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  // v1.16: track the last server-side message ID we've seen so the
+  // polling effect can detect freshly-arrived incoming messages and
+  // play a receive sound. Initial fetch should NOT chime — only deltas
+  // after the first load do.
+  const lastSeenIdRef = useRef<string | null>(null);
+  const firstLoadDoneRef = useRef(false);
 
   // Initial load + polling.
   useEffect(() => {
@@ -9370,6 +9393,23 @@ function DMThreadView({
     const load = async () => {
       const r = await apiFetchThread(conversationId, currentHandle);
       if (cancelled) return;
+      // Detect new incoming messages from the OTHER party since last
+      // poll. We only chime for messages whose ID we hadn't seen before
+      // AND that aren't from us. Skip the very first load so opening
+      // a thread doesn't chime for backlog.
+      if (firstLoadDoneRef.current) {
+        const latest = r.messages.length > 0 ? r.messages[r.messages.length - 1] : null;
+        if (latest
+          && latest.id !== lastSeenIdRef.current
+          && latest.from.toLowerCase() !== currentHandle.toLowerCase()
+          && !latest.id.startsWith('local_')) {
+          playBell();
+        }
+      }
+      if (r.messages.length > 0) {
+        lastSeenIdRef.current = r.messages[r.messages.length - 1].id;
+      }
+      firstLoadDoneRef.current = true;
       setMessages(r.messages);
       if (r.otherHandle) setOtherHandle(r.otherHandle);
       setLoading(false);
@@ -9392,6 +9432,9 @@ function DMThreadView({
     if (!canSend) return;
     const body = draft.trim();
     setSending(true);
+    // v1.16: play send sound immediately on tap, mirrors comment-send
+    // behavior. Optimistic UI = instant audio + instant visual append.
+    playCommentSent();
     // Optimistic append — gives instant feedback. We don't generate a
     // proper ID; server will return the real one on the next poll.
     setMessages((prev) => [...prev, {
