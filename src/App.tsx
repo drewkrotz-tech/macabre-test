@@ -887,6 +887,73 @@ async function apiFetchPost(postId: string): Promise<SocialPost | null> {
   } catch { return null; }
 }
 
+// ---- DM API (v1.15) ----
+// 1:1 direct messages. Server stores conversations + messages in
+// dms.js and exposes /dms/* endpoints.
+type DMConversation = {
+  id: string;
+  otherHandle: string;
+  lastMessageAt: string | null;
+  lastMessageText: string | null;
+  lastMessageBy: string | null;
+  createdAt: string;
+  unread: number;
+};
+type DMMessage = {
+  id: string;
+  from: string;       // sender's handle (lowercased)
+  body: string;
+  createdAt: string;
+};
+async function apiSendDM(args: { handle: string; deviceId: string; toHandle: string; body: string }):
+  Promise<{ ok: boolean; conversationId?: string; messageId?: string; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/dms/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    const data = await res.json();
+    if (!res.ok) return { ok: false, reason: data?.error || `HTTP ${res.status}` };
+    return { ok: true, conversationId: data?.conversationId, messageId: data?.messageId };
+  } catch (e: any) {
+    return { ok: false, reason: e?.message || 'network error' };
+  }
+}
+async function apiFetchInbox(handle: string): Promise<DMConversation[]> {
+  try {
+    const res = await fetch(`${API_BASE}/dms/inbox/${encodeURIComponent(handle)}`);
+    const data = await res.json();
+    return Array.isArray(data?.conversations) ? data.conversations : [];
+  } catch { return []; }
+}
+async function apiFetchThread(convId: string, handle: string): Promise<{ otherHandle: string; messages: DMMessage[] }> {
+  try {
+    const res = await fetch(`${API_BASE}/dms/thread/${encodeURIComponent(convId)}?handle=${encodeURIComponent(handle)}`);
+    const data = await res.json();
+    return {
+      otherHandle: data?.otherHandle || '',
+      messages: Array.isArray(data?.messages) ? data.messages : [],
+    };
+  } catch { return { otherHandle: '', messages: [] }; }
+}
+async function apiUnreadDMs(handle: string): Promise<number> {
+  try {
+    const res = await fetch(`${API_BASE}/dms/unread/${encodeURIComponent(handle)}`);
+    const data = await res.json();
+    return typeof data?.count === 'number' ? data.count : 0;
+  } catch { return 0; }
+}
+// Deterministic conv-id between two handles (must match server's
+// conversationIdFor logic exactly so the client can open a thread
+// before the conversation officially "exists").
+function dmConversationId(a: string, b: string): string {
+  const al = a.toLowerCase();
+  const bl = b.toLowerCase();
+  const [lo, hi] = al < bl ? [al, bl] : [bl, al];
+  return `conv_${lo}_${hi}`;
+}
+
 async function apiToggleLike(args: { postId: string; handle: string; deviceId: string }): Promise<{ ok: boolean; liked?: boolean; count?: number; reason?: string }> {
   try {
     const res = await fetch(`${API_BASE}/posts/like/${encodeURIComponent(args.postId)}`, {
@@ -2338,6 +2405,8 @@ type View =
   | { name: 'social' }
   | { name: 'userProfile'; handle: string }
   | { name: 'hashtag'; tag: string }
+  | { name: 'dmInbox' }
+  | { name: 'dmThread'; conversationId: string; otherHandle: string }
   | { name: 'post'; postId: string; postList?: string[]; preloadedPosts?: SocialPost[] }
   | { name: 'notifications' }
   | { name: 'settings' };
@@ -3024,6 +3093,7 @@ export default function App() {
             onHandleClaimed={setHandle}
             onSelectSettings={() => setView({ name: 'settings' })}
             onSelectNotifications={() => setView({ name: 'notifications' })}
+            onSelectInbox={() => setView({ name: 'dmInbox' })}
           />
         ),
       };
@@ -3040,11 +3110,8 @@ export default function App() {
             onSelectBadges={(h) => setView({ name: 'badges', handle: h })}
             onSelectPost={(postId, postList, preloadedPosts) => setView({ name: 'post', postId, postList, preloadedPosts })}
             onSelectHandle={(h) => setView({ name: 'userProfile', handle: h })}
+            onSelectDMThread={(conversationId, otherHandle) => setView({ name: 'dmThread', conversationId, otherHandle })}
             onSelectExposureTab={(tab) => {
-              // Tapping a bottom-bar tab from inside a standalone profile
-              // jumps to eXposure on that sub-tab. Same pattern as
-              // PostDetailView — write the memory first so SocialView
-              // mounts on the right tab.
               _exposureSubTabMemory = tab;
               setView({ name: 'social' });
             }}
@@ -3059,6 +3126,43 @@ export default function App() {
           <HashtagView
             tag={v.tag}
             onSelectPost={(postId, postList, preloadedPosts) => setView({ name: 'post', postId, postList, preloadedPosts })}
+            onBack={goBack}
+          />
+        ),
+      };
+    } else if (v.name === 'dmInbox') {
+      // Inbox requires a claimed handle — anything else returns home.
+      if (!handle || !deviceId) {
+        // Defer the redirect to a useEffect since we're inside render.
+        // For now, render an empty placeholder; AppShell will re-render
+        // when handle becomes available.
+        return { key: 'dmInbox', element: <div /> };
+      }
+      return {
+        key: 'dmInbox',
+        element: (
+          <DMInboxView
+            currentHandle={handle}
+            deviceId={deviceId}
+            onSelectThread={(conversationId, otherHandle) =>
+              setView({ name: 'dmThread', conversationId, otherHandle })
+            }
+            onBack={goBack}
+          />
+        ),
+      };
+    } else if (v.name === 'dmThread') {
+      if (!handle || !deviceId) {
+        return { key: `dmThread:${v.conversationId}`, element: <div /> };
+      }
+      return {
+        key: `dmThread:${v.conversationId}`,
+        element: (
+          <DMThreadView
+            conversationId={v.conversationId}
+            otherHandle={v.otherHandle}
+            currentHandle={handle}
+            deviceId={deviceId}
             onBack={goBack}
           />
         ),
@@ -5074,7 +5178,7 @@ function DreadFeedClaimScreen({ deviceId, onClaimed }: {
 }
 
 
-function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, onBack, onSelectHandle, onSelectHashtag, onSelectPost, onHandleClaimed, onSelectSettings, onSelectNotifications }: {
+function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, onBack, onSelectHandle, onSelectHashtag, onSelectPost, onHandleClaimed, onSelectSettings, onSelectNotifications, onSelectInbox }: {
   handle: string | null;
   deviceId: string | null;
   sites: SinisterSite[];
@@ -5097,6 +5201,8 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
   // Routes to the NotificationsView when the user taps the bell in
   // the DreadFeed header.
   onSelectNotifications: () => void;
+  // v1.15: opens the DM inbox view.
+  onSelectInbox: () => void;
 }) {
   // Sub-tab inside eXposure. The static black bottom bar switches
   // between four sub-screens: 'feed' (the post feed, eXposure home),
@@ -5142,6 +5248,24 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
     };
     refresh();
     const id = window.setInterval(refresh, 60000);
+    return () => { cancelled = true; window.clearInterval(id); };
+  }, [handle]);
+
+  // v1.15: same pattern for DM unread count. Polls every 30s so the
+  // airplane badge updates without the user manually opening the inbox.
+  const [dmUnreadCount, setDmUnreadCount] = useState(0);
+  useEffect(() => {
+    if (!handle) {
+      setDmUnreadCount(0);
+      return;
+    }
+    let cancelled = false;
+    const refresh = async () => {
+      const n = await apiUnreadDMs(handle);
+      if (!cancelled) setDmUnreadCount(n);
+    };
+    refresh();
+    const id = window.setInterval(refresh, 30000);
     return () => { cancelled = true; window.clearInterval(id); };
   }, [handle]);
 
@@ -5391,7 +5515,9 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
           Pull-to-refresh and per-sub-tab headers render BELOW this. */}
       <ExposureBrandHeader
         unreadCount={unreadCount}
+        dmUnreadCount={dmUnreadCount}
         onTapBell={onSelectNotifications}
+        onTapInbox={handle ? onSelectInbox : undefined}
       />
 
       {/* ====== FEED sub-tab ====== */}
@@ -8899,21 +9025,14 @@ function formatTimeAgo(iso: string): string {
 // app's identity visible no matter where you've drilled in.
 // DreadFeed brand header with optional notification bell on the right.
 // Bell shows a red dot when unreadCount > 0. Tap routes to NotificationsView.
-function ExposureBrandHeader({ unreadCount, onTapBell }: {
+function ExposureBrandHeader({ unreadCount, dmUnreadCount, onTapBell, onTapInbox }: {
   unreadCount?: number;
+  dmUnreadCount?: number;
   onTapBell?: () => void;
+  onTapInbox?: () => void;
 } = {}) {
   return (
     <div style={S.exposureBrandHeader}>
-      {/* Title is rendered in an absolutely-positioned, full-width row
-          so it always sits at the true horizontal center of the header
-          regardless of the bell button on the right. Bell stays absolute
-          on the right and overlaps the title's transparent right side
-          without shifting the title's visual center.
-          Same VHS-glitch effect as the home page "Dread Directory" —
-          red and cyan channel ghosts animate over the white text in
-          rare bursts. Class + data-text are both required (the CSS
-          pseudo-elements read data-text to render the ghost layers). */}
       <div style={S.exposureBrandTitleRow}>
         <div
           style={S.exposureBrandTitle}
@@ -8923,7 +9042,27 @@ function ExposureBrandHeader({ unreadCount, onTapBell }: {
           DreadFeed
         </div>
       </div>
-      {/* Bell sits in the top-right corner of the header. */}
+      {/* Right side icons: bell (notifications) + airplane (DMs). The
+          airplane (v1.15) sits to the left of the bell. Both render only
+          if their on-tap handler is provided. */}
+      {onTapInbox && (
+        <button
+          onClick={onTapInbox}
+          style={S.exposureInboxBtn}
+          aria-label={dmUnreadCount && dmUnreadCount > 0 ? `Messages (${dmUnreadCount} unread)` : 'Messages'}
+        >
+          {/* IG-style paper-airplane glyph */}
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+            <line x1="22" y1="2" x2="11" y2="13" />
+            <polygon points="22 2 15 22 11 13 2 9 22 2" />
+          </svg>
+          {!!dmUnreadCount && dmUnreadCount > 0 && (
+            <span style={S.exposureBellBadge}>
+              {dmUnreadCount > 99 ? '99+' : String(dmUnreadCount)}
+            </span>
+          )}
+        </button>
+      )}
       {onTapBell && (
         <button
           onClick={onTapBell}
@@ -9118,6 +9257,230 @@ function HashtagView({
     </div>
   );
 }
+
+// ---- DMInboxView (v1.15) ----
+// IG-style inbox screen. Lists every conversation the current user has,
+// newest activity first. Tap a row → opens DMThreadView. Polls inbox
+// every 8 seconds while open so new messages show up without manual
+// refresh. (Polling, not WebSockets — keeps the server stateless.)
+function DMInboxView({
+  currentHandle,
+  deviceId,
+  onSelectThread,
+  onBack,
+}: {
+  currentHandle: string;
+  deviceId: string;
+  onSelectThread: (convId: string, otherHandle: string) => void;
+  onBack: () => void;
+}) {
+  const [conversations, setConversations] = useState<DMConversation[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      const list = await apiFetchInbox(currentHandle);
+      if (cancelled) return;
+      setConversations(list);
+      setLoading(false);
+    };
+    load();
+    const id = window.setInterval(load, 8000);
+    return () => { cancelled = true; window.clearInterval(id); };
+  }, [currentHandle]);
+
+  return (
+    <div style={S.hashtagViewWrap}>
+      <div style={S.hashtagHeader}>
+        <button type="button" onClick={onBack} style={S.hashtagBackBtn} aria-label="Back">←</button>
+        <div style={S.hashtagHeaderText}>
+          <div style={S.hashtagHeaderTitle}>Messages</div>
+          <div style={S.hashtagHeaderSub}>
+            {loading ? 'Loading…' : `${conversations.length} ${conversations.length === 1 ? 'conversation' : 'conversations'}`}
+          </div>
+        </div>
+      </div>
+
+      {!loading && conversations.length === 0 ? (
+        <div style={S.hashtagEmpty}>
+          No messages yet. Go to someone's profile and tap Message to start a conversation.
+        </div>
+      ) : (
+        <div style={S.dmInboxList}>
+          {conversations.map((c) => (
+            <button
+              key={c.id}
+              type="button"
+              onClick={() => onSelectThread(c.id, c.otherHandle)}
+              style={S.dmInboxRow}
+            >
+              <div style={S.dmInboxAvatar}>
+                {c.otherHandle.slice(0, 1).toUpperCase()}
+              </div>
+              <div style={S.dmInboxBody}>
+                <div style={S.dmInboxHandle}>{c.otherHandle}</div>
+                <div style={{
+                  ...S.dmInboxPreview,
+                  ...(c.unread > 0 ? S.dmInboxPreviewUnread : null),
+                }}>
+                  {c.lastMessageBy && c.lastMessageBy.toLowerCase() === currentHandle.toLowerCase()
+                    ? `You: ${c.lastMessageText || ''}`
+                    : (c.lastMessageText || 'No messages yet')}
+                </div>
+              </div>
+              {c.unread > 0 && (
+                <div style={S.dmInboxBadge}>{c.unread}</div>
+              )}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---- DMThreadView (v1.15) ----
+// 1:1 conversation view — message bubbles + composer at the bottom.
+// Polls every 4 seconds while open to pick up new incoming messages.
+// Sending appends locally (optimistic) and re-fetches on confirm.
+function DMThreadView({
+  conversationId,
+  otherHandle: initialOtherHandle,
+  currentHandle,
+  deviceId,
+  onBack,
+}: {
+  conversationId: string;
+  otherHandle: string;
+  currentHandle: string;
+  deviceId: string;
+  onBack: () => void;
+}) {
+  const [messages, setMessages] = useState<DMMessage[]>([]);
+  const [otherHandle, setOtherHandle] = useState(initialOtherHandle);
+  const [loading, setLoading] = useState(true);
+  const [draft, setDraft] = useState('');
+  const [sending, setSending] = useState(false);
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  // Initial load + polling.
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      const r = await apiFetchThread(conversationId, currentHandle);
+      if (cancelled) return;
+      setMessages(r.messages);
+      if (r.otherHandle) setOtherHandle(r.otherHandle);
+      setLoading(false);
+    };
+    load();
+    const id = window.setInterval(load, 4000);
+    return () => { cancelled = true; window.clearInterval(id); };
+  }, [conversationId, currentHandle]);
+
+  // Auto-scroll to bottom when messages change.
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [messages.length]);
+
+  const canSend = draft.trim().length > 0 && draft.trim().length <= 2000 && !sending;
+
+  const onSend = async () => {
+    if (!canSend) return;
+    const body = draft.trim();
+    setSending(true);
+    // Optimistic append — gives instant feedback. We don't generate a
+    // proper ID; server will return the real one on the next poll.
+    setMessages((prev) => [...prev, {
+      id: `local_${Date.now()}`,
+      from: currentHandle.toLowerCase(),
+      body,
+      createdAt: new Date().toISOString(),
+    }]);
+    setDraft('');
+    const result = await apiSendDM({ handle: currentHandle, deviceId, toHandle: otherHandle, body });
+    setSending(false);
+    if (!result.ok) {
+      // Roll back the optimistic append on failure.
+      setMessages((prev) => prev.filter((m) => !m.id.startsWith('local_')));
+      showToast(`Send failed: ${result.reason || 'unknown error'}`, 'error');
+    }
+    // Otherwise the next 4s poll picks up the real message and replaces
+    // the local one (it'll dedupe naturally because server messages have
+    // real IDs).
+  };
+
+  return (
+    <div style={S.dmThreadWrap}>
+      <div style={S.hashtagHeader}>
+        <button type="button" onClick={onBack} style={S.hashtagBackBtn} aria-label="Back">←</button>
+        <div style={S.hashtagHeaderText}>
+          <div style={S.hashtagHeaderTitle}>{otherHandle}</div>
+        </div>
+      </div>
+
+      <div ref={scrollRef} style={S.dmThreadScroll}>
+        {loading ? (
+          <div style={S.hashtagEmpty}>Loading…</div>
+        ) : messages.length === 0 ? (
+          <div style={S.hashtagEmpty}>
+            No messages yet. Say hi!
+          </div>
+        ) : (
+          messages.map((m) => {
+            const isOwn = m.from.toLowerCase() === currentHandle.toLowerCase();
+            return (
+              <div
+                key={m.id}
+                style={{
+                  ...S.dmBubbleRow,
+                  justifyContent: isOwn ? 'flex-end' : 'flex-start',
+                }}
+              >
+                <div style={{
+                  ...S.dmBubble,
+                  ...(isOwn ? S.dmBubbleOwn : S.dmBubbleOther),
+                }}>
+                  {m.body}
+                </div>
+              </div>
+            );
+          })
+        )}
+      </div>
+
+      <div style={S.dmComposer}>
+        <textarea
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          placeholder="Message..."
+          maxLength={2000}
+          rows={1}
+          style={S.dmComposerInput}
+          disabled={sending}
+          // Stop touch propagation so horizontal scroll/drag doesn't
+          // trigger swipe-back while the user is in the textarea.
+          onTouchStart={(e) => e.stopPropagation()}
+        />
+        <button
+          type="button"
+          onClick={onSend}
+          disabled={!canSend}
+          style={{
+            ...S.dmComposerSend,
+            opacity: canSend ? 1 : 0.4,
+          }}
+        >
+          Send
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // ---- UserProfileView ----
 // Profile screen for a single handle. Shows:
 //   1. Header — large avatar on left, Posts/Visits counts on right
@@ -9130,7 +9493,7 @@ function HashtagView({
 // Data sources:
 //   - GET /badges/:handle for visit count
 //   - GET /posts/handle/:handle for the grid
-function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSelectSite, onSelectBadges, onSelectPost, onSelectHandle, onSelectExposureTab, onSelectSettings, onBack, embedded }: {
+function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSelectSite, onSelectBadges, onSelectPost, onSelectHandle, onSelectDMThread, onSelectExposureTab, onSelectSettings, onBack, embedded }: {
   profileHandle: string;
   currentHandle: string | null;
   deviceId: string | null;
@@ -9142,6 +9505,11 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
   // to that handle's profile. Required so the sheet doesn't just close
   // with no nav.
   onSelectHandle: (handle: string) => void;
+  // v1.15: open a DM thread with a specific handle. Called by the
+  // Message button on other users' profiles. Optional because the
+  // embedded profile in your own DreadFeed Profile tab doesn't surface
+  // a Message button (you can't DM yourself).
+  onSelectDMThread?: (conversationId: string, otherHandle: string) => void;
   // Optional — only passed when this view is dispatched as a standalone
   // route (e.g. tapped @handle from a feed card). Embedded inside the
   // DreadFeed profile tab, the parent SocialView handles tab nav itself.
@@ -9405,6 +9773,22 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
             style={followStatus.followedByYou ? S.profileFollowingBtn : S.profileFollowBtn}
           >
             {followStatus.followedByYou ? 'Following' : 'Follow'}
+          </button>
+        )}
+        {/* Message button (v1.15) — only on other people's profiles when
+            you have a handle and the viewer hasn't blocked them. Opens a
+            DM thread with this user; if no conversation exists yet, the
+            thread view shows an empty state until the first message is
+            sent. */}
+        {!isMe && currentHandle && deviceId && onSelectDMThread && !isBlocked && (
+          <button
+            onClick={() => {
+              const convId = dmConversationId(currentHandle, profileHandle);
+              onSelectDMThread(convId, profileHandle);
+            }}
+            style={{ ...S.profileActionBtn, flex: 1 }}
+          >
+            Message
           </button>
         )}
         <button
@@ -14697,6 +15081,22 @@ const S: Record<string, React.CSSProperties> = {
     alignItems: 'center',
     justifyContent: 'center',
   },
+  // Airplane (DMs) sits to the LEFT of the bell. Same vertical position,
+  // shifted left by enough to clear the bell + a small gap.
+  exposureInboxBtn: {
+    position: 'absolute' as const,
+    right: 52,
+    top: 'calc(env(safe-area-inset-top, 44px) + 14px)' as any,
+    width: 36,
+    height: 36,
+    background: 'transparent',
+    border: 'none',
+    padding: 0,
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   // Red unread-count badge in the bell's top-right corner.
   exposureBellBadge: {
     position: 'absolute' as const,
@@ -15994,6 +16394,155 @@ const S: Record<string, React.CSSProperties> = {
     textAlign: 'center' as const,
     color: '#888',
     fontSize: 14,
+  },
+  // ---- DM Inbox / Thread (v1.15) ----
+  // Inbox list. Vertical stack of conversation rows under the safe-area
+  // header (same chrome as HashtagView).
+  dmInboxList: {
+    display: 'flex',
+    flexDirection: 'column' as const,
+  },
+  dmInboxRow: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 12,
+    padding: '12px 14px',
+    background: 'transparent',
+    border: 'none',
+    borderBottom: '1px solid rgba(255,255,255,0.06)',
+    color: '#F0EBE0',
+    cursor: 'pointer',
+    width: '100%',
+    textAlign: 'left' as const,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  // Round avatar bubble. No image fetched yet — falls back to first
+  // letter of the other handle on a colored background.
+  dmInboxAvatar: {
+    width: 44,
+    height: 44,
+    borderRadius: '50%',
+    backgroundColor: '#FF3B5C',
+    color: '#FFFFFF',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    fontWeight: 700,
+    fontSize: 18,
+    flexShrink: 0,
+  },
+  dmInboxBody: {
+    flex: 1,
+    minWidth: 0,
+    display: 'flex',
+    flexDirection: 'column' as const,
+    gap: 2,
+  },
+  dmInboxHandle: {
+    fontSize: 15,
+    fontWeight: 600,
+    color: '#F0EBE0',
+  },
+  dmInboxPreview: {
+    fontSize: 13,
+    color: '#888',
+    overflow: 'hidden' as const,
+    textOverflow: 'ellipsis' as const,
+    whiteSpace: 'nowrap' as const,
+  },
+  // When there's unread, the preview goes brighter + heavier — same
+  // visual cue IG uses.
+  dmInboxPreviewUnread: {
+    color: '#F0EBE0',
+    fontWeight: 600,
+  },
+  dmInboxBadge: {
+    minWidth: 22,
+    height: 22,
+    borderRadius: 11,
+    padding: '0 7px',
+    backgroundColor: '#FF3B5C',
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: 700,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexShrink: 0,
+  },
+  // Thread view — full-height column. Scroll area in middle, composer
+  // pinned to bottom with safe-area bottom inset.
+  dmThreadWrap: {
+    backgroundColor: '#0a0a0a',
+    color: '#F0EBE0',
+    height: '100vh',
+    display: 'flex',
+    flexDirection: 'column' as const,
+    paddingTop: 'env(safe-area-inset-top, 50px)' as any,
+  },
+  dmThreadScroll: {
+    flex: 1,
+    overflowY: 'auto' as const,
+    padding: '8px 12px 16px',
+  },
+  dmBubbleRow: {
+    display: 'flex',
+    width: '100%',
+    margin: '4px 0',
+  },
+  // Bubble base styling — own messages are pink/red, other's are grey.
+  dmBubble: {
+    maxWidth: '78%',
+    padding: '8px 14px',
+    borderRadius: 18,
+    fontSize: 15,
+    lineHeight: 1.35,
+    wordBreak: 'break-word' as const,
+    whiteSpace: 'pre-wrap' as const,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  dmBubbleOwn: {
+    backgroundColor: '#FF3B5C',
+    color: '#FFFFFF',
+  },
+  dmBubbleOther: {
+    backgroundColor: '#2a2a2a',
+    color: '#F0EBE0',
+  },
+  // Composer pinned to the bottom — textarea + Send button.
+  dmComposer: {
+    display: 'flex',
+    gap: 8,
+    padding: '10px 12px',
+    paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 10px)' as any,
+    borderTop: '1px solid rgba(255,255,255,0.08)',
+    backgroundColor: '#0a0a0a',
+    alignItems: 'flex-end',
+  },
+  dmComposerInput: {
+    flex: 1,
+    minHeight: 36,
+    maxHeight: 120,
+    padding: '8px 12px',
+    borderRadius: 18,
+    backgroundColor: '#1a1a1a',
+    border: '1px solid rgba(255,255,255,0.12)',
+    color: '#F0EBE0',
+    fontSize: 15,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    resize: 'none' as const,
+    outline: 'none',
+  },
+  dmComposerSend: {
+    padding: '8px 16px',
+    borderRadius: 18,
+    backgroundColor: '#FF3B5C',
+    color: '#FFFFFF',
+    border: 'none',
+    fontSize: 14,
+    fontWeight: 700,
+    cursor: 'pointer',
+    flexShrink: 0,
   },
   // ---- Post detail (IG-style swipe-through viewer) ----
   // Small chip just below the brand header showing "N / total" so the
