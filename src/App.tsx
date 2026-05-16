@@ -583,15 +583,17 @@ async function apiMarkNotificationsRead(args: { handle: string; deviceId: string
   } catch { return { ok: false }; }
 }
 
-// ---------- Visit-claim API ----------
-// POST /visits — server checks (handle, deviceId) ownership, verifies the
-// reported lat/lng is within 100m of the site's coords, dedupes (one visit
-// per handle per site), and records to visits.json. Returns:
-//   { ok: true }                       on a fresh claim
-//   { ok: true, alreadyClaimed: true } if the user previously claimed this site
-//   { ok: false, code, ... }           otherwise (too_far, unknown_site, etc.)
+// ---------- Guestbook / visit-claim API ----------
+// POST /visits — "signing the guestbook" at a site. Server checks
+// (handle, deviceId) ownership, verifies the reported lat/lng is within
+// 100m of the site's coords, dedupes (one signature per handle per site),
+// and records to visits.json. Optionally accepts a short inscription
+// (up to 30 chars). Returns:
+//   { ok: true, signingRank, isKeeper, inscription }     on a fresh signing
+//   { ok: true, alreadyClaimed: true, ... }              if already signed
+//   { ok: false, code, ... }                             on failure
 type VisitClaimResult =
-  | { ok: true; alreadyClaimed?: boolean }
+  | { ok: true; alreadyClaimed?: boolean; signingRank?: number | null; isKeeper?: boolean; inscription?: string }
   | { ok: false; code: string; distance?: number; message?: string };
 
 async function apiClaimVisit(args: {
@@ -600,6 +602,7 @@ async function apiClaimVisit(args: {
   siteId: string;
   lat: number;
   lng: number;
+  inscription?: string;
 }): Promise<VisitClaimResult> {
   try {
     const res = await fetch(`${API_BASE}/visits`, {
@@ -610,15 +613,45 @@ async function apiClaimVisit(args: {
     const data = await res.json().catch(() => ({}));
     // 409 == already claimed; the server treats this as idempotent and so do we.
     if (res.status === 409 || data?.code === 'already_claimed') {
-      return { ok: true, alreadyClaimed: true };
+      return {
+        ok: true,
+        alreadyClaimed: true,
+        signingRank: data?.signingRank ?? null,
+        isKeeper: !!data?.isKeeper,
+        inscription: data?.inscription || '',
+      };
     }
     if (!res.ok) {
       return { ok: false, code: data?.code || `http_${res.status}`, distance: data?.distance, message: data?.error };
     }
-    return { ok: true };
+    return {
+      ok: true,
+      alreadyClaimed: !!data?.alreadyClaimed,
+      signingRank: data?.signingRank ?? null,
+      isKeeper: !!data?.isKeeper,
+      inscription: data?.inscription || '',
+    };
   } catch (err: any) {
     return { ok: false, code: 'network', message: err?.message || 'Network error' };
   }
+}
+
+// GET /guestbook/:siteId — read the guestbook for a site. Returns an
+// ordered list of signatures (rank 1 = Keeper, pinned at top). Public —
+// anyone in the app can read it.
+type GuestbookSignature = {
+  handle: string;
+  inscription: string;
+  signedAt: string;
+  signingRank: number | null;
+};
+async function apiGetGuestbook(siteId: string): Promise<GuestbookSignature[]> {
+  try {
+    const res = await fetch(`${API_BASE}/guestbook/${encodeURIComponent(siteId)}`);
+    if (!res.ok) return [];
+    const data = await res.json();
+    return Array.isArray(data?.signatures) ? data.signatures : [];
+  } catch { return []; }
 }
 
 // Returns the set of siteIds the handle has visited. Used at app startup
@@ -7397,12 +7430,12 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
               </svg>
               <div style={S.igPickPromptLabel}>Tap to choose a photo or video</div>
               <div style={S.igPickPromptHint}>From your camera or library</div>
-              {/* Limits notice — keeps users from wondering why a long
-                  or huge video silently fails to upload. Phrased as
-                  "videos should be ~10s, max 40MB" since the server
-                  enforces size strictly but is loose on duration. */}
+              {/* Limits notice — keeps users from wondering why a huge
+                  video silently fails to upload. Only the 40MB file
+                  size is actually enforced (server + client); duration
+                  is not capped, so don't mention it. */}
               <div style={S.igPickPromptHintSmall}>
-                Videos: up to ~10 seconds, max 40MB
+                Videos: max 40MB
               </div>
             </button>
           )}
@@ -13805,13 +13838,38 @@ function DetailView({ site, currentLocation, handle, deviceId, alreadyVisited, o
   const [claiming, setClaiming] = useState(false);
   const [claimError, setClaimError] = useState<string | null>(null);
 
+  // ---- Guestbook state ----
+  // Guestbook is loaded once on mount and refetched whenever a new signing
+  // succeeds. List is ordered with rank 1 (the Keeper) first.
+  const [guestbook, setGuestbook] = useState<GuestbookSignature[]>([]);
+  const [guestbookLoaded, setGuestbookLoaded] = useState(false);
+  // Modal state: when the user taps "Sign the Guestbook" we open a small
+  // composer for an optional 30-char inscription. The Sign button on the
+  // modal triggers the actual API call.
+  const [signModalOpen, setSignModalOpen] = useState(false);
+  const [inscriptionDraft, setInscriptionDraft] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    apiGetGuestbook(site.id).then((sigs) => {
+      if (!cancelled) {
+        setGuestbook(sigs);
+        setGuestbookLoaded(true);
+      }
+    });
+    return () => { cancelled = true; };
+  }, [site.id]);
+
   // Sync local visited flag if parent's set updates (e.g. new visits loaded
   // from server while this view is mounted).
   useEffect(() => {
     if (alreadyVisited) setVisited(true);
   }, [alreadyVisited]);
 
-  const handleClaimVisit = async () => {
+  // Open the inscription modal. Triggered by the "Sign the Guestbook"
+  // button. Pre-checks GPS/handle so the user finds out about problems
+  // before composing.
+  const openSignModal = () => {
     if (!handle) {
       setClaimError('Claim a handle first (try Submit a Location)');
       return;
@@ -13824,6 +13882,18 @@ function DetailView({ site, currentLocation, handle, deviceId, alreadyVisited, o
       setClaimError('No GPS fix yet — try again in a moment');
       return;
     }
+    setClaimError(null);
+    setInscriptionDraft('');
+    setSignModalOpen(true);
+  };
+
+  // Actually sign the guestbook. Called from inside the modal once the
+  // user confirms. Uses inscriptionDraft (possibly empty string).
+  const handleClaimVisit = async () => {
+    if (!handle || !deviceId || !currentLocation) {
+      setSignModalOpen(false);
+      return;
+    }
     setClaiming(true);
     setClaimError(null);
     playBell();
@@ -13833,18 +13903,24 @@ function DetailView({ site, currentLocation, handle, deviceId, alreadyVisited, o
       siteId: site.id,
       lat: currentLocation.lat,
       lng: currentLocation.lng,
+      inscription: inscriptionDraft.trim(),
     });
     setClaiming(false);
+    setSignModalOpen(false);
     if (result.ok) {
       setVisited(true);
       onVisited(site.id);
-      // Soft confirmation toast — reinforces the badge system by hinting
-      // at progression. Idempotent claims (already visited) get a gentler
-      // message that doesn't pretend they earned anything new.
+      // Refresh the guestbook list so the new signature shows up.
+      apiGetGuestbook(site.id).then((sigs) => setGuestbook(sigs));
       if (result.alreadyClaimed) {
-        showToast(`Already visited ${site.title}`, 'default');
+        showToast(`Already signed ${site.title}`, 'default');
+      } else if (result.isKeeper) {
+        // Keeper status — first signer ever at this site.
+        showToast(`🗝️ You are the Keeper of ${site.title}`, 'success');
+      } else if (typeof result.signingRank === 'number') {
+        showToast(`✓ Signed the guestbook at ${site.title} (#${result.signingRank})`, 'success');
       } else {
-        showToast(`✓ Visited ${site.title} — +1 toward your next badge`, 'success');
+        showToast(`✓ Signed the guestbook at ${site.title}`, 'success');
       }
       return;
     }
@@ -13857,7 +13933,7 @@ function DetailView({ site, currentLocation, handle, deviceId, alreadyVisited, o
     } else if (fail.code === 'network') {
       setClaimError('Network error — check your connection and try again.');
     } else {
-      setClaimError(fail.message || 'Could not claim visit');
+      setClaimError(fail.message || 'Could not sign the guestbook');
     }
   };
   const handleDirections = () => {
@@ -13966,11 +14042,11 @@ function DetailView({ site, currentLocation, handle, deviceId, alreadyVisited, o
                 marginBottom: 12,
               }}
             >
-              ✓ You've Been Here
+              ✓ You've Signed the Guestbook
             </div>
           ) : inRange ? (
             <button
-              onClick={handleClaimVisit}
+              onClick={openSignModal}
               disabled={claiming}
               style={{
                 ...S.directionsButton,
@@ -13983,7 +14059,7 @@ function DetailView({ site, currentLocation, handle, deviceId, alreadyVisited, o
                 opacity: claiming ? 0.7 : 1,
               }}
             >
-              {claiming ? 'Claiming…' : "I'm Here — Claim Visit"}
+              {claiming ? 'Signing…' : "I'm Here — Sign the Guestbook"}
             </button>
           ) : (
             <div
@@ -13998,7 +14074,7 @@ function DetailView({ site, currentLocation, handle, deviceId, alreadyVisited, o
                 fontSize: 18,
               }}
             >
-              {distM != null ? 'Get within 100m to claim location' : 'Locating…'}
+              {distM != null ? 'Get within 100m to sign the guestbook' : 'Locating…'}
             </div>
           )
         )}
@@ -14007,6 +14083,104 @@ function DetailView({ site, currentLocation, handle, deviceId, alreadyVisited, o
             {claimError}
           </div>
         )}
+
+        {/* ---- Guestbook section ----
+            Displays signatures left at this site, with the Keeper (rank 1)
+            pinned at the top. Visible to everyone viewing DetailView, even
+            if they haven't signed it themselves — the point is for sites
+            to feel inhabited and visited. Empty sites show the "be the
+            first" prompt to invite the first visitor to claim the site. */}
+        <div style={{ marginTop: 24, marginBottom: 12 }}>
+          <div style={{
+            fontSize: 14,
+            fontFamily: 'system-ui, -apple-system, sans-serif',
+            color: '#888',
+            letterSpacing: 2,
+            textTransform: 'uppercase',
+            textAlign: 'center',
+            marginBottom: 10,
+          }}>
+            ⸻ Guestbook ⸻
+          </div>
+          {!guestbookLoaded ? (
+            <div style={{ color: '#666', fontSize: 13, textAlign: 'center', padding: '10px 0' }}>
+              Reading the guestbook…
+            </div>
+          ) : guestbook.length === 0 ? (
+            <div style={{
+              border: '1px dashed #2a2a2a',
+              borderRadius: 8,
+              padding: '14px 16px',
+              textAlign: 'center',
+              color: '#888',
+              fontSize: 13,
+              fontStyle: 'italic',
+              fontFamily: 'Georgia, serif',
+            }}>
+              This site is unclaimed.<br />Be the first to sign.
+            </div>
+          ) : (
+            <div style={{
+              border: '1px solid #1f1f1f',
+              borderRadius: 8,
+              padding: '8px 0',
+              backgroundColor: '#0a0a0a',
+              maxHeight: 280,
+              overflowY: 'auto',
+            }}>
+              {guestbook.map((sig, idx) => {
+                const isKeeper = sig.signingRank === 1;
+                const dateStr = sig.signedAt ? new Date(sig.signedAt).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }) : '';
+                return (
+                  <div
+                    key={`${sig.handle}-${idx}`}
+                    style={{
+                      padding: '8px 14px',
+                      borderBottom: idx < guestbook.length - 1 ? '1px solid #1a1a1a' : 'none',
+                      display: 'flex',
+                      alignItems: 'baseline',
+                      gap: 8,
+                      backgroundColor: isKeeper ? '#15100a' : 'transparent',
+                    }}
+                  >
+                    <div style={{ fontSize: 14, flexShrink: 0, width: 22, textAlign: 'center' }}>
+                      {isKeeper ? '🗝️' : <span style={{ color: '#555', fontSize: 11 }}>#{sig.signingRank ?? '?'}</span>}
+                    </div>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{
+                        fontFamily: 'Georgia, serif',
+                        fontSize: 14,
+                        color: isKeeper ? '#e0c98a' : '#c0c0c0',
+                        fontWeight: isKeeper ? 600 : 400,
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                      }}>
+                        {sig.handle}
+                        {isKeeper && <span style={{ fontSize: 10, marginLeft: 8, color: '#a89060', letterSpacing: 1, textTransform: 'uppercase' }}>Keeper</span>}
+                      </div>
+                      {sig.inscription && (
+                        <div style={{
+                          fontFamily: 'Georgia, serif',
+                          fontSize: 12,
+                          fontStyle: 'italic',
+                          color: '#888',
+                          marginTop: 2,
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap',
+                        }}>
+                          “{sig.inscription}”
+                        </div>
+                      )}
+                    </div>
+                    <div style={{ fontSize: 10, color: '#555', flexShrink: 0 }}>{dateStr}</div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
 
         {/* Add Photo (Social post) button.
             Shown when:
@@ -14049,6 +14223,137 @@ function DetailView({ site, currentLocation, handle, deviceId, alreadyVisited, o
         </button>
         <div style={S.imageCredit}>Photo: {site.imageCredit}</div>
       </div>
+
+      {/* ---- Sign the Guestbook modal ----
+          Overlay that lets the user compose an optional 30-char inscription
+          before signing. Tap Skip to sign without one. Tap Sign to commit. */}
+      {signModalOpen && (
+        <div
+          onClick={() => { if (!claiming) setSignModalOpen(false); }}
+          style={{
+            position: 'fixed',
+            inset: 0,
+            backgroundColor: 'rgba(0, 0, 0, 0.82)',
+            zIndex: 9999,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: 20,
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              backgroundColor: '#0c0c0c',
+              border: `1px solid ${SUBMIT_RED}55`,
+              borderRadius: 14,
+              padding: '22px 22px 18px',
+              maxWidth: 360,
+              width: '100%',
+              boxShadow: `0 0 40px ${SUBMIT_RED}33`,
+              fontFamily: 'system-ui, -apple-system, sans-serif',
+            }}
+          >
+            <div style={{
+              fontFamily: 'Georgia, serif',
+              fontSize: 22,
+              color: WHITE,
+              textAlign: 'center',
+              marginBottom: 6,
+              letterSpacing: 1,
+            }}>
+              Sign the Guestbook
+            </div>
+            <div style={{
+              fontSize: 13,
+              color: '#888',
+              textAlign: 'center',
+              marginBottom: 18,
+              fontStyle: 'italic',
+              fontFamily: 'Georgia, serif',
+            }}>
+              {site.title}
+            </div>
+            <div style={{ fontSize: 12, color: '#999', marginBottom: 8 }}>
+              Leave a mark (optional, up to 30 chars):
+            </div>
+            <input
+              type="text"
+              value={inscriptionDraft}
+              onChange={(e) => {
+                const v = e.target.value;
+                if (v.length <= 30) setInscriptionDraft(v);
+              }}
+              placeholder="Here lies…"
+              maxLength={30}
+              disabled={claiming}
+              style={{
+                width: '100%',
+                boxSizing: 'border-box',
+                backgroundColor: '#1a1a1a',
+                border: '1px solid #333',
+                borderRadius: 6,
+                padding: '10px 12px',
+                color: WHITE,
+                fontSize: 15,
+                fontFamily: 'Georgia, serif',
+                fontStyle: 'italic',
+                marginBottom: 6,
+                outline: 'none',
+              }}
+            />
+            <div style={{
+              fontSize: 11,
+              color: '#666',
+              textAlign: 'right',
+              marginBottom: 18,
+            }}>
+              {inscriptionDraft.length}/30
+            </div>
+            <div style={{ display: 'flex', gap: 10 }}>
+              <button
+                onClick={() => { if (!claiming) setSignModalOpen(false); }}
+                disabled={claiming}
+                style={{
+                  flex: 1,
+                  padding: '12px 0',
+                  backgroundColor: 'transparent',
+                  border: '1px solid #2a2a2a',
+                  borderRadius: 8,
+                  color: '#888',
+                  fontSize: 14,
+                  fontFamily: 'system-ui, -apple-system, sans-serif',
+                  cursor: 'pointer',
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleClaimVisit}
+                disabled={claiming}
+                style={{
+                  flex: 2,
+                  padding: '12px 0',
+                  backgroundColor: claiming ? '#3a0a0a' : '#5a0000',
+                  border: `1px solid ${SUBMIT_RED}`,
+                  borderRadius: 8,
+                  color: WHITE,
+                  fontSize: 14,
+                  fontWeight: 600,
+                  fontFamily: 'system-ui, -apple-system, sans-serif',
+                  textShadow: `0 0 8px ${SUBMIT_RED}`,
+                  boxShadow: `0 0 14px ${SUBMIT_RED}55`,
+                  cursor: claiming ? 'wait' : 'pointer',
+                  letterSpacing: 1,
+                  textTransform: 'uppercase',
+                }}
+              >
+                {claiming ? 'Signing…' : (inscriptionDraft.trim() ? 'Sign' : 'Sign Anonymously')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
