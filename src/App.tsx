@@ -1134,6 +1134,99 @@ async function apiCreatePost(args: {
   }
 }
 
+// ---------- Polls API ----------
+// Text-only polls that live in the DreadFeed alongside photo posts. One
+// question + 4 answer options. Users with a handle can vote once and may
+// change their vote until the poll expires (7 days after creation).
+// Results are hidden until the user has voted (IG/Twitter style). After
+// expiry, polls lock read-only with final tallies. Server module: polls.js.
+
+type PollEntry = {
+  id: string;
+  type: 'poll';                 // discriminator so the feed render can branch
+  handle: string;
+  question: string;
+  options: string[];            // always length 4
+  createdAt: string;
+  expiresAt: string;
+  expired: boolean;
+  // null = viewer hasn't voted (or no handle passed). Otherwise the
+  // option index they picked.
+  userVote: number | null;
+  // Only populated when results are visible (viewer has voted OR poll
+  // expired). Otherwise null.
+  tallies: number[] | null;
+  totalVotes: number | null;
+};
+
+type PollFeedPage = { polls: PollEntry[]; nextBefore: string | null };
+
+async function apiFetchPollsFeed(args: { limit?: number; before?: string | null; handle?: string | null }): Promise<PollFeedPage> {
+  try {
+    const params = new URLSearchParams();
+    if (args.limit) params.set('limit', String(args.limit));
+    if (args.before) params.set('before', args.before);
+    if (args.handle) params.set('handle', args.handle);
+    const qs = params.toString();
+    const url = `${API_BASE}/polls/feed${qs ? `?${qs}` : ''}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    return {
+      polls: Array.isArray(data?.polls) ? data.polls : [],
+      nextBefore: data?.nextBefore || null,
+    };
+  } catch { return { polls: [], nextBefore: null }; }
+}
+
+async function apiCreatePoll(args: {
+  handle: string;
+  deviceId: string;
+  question: string;
+  options: string[];
+}): Promise<{ ok: boolean; poll?: PollEntry; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/polls`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        handle: args.handle,
+        deviceId: args.deviceId,
+        question: args.question,
+        options: args.options,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) return { ok: false, reason: data?.error || `HTTP ${res.status}` };
+    return { ok: true, poll: data?.poll };
+  } catch (e: any) {
+    return { ok: false, reason: e?.message || 'network error' };
+  }
+}
+
+async function apiVoteOnPoll(args: {
+  pollId: string;
+  handle: string;
+  deviceId: string;
+  optionIndex: number;
+}): Promise<{ ok: boolean; tallies?: number[]; totalVotes?: number; userVote?: number; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/polls/vote/${encodeURIComponent(args.pollId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        handle: args.handle,
+        deviceId: args.deviceId,
+        optionIndex: args.optionIndex,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) return { ok: false, reason: data?.error || `HTTP ${res.status}` };
+    return { ok: true, tallies: data?.tallies, totalVotes: data?.totalVotes, userVote: data?.userVote };
+  } catch (e: any) {
+    return { ok: false, reason: e?.message || 'network error' };
+  }
+}
+
 // ---------- Live site fetch ----------
 // The server's /sites endpoint returns approved locales. Each site has the
 // shape { id, title, shortDescription, fullDescription, category, state,
@@ -5232,6 +5325,12 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
   // site is within 100m, it shows a "get closer" message; otherwise it
   // surfaces the existing AddPhotoButton composer.
   const [postSheetOpen, setPostSheetOpen] = useState(false);
+  // ➕ tap opens a small chooser sheet (Photo vs Poll) before routing
+  // to the matching composer. setChooserOpen(true) on ➕ tap; the chooser
+  // then either opens postSheetOpen (photo) or pollSheetOpen (poll) and
+  // closes itself.
+  const [chooserOpen, setChooserOpen] = useState(false);
+  const [pollSheetOpen, setPollSheetOpen] = useState(false);
 
   // Unread notifications badge count, shown on the bell in the brand
   // header. Polled on mount + every 60 seconds while DreadFeed is open.
@@ -5284,6 +5383,12 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
   })();
   const [posts, setPosts] = useState<SocialPost[]>(initialSnap ? initialSnap.posts : []);
   const [nextBefore, setNextBefore] = useState<string | null>(initialSnap ? initialSnap.nextBefore : null);
+  // Polls live in parallel with posts. Fetched alongside the feed and
+  // merged chronologically at render time. Separate state keeps the
+  // post code paths (search view, profile grid, etc.) untouched. Pagination
+  // is independent — polls have their own nextBefore cursor.
+  const [polls, setPolls] = useState<PollEntry[]>([]);
+  const [pollsNextBefore, setPollsNextBefore] = useState<string | null>(null);
   // Loading=true only if we have nothing seeded. If we restored from a
   // snapshot, we already have posts to show — no loading flicker.
   const [loading, setLoading] = useState(!initialSnap);
@@ -5346,14 +5451,27 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
   // past threshold. Replaces the entire feed since we're back to the
   // newest post; resets the nextBefore cursor. Also wipes the memory
   // snapshot so the next remount fetches fresh — pull-refresh is an
+  // Polls fetch — runs in parallel with posts. Only in 'all' mode; the
+  // following feed stays photo-only. Returns empty if the call fails so
+  // a polls outage never breaks the photo feed.
+  const loadPollsPage = async (before: string | null): Promise<PollFeedPage> => {
+    if (feedMode === 'following') return { polls: [], nextBefore: null };
+    return apiFetchPollsFeed({ limit: 20, before, handle });
+  };
+
   // explicit "I want new content" signal from the user.
   const refreshFeed = async () => {
     if (refreshing) return;
     setRefreshing(true);
     try {
-      const page = await loadPage(null);
+      const [page, pollsPage] = await Promise.all([
+        loadPage(null),
+        loadPollsPage(null),
+      ]);
       setPosts(page.posts);
       setNextBefore(page.nextBefore);
+      setPolls(pollsPage.polls);
+      setPollsNextBefore(pollsPage.nextBefore);
       _socialFeedMemory = null;
     } catch { /* silent — keep prior feed visible */ }
     setRefreshing(false);
@@ -5383,10 +5501,15 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
     (async () => {
       setLoading(true);
       setError(null);
-      const page = await loadPage(null);
+      const [page, pollsPage] = await Promise.all([
+        loadPage(null),
+        loadPollsPage(null),
+      ]);
       if (cancelled) return;
       setPosts(page.posts);
       setNextBefore(page.nextBefore);
+      setPolls(pollsPage.polls);
+      setPollsNextBefore(pollsPage.nextBefore);
       setLoading(false);
     })();
     return () => { cancelled = true; };
@@ -5411,21 +5534,31 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [posts, nextBefore, feedMode]);
 
-  // Load more — called when the user scrolls near the bottom.
+  // Load more — called when the user scrolls near the bottom. Pulls
+  // the next page of posts AND polls in parallel (each has its own
+  // cursor). Either may exhaust before the other; we only stop calling
+  // when both are exhausted.
   const loadMore = async () => {
-    if (loadingMore || !nextBefore) return;
+    if (loadingMore) return;
+    if (!nextBefore && !pollsNextBefore) return;
     setLoadingMore(true);
-    const page = await loadPage(nextBefore);
+    const [page, pollsPage] = await Promise.all([
+      nextBefore ? loadPage(nextBefore) : Promise.resolve({ posts: [], nextBefore: null } as FeedPage),
+      pollsNextBefore ? loadPollsPage(pollsNextBefore) : Promise.resolve({ polls: [], nextBefore: null } as PollFeedPage),
+    ]);
     setPosts((prev) => [...prev, ...page.posts]);
     setNextBefore(page.nextBefore);
+    setPolls((prev) => [...prev, ...pollsPage.polls]);
+    setPollsNextBefore(pollsPage.nextBefore);
     setLoadingMore(false);
   };
 
   // Scroll listener for infinite scroll. Trigger when user is within
-  // ~800px of the bottom of the page.
+  // ~800px of the bottom of the page. Either cursor (posts or polls)
+  // being non-null means there's still more to fetch.
   useEffect(() => {
     const onScroll = () => {
-      if (!nextBefore || loadingMore) return;
+      if ((!nextBefore && !pollsNextBefore) || loadingMore) return;
       const scrollPos = window.scrollY + window.innerHeight;
       const docHeight = document.documentElement.scrollHeight;
       if (docHeight - scrollPos < 800) {
@@ -5435,7 +5568,7 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
     window.addEventListener('scroll', onScroll, { passive: true });
     return () => window.removeEventListener('scroll', onScroll);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nextBefore, loadingMore]);
+  }, [nextBefore, pollsNextBefore, loadingMore]);
 
   // Site lookup for tap-to-DetailView. Sites are passed down from App so
   // we don't refetch.
@@ -5565,7 +5698,7 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
             <div style={S.socialEmpty}>Loading the feed…</div>
           ) : error ? (
             <div style={S.socialEmpty}>⚠ {error}</div>
-          ) : posts.length === 0 ? (
+          ) : posts.length === 0 && polls.length === 0 ? (
             <div style={S.socialEmpty}>
               {feedMode === 'following'
                 ? 'No posts from accounts you follow yet.'
@@ -5576,25 +5709,58 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
             </div>
           ) : (
             <div style={{ ...S.socialFeed, paddingBottom: 80 }}>
-              {posts.map((p) => (
-                <SocialPostCard
-                  key={p.id}
-                  post={p}
-                  currentHandle={handle}
-                  deviceId={deviceId}
-                  onSiteTap={() => {
-                    const s = siteById.get(p.siteId);
-                    if (s) onSelectSite(s);
-                  }}
-                  onHandleTap={() => onSelectHandle(p.handle)}
-                  onHashtagTap={(tag) => onSelectHashtag(tag)}
-                  onPostRemoved={(postId) => {
-                    setPosts((prev) => prev.filter((x) => x.id !== postId));
-                  }}
-                />
-              ))}
+              {/* Merge posts and polls into one chronological feed by
+                  createdAt/approvedAt. Each item is tagged with a `kind`
+                  so the render switch can pick the right card. Polls
+                  carry their `type:'poll'` discriminator from the
+                  server; posts don't, hence the dual approach. */}
+              {(() => {
+                type FeedItem =
+                  | { kind: 'post'; item: SocialPost; ts: string }
+                  | { kind: 'poll'; item: PollEntry; ts: string };
+                const merged: FeedItem[] = [];
+                for (const p of posts) {
+                  merged.push({ kind: 'post', item: p, ts: p.approvedAt || p.createdAt || '' });
+                }
+                for (const pl of polls) {
+                  merged.push({ kind: 'poll', item: pl, ts: pl.createdAt || '' });
+                }
+                merged.sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
+                return merged.map((entry) => {
+                  if (entry.kind === 'poll') {
+                    const pl = entry.item;
+                    return (
+                      <SocialPollCard
+                        key={'poll:' + pl.id}
+                        poll={pl}
+                        currentHandle={handle}
+                        deviceId={deviceId}
+                        onHandleTap={() => onSelectHandle(pl.handle)}
+                      />
+                    );
+                  }
+                  const p = entry.item;
+                  return (
+                    <SocialPostCard
+                      key={p.id}
+                      post={p}
+                      currentHandle={handle}
+                      deviceId={deviceId}
+                      onSiteTap={() => {
+                        const s = siteById.get(p.siteId);
+                        if (s) onSelectSite(s);
+                      }}
+                      onHandleTap={() => onSelectHandle(p.handle)}
+                      onHashtagTap={(tag) => onSelectHashtag(tag)}
+                      onPostRemoved={(postId) => {
+                        setPosts((prev) => prev.filter((x) => x.id !== postId));
+                      }}
+                    />
+                  );
+                });
+              })()}
               {loadingMore && <div style={S.socialEmpty}>Loading more…</div>}
-              {!nextBefore && posts.length > 0 && (
+              {!nextBefore && !pollsNextBefore && (posts.length > 0 || polls.length > 0) && (
                 <div style={{ ...S.socialEmpty, paddingTop: 20, paddingBottom: 40 }}>
                   <span style={{ opacity: 0.5, fontSize: 12 }}>— end of feed —</span>
                 </div>
@@ -5649,10 +5815,11 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
         active={subTab}
         onSelect={(tab) => {
           if (tab === 'post') {
-            // Post is an action, not a sub-screen — open the composer
-            // sheet. It handles the GPS check internally.
+            // ➕ opens a chooser (Photo vs Poll) — the chooser then
+            // routes to ExposurePostSheet or PollComposerSheet. We don't
+            // switch sub-tabs because Post is an action, not a screen.
             playSubDrop();
-            setPostSheetOpen(true);
+            setChooserOpen(true);
             return;
           }
           playSubDrop();
@@ -5660,8 +5827,24 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
         }}
       />
 
-      {/* Post composer sheet — opened by the ➕ tab. Finds the nearest
-          site within 100m and runs the camera flow. */}
+      {/* ➕ chooser — Photo vs Poll. Tiny bottom-sheet modal that
+          routes the user to the matching composer flow. */}
+      {chooserOpen && (
+        <ChoosePostTypeSheet
+          onPickPhoto={() => {
+            setChooserOpen(false);
+            setPostSheetOpen(true);
+          }}
+          onPickPoll={() => {
+            setChooserOpen(false);
+            setPollSheetOpen(true);
+          }}
+          onCancel={() => setChooserOpen(false)}
+        />
+      )}
+
+      {/* Post composer sheet — opened by the chooser after picking Photo.
+          Runs the IG-style multi-stage camera + editor + caption flow. */}
       {postSheetOpen && (
         <ExposurePostSheet
           handle={handle}
@@ -5670,6 +5853,21 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
           onPosted={() => {
             setPostSheetOpen(false);
             showToast('Posted to DreadFeed', 'success');
+            void refreshFeed();
+          }}
+        />
+      )}
+
+      {/* Poll composer sheet — opened by the chooser after picking Poll.
+          Question + 4 options. Auto-approved server-side, no admin queue. */}
+      {pollSheetOpen && (
+        <PollComposerSheet
+          handle={handle}
+          deviceId={deviceId}
+          onClose={() => setPollSheetOpen(false)}
+          onPosted={() => {
+            setPollSheetOpen(false);
+            showToast('Poll posted', 'success');
             void refreshFeed();
           }}
         />
@@ -8337,6 +8535,330 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap,
         />
       )}
     </div>
+  );
+}
+
+// ---------- SocialPollCard ----------
+// Renders a poll inline in the DreadFeed alongside SocialPostCards. The
+// card has two visual states:
+//   - Pre-vote (no userVote, not expired): question + 4 tappable options,
+//     no results visible. Tapping an option submits the vote and the
+//     card flips to the results state.
+//   - Post-vote / expired: question + 4 horizontal bars showing percent
+//     of total, with the user's pick highlighted. Tapping a different
+//     option (if not expired) changes the vote.
+// Mirrors the SocialPostCard outer chrome (header with avatar + handle)
+// so the two card types feel like the same feed surface.
+function SocialPollCard({ poll, currentHandle, deviceId, onHandleTap }: {
+  poll: PollEntry;
+  currentHandle: string | null;
+  deviceId: string | null;
+  onHandleTap: () => void;
+}) {
+  // Local optimistic state — vote updates flip the card immediately
+  // without waiting for a feed refetch.
+  const [userVote, setUserVote] = useState<number | null>(poll.userVote);
+  const [tallies, setTallies] = useState<number[] | null>(poll.tallies);
+  const [totalVotes, setTotalVotes] = useState<number | null>(poll.totalVotes);
+  const [voting, setVoting] = useState(false);
+
+  const expired = poll.expired;
+  const showResults = expired || userVote !== null;
+  const canVote = !expired && !!currentHandle && !!deviceId && !voting;
+
+  // ---- Time-remaining label ("3d left" / "Ends in 4h" / "Closed") ----
+  // Computed once on mount; polls don't tick in real time — staleness
+  // by a few minutes is fine for a feed card.
+  const timeLabel = (() => {
+    if (expired) return 'Poll closed';
+    const ms = new Date(poll.expiresAt).getTime() - Date.now();
+    if (ms <= 0) return 'Poll closed';
+    const days = Math.floor(ms / (24 * 60 * 60 * 1000));
+    if (days >= 1) return `${days}d left`;
+    const hours = Math.floor(ms / (60 * 60 * 1000));
+    if (hours >= 1) return `${hours}h left`;
+    const mins = Math.floor(ms / (60 * 1000));
+    return `${Math.max(1, mins)}m left`;
+  })();
+
+  const onPick = async (idx: number) => {
+    if (!canVote) {
+      if (!currentHandle) {
+        showToast('Claim a handle first to vote', 'error');
+      }
+      return;
+    }
+    if (idx === userVote) return;        // tapping current pick = no-op
+    setVoting(true);
+    const result = await apiVoteOnPoll({
+      pollId: poll.id,
+      handle: currentHandle!,
+      deviceId: deviceId!,
+      optionIndex: idx,
+    });
+    setVoting(false);
+    if (result.ok) {
+      setUserVote(typeof result.userVote === 'number' ? result.userVote : idx);
+      if (Array.isArray(result.tallies)) setTallies(result.tallies);
+      if (typeof result.totalVotes === 'number') setTotalVotes(result.totalVotes);
+    } else {
+      showToast(`Vote failed: ${result.reason || 'unknown'}`, 'error');
+    }
+  };
+
+  // Percent for the bar, gracefully handling 0 total.
+  const pct = (idx: number) => {
+    if (!tallies || !totalVotes) return 0;
+    if (totalVotes === 0) return 0;
+    return Math.round((tallies[idx] / totalVotes) * 100);
+  };
+
+  return (
+    <div style={S.pollCard}>
+      {/* Card header — handle + time-remaining badge. Tapping the handle
+          navigates to the user's profile (same as post cards). */}
+      <div style={S.pollCardHeader}>
+        <button
+          onClick={onHandleTap}
+          style={S.pollCardHandleBtn}
+          className="sinister-icon-btn"
+        >
+          @{poll.handle}
+        </button>
+        <div style={S.pollCardBadge}>📊 Poll · {timeLabel}</div>
+      </div>
+
+      {/* Question — system font, white, generous line-height. */}
+      <div style={S.pollCardQuestion}>{poll.question}</div>
+
+      {/* Options. Two visual modes: pre-vote (plain pill buttons) or
+          results (horizontal-bar fills inside each option, percent label
+          on the right, viewer's pick highlighted with a red accent). */}
+      <div style={S.pollCardOptions}>
+        {poll.options.map((opt, idx) => {
+          const isPicked = userVote === idx;
+          if (!showResults) {
+            return (
+              <button
+                key={idx}
+                onClick={() => onPick(idx)}
+                disabled={!canVote}
+                style={S.pollOptionBtn}
+                className="sinister-icon-btn"
+              >
+                {opt}
+              </button>
+            );
+          }
+          const p = pct(idx);
+          return (
+            <button
+              key={idx}
+              onClick={() => onPick(idx)}
+              disabled={!canVote}
+              style={{
+                ...S.pollOptionResult,
+                ...(isPicked ? S.pollOptionResultPicked : {}),
+              }}
+              className="sinister-icon-btn"
+            >
+              {/* Fill bar — width is the percentage. Sits behind the label. */}
+              <div
+                style={{
+                  ...S.pollOptionFill,
+                  width: `${p}%`,
+                  ...(isPicked ? S.pollOptionFillPicked : {}),
+                }}
+              />
+              <div style={S.pollOptionLabel}>{opt}{isPicked ? ' ✓' : ''}</div>
+              <div style={S.pollOptionPct}>{p}%</div>
+            </button>
+          );
+        })}
+      </div>
+
+      {/* Footer — total vote count when visible, or a CTA prompt when
+          results are hidden. Plus expiry note for closed polls. */}
+      <div style={S.pollCardFooter}>
+        {showResults ? (
+          <>
+            <span>{totalVotes ?? 0} vote{(totalVotes ?? 0) === 1 ? '' : 's'}</span>
+            {!expired && userVote !== null && (
+              <span style={{ opacity: 0.6, marginLeft: 8 }}>· Tap to change your vote</span>
+            )}
+            {expired && (
+              <span style={{ opacity: 0.6, marginLeft: 8 }}>· Final results</span>
+            )}
+          </>
+        ) : (
+          <span style={{ opacity: 0.6 }}>Vote to see results</span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---------- PollComposerSheet ----------
+// Full-screen sheet that lets a user create a poll. Reached from the
+// DreadFeed ➕ tab's type-chooser. Layout matches ExposurePostSheet's
+// header chrome (✕ Cancel | "New poll" | "Share") so the two composer
+// flows feel like the same surface.
+//
+// Fields:
+//   - 1 question (3-200 chars)
+//   - 4 options (1-80 chars each, all required)
+// Share button enables only when all five fields pass length checks.
+function PollComposerSheet({ handle, deviceId, onClose, onPosted }: {
+  handle: string | null;
+  deviceId: string | null;
+  onClose: () => void;
+  onPosted: () => void;
+}) {
+  const [question, setQuestion] = useState('');
+  // Always 4 options. We use an array of strings indexed 0..3 so render
+  // can map cleanly. Mirrors the server's OPTIONS_COUNT = 4 hard rule.
+  const [options, setOptions] = useState<string[]>(['', '', '', '']);
+  const [submitting, setSubmitting] = useState(false);
+
+  const qTrim = question.trim();
+  const optsTrim = options.map((o) => o.trim());
+  // Mirror server validation: question 3-200, each option 1-80.
+  const qValid = qTrim.length >= 3 && qTrim.length <= 200;
+  const optsValid = optsTrim.every((o) => o.length >= 1 && o.length <= 80);
+  const canShare = qValid && optsValid && !submitting && !!handle && !!deviceId;
+
+  const updateOption = (idx: number, value: string) => {
+    setOptions((prev) => prev.map((o, i) => (i === idx ? value : o)));
+  };
+
+  const onShare = async () => {
+    if (!canShare) return;
+    setSubmitting(true);
+    const result = await apiCreatePoll({
+      handle: handle!,
+      deviceId: deviceId!,
+      question: qTrim,
+      options: optsTrim,
+    });
+    setSubmitting(false);
+    if (result.ok) {
+      playPostShared();
+      onPosted();
+    } else {
+      showToast(`Poll failed: ${result.reason || 'unknown error'}`, 'error');
+    }
+  };
+
+  // No handle? Match the ExposurePostSheet fallback screen.
+  if (!handle || !deviceId) {
+    return createPortal(
+      <div style={S.igComposerScreen}>
+        <div style={S.igComposerHeader}>
+          <button onClick={onClose} style={S.igComposerHeaderBtn} aria-label="Close">✕</button>
+          <div style={S.igComposerHeaderTitle}>New poll</div>
+          <div style={{ width: 40 }} />
+        </div>
+        <div style={{ padding: '40px 24px', textAlign: 'center', color: '#BBB', fontSize: 15, fontFamily: 'system-ui, -apple-system, sans-serif' }}>
+          Claim a handle to post a poll.
+        </div>
+      </div>,
+      document.body
+    );
+  }
+
+  return createPortal(
+    <div style={S.igComposerScreen}>
+      <div style={S.igComposerHeader}>
+        <button onClick={onClose} style={S.igComposerHeaderBtn} aria-label="Cancel">✕</button>
+        <div style={S.igComposerHeaderTitle}>New poll</div>
+        <button
+          onClick={onShare}
+          disabled={!canShare}
+          style={{
+            ...S.igComposerHeaderBtn,
+            color: canShare ? '#0095F6' : '#0095F655',
+            fontWeight: 700,
+            fontSize: 15,
+            width: 'auto',
+            paddingLeft: 8,
+            paddingRight: 8,
+          }}
+          aria-label="Share poll"
+        >
+          {submitting ? '…' : 'Share'}
+        </button>
+      </div>
+
+      <div style={S.pollComposerBody}>
+        {/* Question field. textarea so users can write longer questions
+            comfortably; visually monospaced character counter on the
+            right of the label so they can see how close they are to the
+            200-char ceiling. */}
+        <div style={S.pollComposerLabelRow}>
+          <span style={S.pollComposerLabel}>Question</span>
+          <span style={S.pollComposerCount}>{qTrim.length}/200</span>
+        </div>
+        <textarea
+          value={question}
+          onChange={(e) => setQuestion(e.target.value.slice(0, 200))}
+          placeholder="Ask the Dread Directory…"
+          style={S.pollComposerQuestion}
+          rows={2}
+        />
+
+        <div style={{ ...S.pollComposerLabelRow, marginTop: 18 }}>
+          <span style={S.pollComposerLabel}>Options</span>
+          <span style={S.pollComposerCount}>4 required</span>
+        </div>
+        {options.map((opt, idx) => (
+          <div key={idx} style={S.pollComposerOptionRow}>
+            <span style={S.pollComposerOptionNum}>{idx + 1}</span>
+            <input
+              type="text"
+              value={opt}
+              onChange={(e) => updateOption(idx, e.target.value.slice(0, 80))}
+              placeholder={`Option ${idx + 1}`}
+              style={S.pollComposerOptionInput}
+            />
+          </div>
+        ))}
+
+        <div style={S.pollComposerHint}>
+          Polls run for 7 days. Voters can change their pick until then.
+        </div>
+      </div>
+    </div>,
+    document.body
+  );
+}
+
+// ---------- ChoosePostTypeSheet ----------
+// Tiny bottom sheet that appears when the user taps ➕ on DreadFeed.
+// Two options: "Photo" → opens ExposurePostSheet, or "Poll" → opens
+// PollComposerSheet. Matches the dark IG-style modal aesthetic.
+function ChoosePostTypeSheet({ onPickPhoto, onPickPoll, onCancel }: {
+  onPickPhoto: () => void;
+  onPickPoll: () => void;
+  onCancel: () => void;
+}) {
+  return createPortal(
+    <div style={S.pollChooserBackdrop} onClick={onCancel}>
+      <div style={S.pollChooserCard} onClick={(e) => e.stopPropagation()}>
+        <div style={S.pollChooserTitle}>What are you posting?</div>
+        <button onClick={onPickPhoto} style={S.pollChooserBtn} className="sinister-icon-btn">
+          <span style={S.pollChooserBtnIcon}>📷</span>
+          <span style={S.pollChooserBtnLabel}>Photo</span>
+        </button>
+        <button onClick={onPickPoll} style={S.pollChooserBtn} className="sinister-icon-btn">
+          <span style={S.pollChooserBtnIcon}>📊</span>
+          <span style={S.pollChooserBtnLabel}>Poll</span>
+        </button>
+        <button onClick={onCancel} style={S.pollChooserCancel} className="sinister-icon-btn">
+          Cancel
+        </button>
+      </div>
+    </div>,
+    document.body
   );
 }
 
@@ -19015,5 +19537,296 @@ const S: Record<string, React.CSSProperties> = {
     fontFamily: 'system-ui, -apple-system, sans-serif',
     cursor: 'pointer',
     marginTop: 6,
+  },
+
+  // ---------- Poll feed cards (SocialPollCard) ----------
+  // Matches SocialPostCard chrome: dark background, full-width card,
+  // borderless top/bottom (the feed gutter handles separation).
+  pollCard: {
+    width: '100%',
+    backgroundColor: '#000',
+    borderTop: '1px solid #1a1a1a',
+    borderBottom: '1px solid #1a1a1a',
+    padding: '14px 14px 16px',
+    boxSizing: 'border-box',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    color: '#F0EBE0',
+  },
+  pollCardHeader: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 12,
+  },
+  pollCardHandleBtn: {
+    background: 'transparent',
+    border: 'none',
+    padding: 0,
+    color: '#FFFFFF',
+    fontSize: 14,
+    fontWeight: 700,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+  },
+  pollCardBadge: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 4,
+    fontSize: 11,
+    color: '#9a8e7a',
+    backgroundColor: '#171717',
+    border: '1px solid #2a2a2a',
+    borderRadius: 999,
+    padding: '4px 10px',
+    fontWeight: 600,
+    letterSpacing: 0.2,
+  },
+  pollCardQuestion: {
+    fontSize: 17,
+    lineHeight: 1.35,
+    fontWeight: 600,
+    color: '#F0EBE0',
+    marginBottom: 14,
+    whiteSpace: 'pre-wrap',
+    wordBreak: 'break-word',
+  },
+  pollCardOptions: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 8,
+  },
+  // Pre-vote pill button — borderless dark pill, tappable.
+  pollOptionBtn: {
+    width: '100%',
+    minHeight: 44,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'flex-start',
+    backgroundColor: '#141414',
+    color: '#F0EBE0',
+    border: '1px solid #262626',
+    borderRadius: 10,
+    padding: '10px 14px',
+    fontSize: 15,
+    fontWeight: 500,
+    textAlign: 'left' as const,
+    cursor: 'pointer',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  // Post-vote results row — container that holds the fill bar, label,
+  // and percent. position:relative is required so the fill can absolute-
+  // position underneath. overflow:hidden clips the fill to the rounded
+  // corners.
+  pollOptionResult: {
+    position: 'relative' as const,
+    overflow: 'hidden' as const,
+    width: '100%',
+    minHeight: 44,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#101010',
+    color: '#F0EBE0',
+    border: '1px solid #262626',
+    borderRadius: 10,
+    padding: '10px 14px',
+    fontSize: 15,
+    fontWeight: 500,
+    textAlign: 'left' as const,
+    cursor: 'pointer',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  pollOptionResultPicked: {
+    borderColor: '#8B0000',
+  },
+  pollOptionFill: {
+    position: 'absolute' as const,
+    left: 0,
+    top: 0,
+    bottom: 0,
+    backgroundColor: '#1f1f1f',
+    transition: 'width 280ms ease-out',
+    pointerEvents: 'none' as const,
+  },
+  pollOptionFillPicked: {
+    backgroundColor: '#3a0000',
+  },
+  pollOptionLabel: {
+    position: 'relative' as const,
+    zIndex: 1,
+    flex: 1,
+    minWidth: 0,
+    overflow: 'hidden' as const,
+    textOverflow: 'ellipsis' as const,
+    whiteSpace: 'nowrap' as const,
+  },
+  pollOptionPct: {
+    position: 'relative' as const,
+    zIndex: 1,
+    fontSize: 13,
+    fontWeight: 700,
+    color: '#bbb',
+    marginLeft: 12,
+    minWidth: 36,
+    textAlign: 'right' as const,
+  },
+  pollCardFooter: {
+    marginTop: 12,
+    fontSize: 12,
+    color: '#9a8e7a',
+    display: 'flex',
+    alignItems: 'center',
+    flexWrap: 'wrap' as const,
+  },
+
+  // ---------- Poll composer (PollComposerSheet) ----------
+  pollComposerBody: {
+    padding: '18px 16px 24px',
+    overflowY: 'auto' as const,
+    flex: 1,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    color: '#F0EBE0',
+  },
+  pollComposerLabelRow: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 8,
+  },
+  pollComposerLabel: {
+    fontSize: 13,
+    fontWeight: 700,
+    color: '#F0EBE0',
+    letterSpacing: 0.5,
+    textTransform: 'uppercase' as const,
+  },
+  pollComposerCount: {
+    fontSize: 12,
+    color: '#7a7a7a',
+    fontVariantNumeric: 'tabular-nums' as const,
+  },
+  pollComposerQuestion: {
+    width: '100%',
+    backgroundColor: '#101010',
+    color: '#F0EBE0',
+    border: '1px solid #2a2a2a',
+    borderRadius: 10,
+    padding: '12px 14px',
+    fontSize: 16,
+    fontWeight: 500,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    resize: 'none' as const,
+    outline: 'none',
+    boxSizing: 'border-box' as const,
+  },
+  pollComposerOptionRow: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 10,
+    marginBottom: 8,
+  },
+  pollComposerOptionNum: {
+    width: 24,
+    height: 24,
+    flexShrink: 0,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#1a1a1a',
+    color: '#888',
+    border: '1px solid #2a2a2a',
+    borderRadius: 999,
+    fontSize: 12,
+    fontWeight: 700,
+  },
+  pollComposerOptionInput: {
+    flex: 1,
+    backgroundColor: '#101010',
+    color: '#F0EBE0',
+    border: '1px solid #2a2a2a',
+    borderRadius: 10,
+    padding: '10px 12px',
+    fontSize: 15,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    outline: 'none',
+    boxSizing: 'border-box' as const,
+    minWidth: 0,
+  },
+  pollComposerHint: {
+    marginTop: 16,
+    fontSize: 12,
+    color: '#7a7a7a',
+    lineHeight: 1.4,
+  },
+
+  // ---------- ChoosePostTypeSheet (➕ chooser) ----------
+  pollChooserBackdrop: {
+    position: 'fixed' as const,
+    inset: 0,
+    backgroundColor: 'rgba(0,0,0,0.78)',
+    zIndex: 9000,
+    display: 'flex',
+    alignItems: 'flex-end',
+    justifyContent: 'center',
+  },
+  pollChooserCard: {
+    width: '100%',
+    maxWidth: 520,
+    backgroundColor: '#0c0c0c',
+    borderTopLeftRadius: 18,
+    borderTopRightRadius: 18,
+    borderTop: '1px solid #1a1a1a',
+    padding: '20px 18px calc(28px + env(safe-area-inset-bottom))',
+    boxSizing: 'border-box' as const,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    color: '#F0EBE0',
+  },
+  pollChooserTitle: {
+    fontSize: 13,
+    fontWeight: 700,
+    color: '#9a8e7a',
+    letterSpacing: 0.6,
+    textTransform: 'uppercase' as const,
+    textAlign: 'center' as const,
+    marginBottom: 14,
+  },
+  pollChooserBtn: {
+    width: '100%',
+    display: 'flex',
+    alignItems: 'center',
+    gap: 14,
+    backgroundColor: '#141414',
+    color: '#F0EBE0',
+    border: '1px solid #262626',
+    borderRadius: 12,
+    padding: '14px 16px',
+    fontSize: 16,
+    fontWeight: 600,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+    marginBottom: 10,
+    textAlign: 'left' as const,
+  },
+  pollChooserBtnIcon: {
+    fontSize: 22,
+    width: 28,
+    textAlign: 'center' as const,
+  },
+  pollChooserBtnLabel: {
+    fontSize: 16,
+    fontWeight: 600,
+  },
+  pollChooserCancel: {
+    width: '100%',
+    backgroundColor: 'transparent',
+    color: '#888',
+    border: '1px solid #2a2a2a',
+    borderRadius: 12,
+    padding: '12px',
+    fontSize: 15,
+    fontWeight: 500,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+    marginTop: 4,
   },
 };
