@@ -7152,7 +7152,7 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
   // The first photo (if any) becomes the editable primary that goes
   // through the editor. Extras ride along raw.
   const MAX_PHOTOS = 10;
-  const MAX_VIDEO_BYTES = 20 * 1024 * 1024;     // 20 MB hard cap, mirrors server
+  const MAX_VIDEO_BYTES = 40 * 1024 * 1024;     // 40 MB hard cap, mirrors server
   const onPhotoChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const fl = e.target.files;
     if (!fl || fl.length === 0) return;
@@ -7167,7 +7167,9 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
     if (videos.length > 0) {
       const v = videos[0];
       if (v.size > MAX_VIDEO_BYTES) {
-        showToast(`Video too large (max ${Math.round(MAX_VIDEO_BYTES / 1024 / 1024)}MB). Trim it first in Photos.`, 'error');
+        const actualMb = Math.round(v.size / 1024 / 1024);
+        const limitMb = Math.round(MAX_VIDEO_BYTES / 1024 / 1024);
+        showToast(`Video too large: ${actualMb}MB (max ${limitMb}MB). Trim it first in Photos.`, 'error');
         return;
       }
       // Video post path: skip the editor entirely. Store the video as
@@ -7383,10 +7385,10 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
               <div style={S.igPickPromptHint}>From your camera or library</div>
               {/* Limits notice — keeps users from wondering why a long
                   or huge video silently fails to upload. Phrased as
-                  "videos should be ~10s, max 20MB" since the server
+                  "videos should be ~10s, max 40MB" since the server
                   enforces size strictly but is loose on duration. */}
               <div style={S.igPickPromptHintSmall}>
-                Videos: up to ~10 seconds, max 20MB
+                Videos: up to ~10 seconds, max 40MB
               </div>
             </button>
           )}
@@ -8589,6 +8591,7 @@ function SocialPollCard({ poll, currentHandle, deviceId, onHandleTap }: {
       return;
     }
     if (idx === userVote) return;        // tapping current pick = no-op
+    playPop();
     setVoting(true);
     const result = await apiVoteOnPoll({
       pollId: poll.id,
@@ -8847,7 +8850,7 @@ function ChoosePostTypeSheet({ onPickPhoto, onPickPoll, onCancel }: {
         <div style={S.pollChooserTitle}>What are you posting?</div>
         <button onClick={onPickPhoto} style={S.pollChooserBtn} className="sinister-icon-btn">
           <span style={S.pollChooserBtnIcon}>📷</span>
-          <span style={S.pollChooserBtnLabel}>Photo</span>
+          <span style={S.pollChooserBtnLabel}>Photo / Video</span>
         </button>
         <button onClick={onPickPoll} style={S.pollChooserBtn} className="sinister-icon-btn">
           <span style={S.pollChooserBtnIcon}>📊</span>
