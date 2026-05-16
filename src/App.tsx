@@ -7157,6 +7157,25 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
     const fl = e.target.files;
     if (!fl || fl.length === 0) return;
     const arr = Array.from(fl);
+
+    // CHECK SIZE FIRST — before any other validation. The most common
+    // failure mode is "I took a video and it was too big" and we want
+    // the toast to tell the user exactly what happened. Done up-front
+    // because the OS picker can hand us a video that's also reported
+    // alongside a thumbnail (some iOS versions do this), and the
+    // "mixed photo+video" check below would steal the error otherwise.
+    const tooBigVideo = arr.find((f) => f.type.startsWith('video/') && f.size > MAX_VIDEO_BYTES);
+    if (tooBigVideo) {
+      const actualMb = Math.round(tooBigVideo.size / 1024 / 1024);
+      const limitMb = Math.round(MAX_VIDEO_BYTES / 1024 / 1024);
+      showToast(`Video too large: ${actualMb}MB (max ${limitMb}MB). Trim it first in Photos.`, 'error');
+      // Reset the input so picking the same file again still re-triggers
+      // onChange. Without this iOS won't re-fire onChange for an
+      // identical pick.
+      if (fileRef.current) fileRef.current.value = '';
+      return;
+    }
+
     const photos = arr.filter((f) => f.type.startsWith('image/'));
     const videos = arr.filter((f) => f.type.startsWith('video/'));
 
@@ -7166,12 +7185,7 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
     }
     if (videos.length > 0) {
       const v = videos[0];
-      if (v.size > MAX_VIDEO_BYTES) {
-        const actualMb = Math.round(v.size / 1024 / 1024);
-        const limitMb = Math.round(MAX_VIDEO_BYTES / 1024 / 1024);
-        showToast(`Video too large: ${actualMb}MB (max ${limitMb}MB). Trim it first in Photos.`, 'error');
-        return;
-      }
+      // Size already checked above; this branch is the happy path.
       // Video post path: skip the editor entirely. Store the video as
       // "photoFile" for the upload step (server routes by mimetype).
       // No extras for video posts (v1).
@@ -7320,14 +7334,40 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
           {photoPreview ? (
             <div style={S.igPickPreviewWrap}>
               {isVideoPick ? (
-                <video
-                  src={photoPreview}
-                  style={S.igPickPreviewImg}
-                  muted
-                  autoPlay
-                  playsInline
-                  loop
-                />
+                // Don't render the picked video inline — WKWebView can
+                // crash decoding HEVC/HDR .mov files straight off the
+                // iOS camera roll. Show a static placeholder card with
+                // the file size so the user knows it's selected and
+                // confirms the pick visually. The actual upload still
+                // uses the picked File object; only the preview is
+                // suppressed.
+                <div
+                  style={{
+                    ...S.igPickPreviewImg,
+                    display: 'flex',
+                    flexDirection: 'column' as const,
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    backgroundColor: '#111',
+                    color: '#F0EBE0',
+                    gap: 10,
+                    padding: 20,
+                    boxSizing: 'border-box' as const,
+                  }}
+                >
+                  <svg width="56" height="56" viewBox="0 0 24 24" fill="none" stroke="#888" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                    <polygon points="23 7 16 12 23 17 23 7" />
+                    <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
+                  </svg>
+                  <div style={{ fontSize: 15, fontWeight: 600, fontFamily: 'system-ui, -apple-system, sans-serif' }}>
+                    Video selected
+                  </div>
+                  {photoFile && (
+                    <div style={{ fontSize: 13, color: '#888', fontFamily: 'system-ui, -apple-system, sans-serif' }}>
+                      {Math.round(photoFile.size / 1024 / 1024 * 10) / 10} MB
+                    </div>
+                  )}
+                </div>
               ) : (
                 <img src={photoPreview} alt="" style={S.igPickPreviewImg} />
               )}
@@ -7413,20 +7453,36 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
           </div>
 
           {/* Smaller centered preview + caption field below. For video
-              posts the preview is a muted, looping <video> so the user
-              sees what they're about to share. */}
+              posts the preview is a static placeholder card (NOT a live
+              <video>) — WKWebView crashes decoding fresh-from-camera
+              .mov files. The actual upload still uses the picked File
+              object; only the inline preview is suppressed. */}
           <div style={S.igCaptionBody}>
             <div style={S.igCaptionPreviewRow}>
               {editedPreview && (
                 isVideoPick ? (
-                  <video
-                    src={editedPreview}
-                    style={S.igCaptionPreviewImg}
-                    muted
-                    autoPlay
-                    playsInline
-                    loop
-                  />
+                  <div
+                    style={{
+                      ...S.igCaptionPreviewImg,
+                      display: 'flex',
+                      flexDirection: 'column' as const,
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      backgroundColor: '#111',
+                      color: '#F0EBE0',
+                      gap: 4,
+                      padding: 8,
+                      boxSizing: 'border-box' as const,
+                    }}
+                  >
+                    <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#888" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                      <polygon points="23 7 16 12 23 17 23 7" />
+                      <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
+                    </svg>
+                    <div style={{ fontSize: 10, fontWeight: 600, fontFamily: 'system-ui, -apple-system, sans-serif', textAlign: 'center' as const }}>
+                      Video
+                    </div>
+                  </div>
                 ) : (
                   <img src={editedPreview} alt="" style={S.igCaptionPreviewImg} />
                 )
