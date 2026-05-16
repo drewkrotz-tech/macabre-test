@@ -1,8 +1,9 @@
 # =============================================================================
 # codemagic.yaml - The Dread Directory
 # Signed TestFlight workflow + unsigned smoke test.
-# Injects iOS Info.plist permission strings (location + camera) automatically
-# after Capacitor scaffolds the iOS project, before the build runs.
+# Injects iOS Info.plist permission strings (location + camera + microphone +
+# photo library) automatically after Capacitor scaffolds the iOS project,
+# before the build runs.
 # Also writes the App.entitlements file with Sign in with Apple capability
 # and patches project.pbxproj using a python one-liner to point each App
 # target config at the entitlements file.
@@ -111,6 +112,12 @@ workflows:
             plutil -replace NSLocationAlwaysUsageDescription -string "The Dread Directory needs background location to ping you when you're near a sinister site." "$PLIST"
           plutil -insert NSCameraUsageDescription -string "The Dread Directory uses your camera so you can take a verification photo when submitting a new sinister site." "$PLIST" || \
             plutil -replace NSCameraUsageDescription -string "The Dread Directory uses your camera so you can take a verification photo when submitting a new sinister site." "$PLIST"
+          plutil -insert NSMicrophoneUsageDescription -string "The Dread Directory uses your microphone to record audio when you capture a video for a DreadFeed post." "$PLIST" || \
+            plutil -replace NSMicrophoneUsageDescription -string "The Dread Directory uses your microphone to record audio when you capture a video for a DreadFeed post." "$PLIST"
+          plutil -insert NSPhotoLibraryUsageDescription -string "The Dread Directory needs photo library access so you can pick photos and videos for your DreadFeed posts." "$PLIST" || \
+            plutil -replace NSPhotoLibraryUsageDescription -string "The Dread Directory needs photo library access so you can pick photos and videos for your DreadFeed posts." "$PLIST"
+          plutil -insert NSPhotoLibraryAddUsageDescription -string "The Dread Directory needs permission to save photos and videos to your library." "$PLIST" || \
+            plutil -replace NSPhotoLibraryAddUsageDescription -string "The Dread Directory needs permission to save photos and videos to your library." "$PLIST"
           plutil -insert NSMotionUsageDescription -string "The Dread Directory uses motion sensors to efficiently detect when you're moving, so it only checks for nearby sinister sites when needed and saves your battery." "$PLIST" || \
             plutil -replace NSMotionUsageDescription -string "The Dread Directory uses motion sensors to efficiently detect when you're moving, so it only checks for nearby sinister sites when needed and saves your battery." "$PLIST"
           plutil -insert UIBackgroundModes -array "$PLIST" 2>/dev/null || true
@@ -290,6 +297,12 @@ workflows:
             plutil -replace NSLocationAlwaysUsageDescription -string "The Dread Directory needs background location to ping you when you're near a sinister site." "$PLIST"
           plutil -insert NSCameraUsageDescription -string "The Dread Directory uses your camera so you can take a verification photo when submitting a new sinister site." "$PLIST" || \
             plutil -replace NSCameraUsageDescription -string "The Dread Directory uses your camera so you can take a verification photo when submitting a new sinister site." "$PLIST"
+          plutil -insert NSMicrophoneUsageDescription -string "The Dread Directory uses your microphone to record audio when you capture a video for a DreadFeed post." "$PLIST" || \
+            plutil -replace NSMicrophoneUsageDescription -string "The Dread Directory uses your microphone to record audio when you capture a video for a DreadFeed post." "$PLIST"
+          plutil -insert NSPhotoLibraryUsageDescription -string "The Dread Directory needs photo library access so you can pick photos and videos for your DreadFeed posts." "$PLIST" || \
+            plutil -replace NSPhotoLibraryUsageDescription -string "The Dread Directory needs photo library access so you can pick photos and videos for your DreadFeed posts." "$PLIST"
+          plutil -insert NSPhotoLibraryAddUsageDescription -string "The Dread Directory needs permission to save photos and videos to your library." "$PLIST" || \
+            plutil -replace NSPhotoLibraryAddUsageDescription -string "The Dread Directory needs permission to save photos and videos to your library." "$PLIST"
           plutil -insert NSMotionUsageDescription -string "The Dread Directory uses motion sensors to efficiently detect when you're moving, so it only checks for nearby sinister sites when needed and saves your battery." "$PLIST" || \
             plutil -replace NSMotionUsageDescription -string "The Dread Directory uses motion sensors to efficiently detect when you're moving, so it only checks for nearby sinister sites when needed and saves your battery." "$PLIST"
           plutil -insert UIBackgroundModes -array "$PLIST" 2>/dev/null || true
