@@ -7334,40 +7334,14 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
           {photoPreview ? (
             <div style={S.igPickPreviewWrap}>
               {isVideoPick ? (
-                // Don't render the picked video inline — WKWebView can
-                // crash decoding HEVC/HDR .mov files straight off the
-                // iOS camera roll. Show a static placeholder card with
-                // the file size so the user knows it's selected and
-                // confirms the pick visually. The actual upload still
-                // uses the picked File object; only the preview is
-                // suppressed.
-                <div
-                  style={{
-                    ...S.igPickPreviewImg,
-                    display: 'flex',
-                    flexDirection: 'column' as const,
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    backgroundColor: '#111',
-                    color: '#F0EBE0',
-                    gap: 10,
-                    padding: 20,
-                    boxSizing: 'border-box' as const,
-                  }}
-                >
-                  <svg width="56" height="56" viewBox="0 0 24 24" fill="none" stroke="#888" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                    <polygon points="23 7 16 12 23 17 23 7" />
-                    <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
-                  </svg>
-                  <div style={{ fontSize: 15, fontWeight: 600, fontFamily: 'system-ui, -apple-system, sans-serif' }}>
-                    Video selected
-                  </div>
-                  {photoFile && (
-                    <div style={{ fontSize: 13, color: '#888', fontFamily: 'system-ui, -apple-system, sans-serif' }}>
-                      {Math.round(photoFile.size / 1024 / 1024 * 10) / 10} MB
-                    </div>
-                  )}
-                </div>
+                <video
+                  src={photoPreview}
+                  style={S.igPickPreviewImg}
+                  muted
+                  autoPlay
+                  playsInline
+                  loop
+                />
               ) : (
                 <img src={photoPreview} alt="" style={S.igPickPreviewImg} />
               )}
@@ -7453,36 +7427,20 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
           </div>
 
           {/* Smaller centered preview + caption field below. For video
-              posts the preview is a static placeholder card (NOT a live
-              <video>) — WKWebView crashes decoding fresh-from-camera
-              .mov files. The actual upload still uses the picked File
-              object; only the inline preview is suppressed. */}
+              posts the preview is a muted, looping <video> so the user
+              sees what they're about to share. */}
           <div style={S.igCaptionBody}>
             <div style={S.igCaptionPreviewRow}>
               {editedPreview && (
                 isVideoPick ? (
-                  <div
-                    style={{
-                      ...S.igCaptionPreviewImg,
-                      display: 'flex',
-                      flexDirection: 'column' as const,
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                      backgroundColor: '#111',
-                      color: '#F0EBE0',
-                      gap: 4,
-                      padding: 8,
-                      boxSizing: 'border-box' as const,
-                    }}
-                  >
-                    <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#888" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                      <polygon points="23 7 16 12 23 17 23 7" />
-                      <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
-                    </svg>
-                    <div style={{ fontSize: 10, fontWeight: 600, fontFamily: 'system-ui, -apple-system, sans-serif', textAlign: 'center' as const }}>
-                      Video
-                    </div>
-                  </div>
+                  <video
+                    src={editedPreview}
+                    style={S.igCaptionPreviewImg}
+                    muted
+                    autoPlay
+                    playsInline
+                    loop
+                  />
                 ) : (
                   <img src={editedPreview} alt="" style={S.igCaptionPreviewImg} />
                 )
