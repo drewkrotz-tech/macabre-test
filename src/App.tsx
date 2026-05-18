@@ -1,6 +1,7 @@
 // @ts-ignore — Vite handles .ttf imports as URL strings
 declare module '*.ttf' { const url: string; export default url; }
 declare module '*.png' { const url: string; export default url; }
+declare module '*.svg' { const url: string; export default url; }
 
 import { forwardRef, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
@@ -12,6 +13,7 @@ import {
   setSites,
 } from './geofencing';
 import LivingHellFontUrl from './assets/Living Hell.ttf';
+import PunkFontUrl from './assets/punk.ttf';
 import SlideMountUrl from './assets/slide-mount.png';
 // Custom bottom-bar icons (rounded-square iOS-style app icons) for the
 // home page bar — replace the prior text labels + "More" dropdown.
@@ -21,6 +23,18 @@ import leaderIconUrl from './assets/leader.png';
 import aboutIconUrl from './assets/about.png';
 import locationIconUrl from './assets/location.png';
 
+// Resolve a server-returned avatarUrl string into a renderable URL.
+// Two shapes the server may return:
+//   - null / undefined: caller falls back to default (exposureIconUrl)
+//   - 'https://...':    custom upload from R2 — returned as-is
+// We previously also supported 'library:<id>' for bundled SVG library
+// avatars, but Drew killed that path — uploads only.
+function resolveAvatarUrl(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  if (raw.startsWith('http')) return raw;
+  return null;
+}
+
 // Register the Living Hell font face once at module load.
 if (typeof document !== 'undefined' && !document.getElementById('__livinghell-fontface')) {
   const style = document.createElement('style');
@@ -28,10 +42,77 @@ if (typeof document !== 'undefined' && !document.getElementById('__livinghell-fo
   style.textContent = `@font-face { font-family: 'LivingHell'; src: url('${LivingHellFontUrl}') format('truetype'); font-display: block; }`;
   document.head.appendChild(style);
 }
+
+// Register the punk ransom-note font ("Hit me, punk! 01"). Used as the
+// brand title font in the eXposure header. The internal font family name
+// inside the .ttf is "Hit me, punk! 01" — we keep that exact string here
+// and reference it in fontFamily declarations below.
+if (typeof document !== 'undefined' && !document.getElementById('__punk-fontface')) {
+  const style = document.createElement('style');
+  style.id = '__punk-fontface';
+  style.textContent = `@font-face { font-family: 'Hit me, punk! 01'; src: url('${PunkFontUrl}') format('truetype'); font-display: block; }`;
+  document.head.appendChild(style);
+}
 import { SINISTER_SITES as FALLBACK_SITES, SinisterSite } from './locations';
 
 // ---------- Production server URL ----------
 const API_BASE = 'https://dread.sinistertrivia.com';
+
+// ---------- Native: Sign in with Apple ----------
+// Wrapper around @capacitor-community/apple-sign-in. Dynamically imported
+// so a web/desktop preview where the plugin isn't installed doesn't crash
+// on module load — on iOS the plugin resolves and the native sheet opens.
+// On non-iOS or when the plugin isn't available, returns { ok: false }.
+//
+// Returns the raw Apple identityToken on success — we hand it to
+// /handles/sign-in-apple which verifies it against Apple's JWKS and
+// extracts the stable user id + email.
+async function nativeSignInWithApple(): Promise<
+  | { ok: true; identityToken: string; email: string | null; user: string }
+  | { ok: false; reason: string; cancelled?: boolean }
+> {
+  try {
+    const mod: any = await import('@capacitor-community/apple-sign-in').catch(() => null);
+    if (!mod || !mod.SignInWithApple) {
+      return { ok: false, reason: 'Sign in with Apple is only available on iOS' };
+    }
+    const options = {
+      clientId: 'com.sinistertrivia.macabretest',
+      // We only request what we need. Apple requires the scopes match
+      // what's configured in the App ID capability.
+      scopes: 'email name',
+      // redirectURI / state / nonce are only required for the web
+      // variant; the native plugin handles them internally.
+      redirectURI: '',
+      state: '',
+      nonce: '',
+    };
+    const result = await mod.SignInWithApple.authorize(options);
+    // result.response shape (per plugin docs):
+    //   { user, email?, givenName?, familyName?, identityToken, authorizationCode }
+    // Apple only returns email + name on FIRST sign-in for a given Apple ID
+    // per app. Subsequent sign-ins from the same Apple ID only give us
+    // user + identityToken. The server-side JWT verification can still
+    // extract email from the identityToken payload, so we don't need
+    // the top-level email field to be populated.
+    const r = result && result.response ? result.response : null;
+    if (!r || !r.identityToken || !r.user) {
+      return { ok: false, reason: 'Apple did not return a valid token' };
+    }
+    return {
+      ok: true,
+      identityToken: r.identityToken,
+      email: typeof r.email === 'string' ? r.email : null,
+      user: r.user,
+    };
+  } catch (err: any) {
+    // The plugin throws on user cancellation. The exact error shape varies
+    // by iOS version; check for common cancel signals.
+    const msg = err && err.message ? String(err.message) : 'Apple Sign In failed';
+    const cancelled = /cancel|user canceled|1001/i.test(msg);
+    return { ok: false, reason: msg, cancelled };
+  }
+}
 
 // ---------- Device identity (handle system) ----------
 // Auto-generated stable id stored on first launch. Used to prove ownership of
@@ -97,34 +178,422 @@ async function apiCheckHandle(handle: string): Promise<HandleCheckResult> {
   } catch { return { available: false, reason: 'network error' }; }
 }
 
-async function apiClaimHandle(handle: string, deviceId: string): Promise<HandleClaimResult> {
+async function apiClaimHandle(
+  handle: string,
+  deviceId: string,
+  opts?: { appleUserId?: string; appleEmail?: string }
+): Promise<HandleClaimResult> {
   try {
+    const body: any = { handle, deviceId };
+    if (opts?.appleUserId) body.appleUserId = opts.appleUserId;
+    if (opts?.appleEmail) body.appleEmail = opts.appleEmail;
     const res = await fetch(`${API_BASE}/handles/claim`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ handle, deviceId }),
+      body: JSON.stringify(body),
     });
     return await res.json();
   } catch { return { ok: false, reason: 'network error' }; }
 }
 
-async function apiGetMyHandle(deviceId: string): Promise<string | null> {
+// ---- Avatar APIs ----
+// Upload a custom avatar photo. Server resizes to 256x256 JPEG, strips
+// EXIF, stores at avatars/{lowerHandle}.jpg in R2. Returns the new
+// avatarUrl with a cache-busting query param so the UI refreshes.
+async function apiUploadAvatar(args: { handle: string; deviceId: string; photo: File | Blob }):
+  Promise<{ ok: boolean; avatarUrl?: string | null; reason?: string }> {
   try {
-    const res = await fetch(`${API_BASE}/handles/me?deviceId=${encodeURIComponent(deviceId)}`);
+    const fd = new FormData();
+    fd.append('handle', args.handle);
+    fd.append('deviceId', args.deviceId);
+    fd.append('photo', args.photo);
+    const res = await fetch(`${API_BASE}/handles/avatar/upload`, {
+      method: 'POST',
+      body: fd,
+    });
+    return await res.json();
+  } catch { return { ok: false, reason: 'network error' }; }
+}
+
+// Revert to the default placeholder. Server deletes the prior custom
+// upload from R2 (best-effort) and clears the avatar field.
+async function apiRemoveAvatar(args: { handle: string; deviceId: string }):
+  Promise<{ ok: boolean; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/handles/avatar/remove`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    return await res.json();
+  } catch { return { ok: false, reason: 'network error' }; }
+}
+
+// Fetch one handle's current avatar URL. Used when the post/comment/etc
+// payload didn't carry the avatar (older records, comments not yet
+// enriched server-side). Returns null if the handle has no custom avatar.
+async function apiGetAvatar(handle: string): Promise<string | null> {
+  try {
+    const res = await fetch(`${API_BASE}/handles/avatar/${encodeURIComponent(handle)}`);
+    if (!res.ok) return null;
     const data = await res.json();
-    return data?.handle || null;
+    return (data && typeof data.avatarUrl === 'string') ? data.avatarUrl : null;
   } catch { return null; }
 }
 
-// ---------- Visit-claim API ----------
-// POST /visits — server checks (handle, deviceId) ownership, verifies the
-// reported lat/lng is within 100m of the site's coords, dedupes (one visit
-// per handle per site), and records to visits.json. Returns:
-//   { ok: true }                       on a fresh claim
-//   { ok: true, alreadyClaimed: true } if the user previously claimed this site
-//   { ok: false, code, ... }           otherwise (too_far, unknown_site, etc.)
+// ---- Profile (displayName / bio / link) ----
+type ProfileFields = {
+  handle: string;
+  displayName: string;
+  bio: string;
+  link: string;
+  avatarUrl: string | null;
+};
+
+async function apiGetProfile(handle: string): Promise<ProfileFields | null> {
+  try {
+    const res = await fetch(`${API_BASE}/handles/profile/${encodeURIComponent(handle)}`);
+    if (!res.ok) return null;
+    return await res.json();
+  } catch { return null; }
+}
+
+async function apiUpdateProfile(args: {
+  handle: string;
+  deviceId: string;
+  displayName?: string;
+  bio?: string;
+  link?: string;
+}): Promise<{ ok: boolean; reason?: string; profile?: ProfileFields }> {
+  try {
+    const res = await fetch(`${API_BASE}/handles/profile/update`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    return await res.json();
+  } catch { return { ok: false, reason: 'network error' }; }
+}
+
+// ---- Email-path account creation (verified at claim time) ----
+// Two-step: start sends a 6-digit code to email, finish verifies and
+// atomically creates the handle. The server requires the same deviceId
+// for both calls.
+async function apiStartEmailClaim(args: { handle: string; email: string; deviceId: string }):
+  Promise<{ ok: boolean; reason?: string; existingHandle?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/handles/start-email-claim`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    return await res.json();
+  } catch (e: any) { return { ok: false, reason: e?.message || 'network error' }; }
+}
+
+async function apiFinishEmailClaim(args: { handle: string; code: string; deviceId: string }):
+  Promise<HandleClaimResult> {
+  try {
+    const res = await fetch(`${API_BASE}/handles/finish-email-claim`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    return await res.json();
+  } catch (e: any) { return { ok: false, reason: e?.message || 'network error' }; }
+}
+
+async function apiGetMyHandle(deviceId: string): Promise<{ handle: string | null; hasEmail: boolean; hasApple: boolean }> {
+  try {
+    const res = await fetch(`${API_BASE}/handles/me?deviceId=${encodeURIComponent(deviceId)}`);
+    const data = await res.json();
+    return {
+      handle: data?.handle || null,
+      hasEmail: !!data?.hasEmail,
+      hasApple: !!data?.hasApple,
+    };
+  } catch { return { handle: null, hasEmail: false, hasApple: false }; }
+}
+
+// ---------- Account management API ----------
+// All the endpoints added in Batch 1: account deletion, email recovery,
+// Apple Sign In, content reporting, user blocking.
+
+async function apiSignInApple(args: { identityToken: string; deviceId: string }):
+  Promise<{ ok: boolean; handle: string | null; appleUserId?: string; appleEmail?: string | null; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/handles/sign-in-apple`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    return await res.json();
+  } catch (e: any) { return { ok: false, handle: null, reason: e?.message || 'network error' }; }
+}
+
+// Link an Apple ID to an existing handle. Used by the migration modal —
+// the regular sign-in-apple flow assumes "log me in by Apple ID", but
+// grandfathered users need "attach Apple ID to the handle I'm currently
+// in." Verifies ownership AND the Apple JWT.
+async function apiLinkApple(args: { handle: string; deviceId: string; identityToken: string }):
+  Promise<{ ok: boolean; handle?: string; reason?: string; existingHandle?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/handles/link-apple`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    return await res.json();
+  } catch (e: any) { return { ok: false, reason: e?.message || 'network error' }; }
+}
+
+async function apiAddEmail(args: { handle: string; deviceId: string; email: string }): Promise<{ ok: boolean; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/handles/add-email`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    return await res.json();
+  } catch (e: any) { return { ok: false, reason: e?.message || 'network error' }; }
+}
+
+async function apiVerifyEmail(args: { handle: string; deviceId: string; code: string }): Promise<{ ok: boolean; email?: string; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/handles/verify-email`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    return await res.json();
+  } catch (e: any) { return { ok: false, reason: e?.message || 'network error' }; }
+}
+
+async function apiRequestRecovery(handle: string): Promise<{ ok: boolean; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/handles/request-recovery`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ handle }),
+    });
+    return await res.json();
+  } catch (e: any) { return { ok: false, reason: e?.message || 'network error' }; }
+}
+
+async function apiRecover(args: { handle: string; code: string; newDeviceId: string }):
+  Promise<{ ok: boolean; handle?: string; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/handles/recover`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    return await res.json();
+  } catch (e: any) { return { ok: false, reason: e?.message || 'network error' }; }
+}
+
+async function apiDeleteAccount(args: { handle: string; deviceId: string }): Promise<{ ok: boolean; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/handles/delete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    return await res.json();
+  } catch (e: any) { return { ok: false, reason: e?.message || 'network error' }; }
+}
+
+// ---- Reports ----
+type ReportReason = 'spam' | 'harassment' | 'hate' | 'violence' | 'sexual' | 'illegal' | 'off-topic' | 'other';
+
+async function apiReport(args: { type: 'post' | 'comment'; targetId: string; reason: ReportReason; note?: string; handle: string; deviceId: string }):
+  Promise<{ ok: boolean; alreadyReported?: boolean; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/reports`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    const data = await res.json();
+    if (!res.ok) return { ok: false, reason: data?.error || `HTTP ${res.status}` };
+    return { ok: true, alreadyReported: !!data?.alreadyReported };
+  } catch (e: any) { return { ok: false, reason: e?.message || 'network error' }; }
+}
+
+// ---- Blocks ----
+async function apiBlock(args: { blocker: string; blocked: string; deviceId: string }): Promise<{ ok: boolean; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/blocks/block`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    const data = await res.json();
+    if (!res.ok) return { ok: false, reason: data?.error || `HTTP ${res.status}` };
+    return { ok: true };
+  } catch (e: any) { return { ok: false, reason: e?.message || 'network error' }; }
+}
+
+async function apiUnblock(args: { blocker: string; blocked: string; deviceId: string }): Promise<{ ok: boolean; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/blocks/unblock`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    const data = await res.json();
+    if (!res.ok) return { ok: false, reason: data?.error || `HTTP ${res.status}` };
+    return { ok: true };
+  } catch (e: any) { return { ok: false, reason: e?.message || 'network error' }; }
+}
+
+async function apiBlockedList(handle: string): Promise<{ handle: string; createdAt: string }[]> {
+  try {
+    const res = await fetch(`${API_BASE}/blocks/list/${encodeURIComponent(handle)}`);
+    const data = await res.json();
+    return Array.isArray(data?.blocked) ? data.blocked : [];
+  } catch { return []; }
+}
+
+// ---- Hidden set (blocked handles) ----
+// Module-level cache of the viewer's blocked list, used to filter feeds
+// and comments client-side without round-tripping per-render. Reloaded
+// when the viewer changes handles or after a block/unblock action.
+// Holding lowercase handles for case-insensitive matching.
+let _hiddenSetCache: { viewer: string | null; set: Set<string>; loadedAt: number } = {
+  viewer: null,
+  set: new Set(),
+  loadedAt: 0,
+};
+const HIDDEN_SET_TTL_MS = 60 * 1000; // 1 minute — short enough to feel live after a block
+
+async function getHiddenSet(viewer: string | null): Promise<Set<string>> {
+  if (!viewer) return new Set();
+  const lower = viewer.toLowerCase();
+  const fresh = _hiddenSetCache.viewer === lower &&
+                (Date.now() - _hiddenSetCache.loadedAt) < HIDDEN_SET_TTL_MS;
+  if (fresh) return _hiddenSetCache.set;
+  const list = await apiBlockedList(viewer);
+  const set = new Set(list.map((b) => (b.handle || '').toLowerCase()));
+  _hiddenSetCache = { viewer: lower, set, loadedAt: Date.now() };
+  return set;
+}
+
+// Invalidate the cache — call after every successful block/unblock so the
+// next feed render reflects the change without waiting for the TTL.
+function invalidateHiddenSet() {
+  _hiddenSetCache = { viewer: null, set: new Set(), loadedAt: 0 };
+}
+
+// ---- Hidden posts (client-side only) ----
+// Personal "I don't want to see this again" hides, distinct from
+// block-handle (which hides ALL of a user's content). Stored locally
+// via readPersistent/writePersistent (Capacitor Preferences on native,
+// localStorage on web) and never sent to the server — the user's hides
+// are their own business and don't affect other viewers. Reinstall =
+// wipe. That's acceptable.
+const HIDDEN_POSTS_KEY = 'sinister.hiddenPosts.v1';
+let _hiddenPostsCache: Set<string> | null = null;
+
+async function loadHiddenPosts(): Promise<Set<string>> {
+  if (_hiddenPostsCache) return _hiddenPostsCache;
+  try {
+    const value = await readPersistent(HIDDEN_POSTS_KEY);
+    const arr = value ? JSON.parse(value) : [];
+    _hiddenPostsCache = new Set(Array.isArray(arr) ? arr : []);
+  } catch {
+    _hiddenPostsCache = new Set();
+  }
+  return _hiddenPostsCache;
+}
+
+async function hidePost(postId: string): Promise<void> {
+  const set = await loadHiddenPosts();
+  set.add(postId);
+  try {
+    await writePersistent(HIDDEN_POSTS_KEY, JSON.stringify([...set]));
+  } catch {
+    // Best effort — set is still updated in memory.
+  }
+}
+
+// Delete one of your own posts from the server. Server verifies handle
+// ownership AND that the post was actually authored by you.
+async function apiDeleteMyPost(args: { postId: string; handle: string; deviceId: string }):
+  Promise<{ ok: boolean; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/posts/delete-mine/${encodeURIComponent(args.postId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ handle: args.handle, deviceId: args.deviceId }),
+    });
+    if (!res.ok) return { ok: false, reason: `http ${res.status}` };
+    return await res.json();
+  } catch { return { ok: false, reason: 'network error' }; }
+}
+
+// ---- Notifications ----
+type NotificationItem = {
+  id: string;
+  type: 'liked_post' | 'followed' | 'commented';
+  actor: string;
+  actorAvatarUrl: string | null;
+  postId: string | null;
+  postThumbUrl: string | null;
+  commentSnippet?: string;
+  createdAt: string;
+  unread: boolean;
+};
+
+type NotificationListResp = {
+  handle: string;
+  count: number;
+  unreadCount: number;
+  lastReadAt: string | null;
+  notifications: NotificationItem[];
+};
+
+async function apiFetchNotifications(handle: string): Promise<NotificationListResp | null> {
+  try {
+    const res = await fetch(`${API_BASE}/notifications/${encodeURIComponent(handle)}`);
+    if (!res.ok) return null;
+    return await res.json();
+  } catch { return null; }
+}
+
+async function apiFetchUnreadCount(handle: string): Promise<number> {
+  try {
+    const res = await fetch(`${API_BASE}/notifications/count/${encodeURIComponent(handle)}`);
+    if (!res.ok) return 0;
+    const data = await res.json();
+    return typeof data.unreadCount === 'number' ? data.unreadCount : 0;
+  } catch { return 0; }
+}
+
+async function apiMarkNotificationsRead(args: { handle: string; deviceId: string }):
+  Promise<{ ok: boolean }> {
+  try {
+    const res = await fetch(`${API_BASE}/notifications/mark-read`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    if (!res.ok) return { ok: false };
+    return await res.json();
+  } catch { return { ok: false }; }
+}
+
+// ---------- Guestbook / visit-claim API ----------
+// POST /visits — "signing the guestbook" at a site. Server checks
+// (handle, deviceId) ownership, verifies the reported lat/lng is within
+// 100m of the site's coords, dedupes (one signature per handle per site),
+// and records to visits.json. Optionally accepts a short inscription
+// (up to 30 chars). Returns:
+//   { ok: true, signingRank, isKeeper, inscription }     on a fresh signing
+//   { ok: true, alreadyClaimed: true, ... }              if already signed
+//   { ok: false, code, ... }                             on failure
 type VisitClaimResult =
-  | { ok: true; alreadyClaimed?: boolean }
+  | { ok: true; alreadyClaimed?: boolean; signingRank?: number | null; isKeeper?: boolean; inscription?: string }
   | { ok: false; code: string; distance?: number; message?: string };
 
 async function apiClaimVisit(args: {
@@ -133,6 +602,7 @@ async function apiClaimVisit(args: {
   siteId: string;
   lat: number;
   lng: number;
+  inscription?: string;
 }): Promise<VisitClaimResult> {
   try {
     const res = await fetch(`${API_BASE}/visits`, {
@@ -143,15 +613,45 @@ async function apiClaimVisit(args: {
     const data = await res.json().catch(() => ({}));
     // 409 == already claimed; the server treats this as idempotent and so do we.
     if (res.status === 409 || data?.code === 'already_claimed') {
-      return { ok: true, alreadyClaimed: true };
+      return {
+        ok: true,
+        alreadyClaimed: true,
+        signingRank: data?.signingRank ?? null,
+        isKeeper: !!data?.isKeeper,
+        inscription: data?.inscription || '',
+      };
     }
     if (!res.ok) {
       return { ok: false, code: data?.code || `http_${res.status}`, distance: data?.distance, message: data?.error };
     }
-    return { ok: true };
+    return {
+      ok: true,
+      alreadyClaimed: !!data?.alreadyClaimed,
+      signingRank: data?.signingRank ?? null,
+      isKeeper: !!data?.isKeeper,
+      inscription: data?.inscription || '',
+    };
   } catch (err: any) {
     return { ok: false, code: 'network', message: err?.message || 'Network error' };
   }
+}
+
+// GET /guestbook/:siteId — read the guestbook for a site. Returns an
+// ordered list of signatures (rank 1 = Keeper, pinned at top). Public —
+// anyone in the app can read it.
+type GuestbookSignature = {
+  handle: string;
+  inscription: string;
+  signedAt: string;
+  signingRank: number | null;
+};
+async function apiGetGuestbook(siteId: string): Promise<GuestbookSignature[]> {
+  try {
+    const res = await fetch(`${API_BASE}/guestbook/${encodeURIComponent(siteId)}`);
+    if (!res.ok) return [];
+    const data = await res.json();
+    return Array.isArray(data?.signatures) ? data.signatures : [];
+  } catch { return []; }
 }
 
 // Returns the set of siteIds the handle has visited. Used at app startup
@@ -227,10 +727,59 @@ type SocialPost = {
   siteTitle: string | null;
   siteCategory: string | null;
   handle: string;
+  // Server returns the post author's current avatar — either null
+  // (default placeholder), 'library:<id>' (bundled SVG), or a full
+  // R2 URL (custom upload). Resolved via resolveAvatarUrl() before
+  // passing to <img src>.
+  avatarUrl?: string | null;
   caption: string;
   photoUrl: string;
+  // v1.12 carousel posts: array of 1..N photo URLs. The post card uses
+  // this when present; falls back to single photoUrl on older API
+  // responses or single-photo posts.
+  photoUrls?: string[];
+  // v1.13: parallel to photoUrls, identifying which slots are videos.
+  // Defaults to all 'photo' for pre-v1.13 posts.
+  mediaTypes?: Array<'photo' | 'video'>;
+  // v1.14: hashtags extracted from caption at write time, lowercased
+  // and deduped. Older posts have no value (treated as empty array).
+  hashtags?: string[];
   createdAt: string;
   approvedAt: string;
+  likeCount: number;
+  // Cached comment count — server denormalizes this onto the post so
+  // the feed can render the count without joining comments.json. Server
+  // may omit it on older records, so the post card defaults to 0.
+  commentCount?: number;
+  // Cached repost count — like commentCount, denormalized on the post
+  // so the feed render doesn't have to join reposts.json.
+  repostCount?: number;
+  // When this feed entry is a REPOST rather than an original post, the
+  // server stamps these. repostedBy is the handle of the user who
+  // reposted; repostedAt is when. Null/undefined on original entries.
+  // Used by the card to render the "Reposted by X" header above the
+  // post content.
+  repostedBy?: string | null;
+  repostedAt?: string | null;
+  // Up to 2 most-recent top-level approved comments, embedded by the
+  // /posts/feed handler so the feed card can render IG-style inline
+  // preview rows ("@handle their comment text") without N+1 follow-up
+  // requests. Older API responses won't include this field; the card
+  // defaults to an empty array in that case.
+  latestComments?: Array<{ id: string; handle: string; body: string; createdAt: string }>;
+};
+
+// One comment on a post. Returned by GET /comments/post/:postId.
+// parentId carries IG-style reply structure: null for top-level
+// comments, set to the root top-level comment id for replies. Replies
+// are always one level deep (server flattens reply-to-reply chains).
+type SocialComment = {
+  id: string;
+  postId: string;
+  parentId?: string | null;
+  handle: string;
+  body: string;
+  createdAt: string;
   likeCount: number;
 };
 
@@ -251,12 +800,109 @@ async function apiFetchFeed(args: { limit?: number; before?: string | null }): P
   } catch { return { posts: [], nextBefore: null }; }
 }
 
+// Following-only feed — posts by handles the given user follows. Mirrors
+// the shape of apiFetchFeed so the SocialView can swap between "All" and
+// "Following" without touching its render code.
+async function apiFetchFollowingFeed(args: { handle: string; limit?: number; before?: string | null }): Promise<FeedPage> {
+  try {
+    const params = new URLSearchParams();
+    if (args.limit) params.set('limit', String(args.limit));
+    if (args.before) params.set('before', args.before);
+    const qs = params.toString();
+    const url = `${API_BASE}/follows/feed/${encodeURIComponent(args.handle)}${qs ? `?${qs}` : ''}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    return {
+      posts: Array.isArray(data?.posts) ? data.posts : [],
+      nextBefore: data?.nextBefore || null,
+    };
+  } catch { return { posts: [], nextBefore: null }; }
+}
+
+// ---- Follow API ----
+// All follow endpoints live in the dedicated server module follows.js.
+// Asymmetric public follows (no approval flow). All actions return
+// optimistically; client treats network failure as transient and reverts.
+
+type FollowStatus = { followedByYou: boolean; followerCount: number; followingCount: number };
+
+async function apiFollowStatus(args: { target: string; handle: string | null }): Promise<FollowStatus> {
+  try {
+    const qs = args.handle ? `?handle=${encodeURIComponent(args.handle)}` : '';
+    const res = await fetch(`${API_BASE}/follows/status/${encodeURIComponent(args.target)}${qs}`);
+    const data = await res.json();
+    return {
+      followedByYou: !!data?.followedByYou,
+      followerCount: typeof data?.followerCount === 'number' ? data.followerCount : 0,
+      followingCount: typeof data?.followingCount === 'number' ? data.followingCount : 0,
+    };
+  } catch {
+    return { followedByYou: false, followerCount: 0, followingCount: 0 };
+  }
+}
+
+async function apiFollow(args: { follower: string; target: string; deviceId: string }): Promise<{ ok: boolean; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/follows/follow`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    const data = await res.json();
+    if (!res.ok) return { ok: false, reason: data?.error || `HTTP ${res.status}` };
+    return { ok: true };
+  } catch (e: any) { return { ok: false, reason: e?.message || 'network error' }; }
+}
+
+async function apiUnfollow(args: { follower: string; target: string; deviceId: string }): Promise<{ ok: boolean; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/follows/unfollow`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    const data = await res.json();
+    if (!res.ok) return { ok: false, reason: data?.error || `HTTP ${res.status}` };
+    return { ok: true };
+  } catch (e: any) { return { ok: false, reason: e?.message || 'network error' }; }
+}
+
+type HandleEntry = { handle: string; followedAt: string };
+
+async function apiFollowers(handle: string): Promise<HandleEntry[]> {
+  try {
+    const res = await fetch(`${API_BASE}/follows/followers/${encodeURIComponent(handle)}`);
+    const data = await res.json();
+    return Array.isArray(data?.followers) ? data.followers : [];
+  } catch { return []; }
+}
+
+async function apiFollowing(handle: string): Promise<HandleEntry[]> {
+  try {
+    const res = await fetch(`${API_BASE}/follows/following/${encodeURIComponent(handle)}`);
+    const data = await res.json();
+    return Array.isArray(data?.following) ? data.following : [];
+  } catch { return []; }
+}
+
 // Approved posts by one handle (newest first). Powers the IG-style grid
 // on UserProfileView. Server-side filter keeps the client from pulling
 // the full feed and discarding 95% of it.
 async function apiFetchPostsByHandle(handle: string): Promise<SocialPost[]> {
   try {
     const res = await fetch(`${API_BASE}/posts/handle/${encodeURIComponent(handle)}`);
+    const data = await res.json();
+    return Array.isArray(data?.posts) ? data.posts : [];
+  } catch { return []; }
+}
+
+// v1.14: all approved posts tagged with the given hashtag, newest first.
+// Server lowercases the tag before matching, and we trust its filtering
+// — no client-side post-processing needed.
+async function apiFetchPostsByHashtag(tag: string): Promise<SocialPost[]> {
+  try {
+    const cleaned = tag.replace(/^#/, '').toLowerCase();
+    const res = await fetch(`${API_BASE}/posts/hashtag/${encodeURIComponent(cleaned)}`);
     const data = await res.json();
     return Array.isArray(data?.posts) ? data.posts : [];
   } catch { return []; }
@@ -272,6 +918,73 @@ async function apiFetchPost(postId: string): Promise<SocialPost | null> {
     if (!data || !data.id) return null;
     return data as SocialPost;
   } catch { return null; }
+}
+
+// ---- DM API (v1.15) ----
+// 1:1 direct messages. Server stores conversations + messages in
+// dms.js and exposes /dms/* endpoints.
+type DMConversation = {
+  id: string;
+  otherHandle: string;
+  lastMessageAt: string | null;
+  lastMessageText: string | null;
+  lastMessageBy: string | null;
+  createdAt: string;
+  unread: number;
+};
+type DMMessage = {
+  id: string;
+  from: string;       // sender's handle (lowercased)
+  body: string;
+  createdAt: string;
+};
+async function apiSendDM(args: { handle: string; deviceId: string; toHandle: string; body: string }):
+  Promise<{ ok: boolean; conversationId?: string; messageId?: string; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/dms/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    const data = await res.json();
+    if (!res.ok) return { ok: false, reason: data?.error || `HTTP ${res.status}` };
+    return { ok: true, conversationId: data?.conversationId, messageId: data?.messageId };
+  } catch (e: any) {
+    return { ok: false, reason: e?.message || 'network error' };
+  }
+}
+async function apiFetchInbox(handle: string): Promise<DMConversation[]> {
+  try {
+    const res = await fetch(`${API_BASE}/dms/inbox/${encodeURIComponent(handle)}`);
+    const data = await res.json();
+    return Array.isArray(data?.conversations) ? data.conversations : [];
+  } catch { return []; }
+}
+async function apiFetchThread(convId: string, handle: string): Promise<{ otherHandle: string; messages: DMMessage[] }> {
+  try {
+    const res = await fetch(`${API_BASE}/dms/thread/${encodeURIComponent(convId)}?handle=${encodeURIComponent(handle)}`);
+    const data = await res.json();
+    return {
+      otherHandle: data?.otherHandle || '',
+      messages: Array.isArray(data?.messages) ? data.messages : [],
+    };
+  } catch { return { otherHandle: '', messages: [] }; }
+}
+async function apiUnreadDMs(handle: string): Promise<number> {
+  try {
+    const res = await fetch(`${API_BASE}/dms/unread/${encodeURIComponent(handle)}`);
+    const data = await res.json();
+    return typeof data?.count === 'number' ? data.count : 0;
+  } catch { return 0; }
+}
+// Deterministic conv-id between two handles (must match server's
+// conversationIdFor logic exactly so the client can open a thread
+// before the conversation officially "exists").
+function dmConversationId(a: string, b: string): string {
+  const al = a.toLowerCase();
+  const bl = b.toLowerCase();
+  const [lo, hi] = al < bl ? [al, bl] : [bl, al];
+  return `conv_${lo}_${hi}`;
 }
 
 async function apiToggleLike(args: { postId: string; handle: string; deviceId: string }): Promise<{ ok: boolean; liked?: boolean; count?: number; reason?: string }> {
@@ -300,6 +1013,106 @@ async function apiLikeStatus(args: { postId: string; handle: string | null }): P
   } catch { return { liked: false, count: 0 }; }
 }
 
+// ---- Repost API ----
+// Mirrors the like API. POST toggles, GET returns current status. The
+// server prevents reposting your own post and verifies handle ownership.
+
+async function apiToggleRepost(args: { postId: string; handle: string; deviceId: string }): Promise<{ ok: boolean; reposted?: boolean; count?: number; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/posts/repost/${encodeURIComponent(args.postId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ handle: args.handle, deviceId: args.deviceId }),
+    });
+    const data = await res.json();
+    if (!res.ok) return { ok: false, reason: data?.error || `HTTP ${res.status}` };
+    return { ok: true, reposted: !!data?.reposted, count: typeof data?.count === 'number' ? data.count : undefined };
+  } catch (e: any) {
+    return { ok: false, reason: e?.message || 'network error' };
+  }
+}
+
+async function apiRepostStatus(args: { postId: string; handle: string | null }): Promise<{ reposted: boolean; count: number }> {
+  try {
+    const url = args.handle
+      ? `${API_BASE}/posts/repost-status/${encodeURIComponent(args.postId)}?handle=${encodeURIComponent(args.handle)}`
+      : `${API_BASE}/posts/repost-status/${encodeURIComponent(args.postId)}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    return { reposted: !!data?.reposted, count: typeof data?.count === 'number' ? data.count : 0 };
+  } catch { return { reposted: false, count: 0 }; }
+}
+
+// ---- Comment API ----
+// All comment endpoints live in the dedicated server module comments.js.
+// Auto-approved at creation; flat structure (no nested replies in v1).
+
+// Fetch all approved comments for a post, oldest first.
+async function apiFetchComments(postId: string): Promise<SocialComment[]> {
+  try {
+    const res = await fetch(`${API_BASE}/comments/post/${encodeURIComponent(postId)}`);
+    const data = await res.json();
+    return Array.isArray(data?.comments) ? data.comments : [];
+  } catch { return []; }
+}
+
+// Create a new comment on a post. Server auto-approves and updates the
+// parent post's cached commentCount.
+async function apiCreateComment(args: { postId: string; handle: string; deviceId: string; body: string; parentId?: string | null }): Promise<{ ok: boolean; comment?: SocialComment; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/comments`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    const data = await res.json();
+    if (!res.ok) return { ok: false, reason: data?.error || `HTTP ${res.status}` };
+    return { ok: true, comment: data?.comment };
+  } catch (e: any) {
+    return { ok: false, reason: e?.message || 'network error' };
+  }
+}
+
+// Toggle a heart on a single comment. Mirrors apiToggleLike for posts.
+async function apiToggleCommentLike(args: { commentId: string; handle: string; deviceId: string }): Promise<{ ok: boolean; liked?: boolean; count?: number; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/comments/like/${encodeURIComponent(args.commentId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ handle: args.handle, deviceId: args.deviceId }),
+    });
+    const data = await res.json();
+    if (!res.ok) return { ok: false, reason: data?.error || `HTTP ${res.status}` };
+    return { ok: true, liked: !!data?.liked, count: typeof data?.count === 'number' ? data.count : 0 };
+  } catch (e: any) { return { ok: false, reason: e?.message || 'network error' }; }
+}
+
+// Check whether the current user has liked a comment + the total count.
+async function apiCommentLikeStatus(args: { commentId: string; handle: string | null }): Promise<{ liked: boolean; count: number }> {
+  try {
+    const url = args.handle
+      ? `${API_BASE}/comments/likes/${encodeURIComponent(args.commentId)}?handle=${encodeURIComponent(args.handle)}`
+      : `${API_BASE}/comments/likes/${encodeURIComponent(args.commentId)}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    return { liked: !!data?.liked, count: typeof data?.count === 'number' ? data.count : 0 };
+  } catch { return { liked: false, count: 0 }; }
+}
+
+// Author-delete their own comment.
+async function apiDeleteComment(args: { commentId: string; handle: string; deviceId: string }): Promise<{ ok: boolean; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/comments/delete/${encodeURIComponent(args.commentId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ handle: args.handle, deviceId: args.deviceId }),
+    });
+    const data = await res.json();
+    if (!res.ok) return { ok: false, reason: data?.error || `HTTP ${res.status}` };
+    return { ok: true };
+  } catch (e: any) { return { ok: false, reason: e?.message || 'network error' }; }
+}
+
 // Create a post via multipart/form-data. Photo must be a Blob/File from
 // the camera capture. Server verifies GPS within 100m, queues for admin
 // approval, and records the visit (idempotent — same site = no dup visit).
@@ -308,8 +1121,13 @@ async function apiLikeStatus(args: { postId: string; handle: string | null }): P
 //     Server verifies GPS within 100m, post enters pending review.
 //   - Freeform: pass freeform=true and omit siteId / GPS. Server
 //     auto-approves and the post hits the feed immediately.
+// v1.12: photo is the primary (edited) image. extras is an optional
+// array of unedited additional photos that ride along as carousel slots
+// 2..N. The server stores them in photoR2Keys[] with the primary at
+// index 0.
 async function apiCreatePost(args: {
   photo: Blob;
+  extras?: Blob[];
   handle: string;
   deviceId: string;
   caption: string;
@@ -320,7 +1138,16 @@ async function apiCreatePost(args: {
 }): Promise<{ ok: boolean; postId?: string; reason?: string }> {
   try {
     const fd = new FormData();
-    fd.append('photo', args.photo, 'post.jpg');
+    // Send the primary on BOTH fields — `photo` for backwards-compat
+    // with any legacy server, AND as the first entry in `photos` for
+    // v1.12+ servers that expect the multi-field. Servers running both
+    // schemas dedupe in the normalizeFiles middleware.
+    fd.append('photos', args.photo, 'post-0.jpg');
+    if (args.extras && args.extras.length > 0) {
+      args.extras.forEach((blob, i) => {
+        fd.append('photos', blob, `post-${i + 1}.jpg`);
+      });
+    }
     fd.append('handle', args.handle);
     fd.append('deviceId', args.deviceId);
     fd.append('caption', args.caption);
@@ -335,6 +1162,99 @@ async function apiCreatePost(args: {
     const data = await res.json();
     if (!res.ok) return { ok: false, reason: data?.error || `HTTP ${res.status}` };
     return { ok: true, postId: data?.postId };
+  } catch (e: any) {
+    return { ok: false, reason: e?.message || 'network error' };
+  }
+}
+
+// ---------- Polls API ----------
+// Text-only polls that live in the DreadFeed alongside photo posts. One
+// question + 4 answer options. Users with a handle can vote once and may
+// change their vote until the poll expires (7 days after creation).
+// Results are hidden until the user has voted (IG/Twitter style). After
+// expiry, polls lock read-only with final tallies. Server module: polls.js.
+
+type PollEntry = {
+  id: string;
+  type: 'poll';                 // discriminator so the feed render can branch
+  handle: string;
+  question: string;
+  options: string[];            // always length 4
+  createdAt: string;
+  expiresAt: string;
+  expired: boolean;
+  // null = viewer hasn't voted (or no handle passed). Otherwise the
+  // option index they picked.
+  userVote: number | null;
+  // Only populated when results are visible (viewer has voted OR poll
+  // expired). Otherwise null.
+  tallies: number[] | null;
+  totalVotes: number | null;
+};
+
+type PollFeedPage = { polls: PollEntry[]; nextBefore: string | null };
+
+async function apiFetchPollsFeed(args: { limit?: number; before?: string | null; handle?: string | null }): Promise<PollFeedPage> {
+  try {
+    const params = new URLSearchParams();
+    if (args.limit) params.set('limit', String(args.limit));
+    if (args.before) params.set('before', args.before);
+    if (args.handle) params.set('handle', args.handle);
+    const qs = params.toString();
+    const url = `${API_BASE}/polls/feed${qs ? `?${qs}` : ''}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    return {
+      polls: Array.isArray(data?.polls) ? data.polls : [],
+      nextBefore: data?.nextBefore || null,
+    };
+  } catch { return { polls: [], nextBefore: null }; }
+}
+
+async function apiCreatePoll(args: {
+  handle: string;
+  deviceId: string;
+  question: string;
+  options: string[];
+}): Promise<{ ok: boolean; poll?: PollEntry; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/polls`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        handle: args.handle,
+        deviceId: args.deviceId,
+        question: args.question,
+        options: args.options,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) return { ok: false, reason: data?.error || `HTTP ${res.status}` };
+    return { ok: true, poll: data?.poll };
+  } catch (e: any) {
+    return { ok: false, reason: e?.message || 'network error' };
+  }
+}
+
+async function apiVoteOnPoll(args: {
+  pollId: string;
+  handle: string;
+  deviceId: string;
+  optionIndex: number;
+}): Promise<{ ok: boolean; tallies?: number[]; totalVotes?: number; userVote?: number; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/polls/vote/${encodeURIComponent(args.pollId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        handle: args.handle,
+        deviceId: args.deviceId,
+        optionIndex: args.optionIndex,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) return { ok: false, reason: data?.error || `HTTP ${res.status}` };
+    return { ok: true, tallies: data?.tallies, totalVotes: data?.totalVotes, userVote: data?.userVote };
   } catch (e: any) {
     return { ok: false, reason: e?.message || 'network error' };
   }
@@ -371,7 +1291,7 @@ async function fetchLiveSites(): Promise<SinisterSite[]> {
       state: s.state || 'Unknown',
       coords: s.coords,
       imageUrl: s.photoUrl || s.imageUrl || '',
-      imageCredit: s.submitter ? `@${s.submitter}` : 'Sinister Locations',
+      imageCredit: s.submitter ? `@${s.submitter}` : 'The Dread Directory',
       // Pass-through fields for detail-page submitter credit. Optional —
       // legacy seeded sites may not have them; the detail page handles
       // both cases (shows "Submitted by Sinister" if submitter missing,
@@ -576,6 +1496,121 @@ function playSubDrop() {
     gain.connect(ctx.destination);
     osc.start(now);
     osc.stop(now + 0.25);
+  } catch { /* silent */ }
+}
+
+// ---------- DreadFeed (IG-style) sounds ----------
+// Distinct from the horror app's playSubDrop/playPop — these are bright,
+// short, IG-style UI blips. The DreadFeed mini-app reaches for "social
+// network" feel rather than "sinister" feel, so these sounds skip the
+// low-freq weight and stay in the 600-1500Hz pleasant range with quick
+// envelopes. All three share the same getAudioCtx() singleton so they
+// inherit the iOS resume/unlock pattern.
+
+// haptic — fires a short native haptic tap when available. Order:
+//   1) Capacitor Haptics plugin (native iOS — real haptic engine)
+//   2) navigator.vibrate (older Android browsers)
+//   3) silent no-op (modern iOS Safari, desktop)
+// Wrapped in try/catch and runtime-resolved so we don't take a build
+// dependency on @capacitor/haptics — if the plugin isn't installed yet,
+// we silently fall through. Three intensities matching iOS's
+// UIImpactFeedbackGenerator styles.
+function haptic(style: 'light' | 'medium' | 'heavy' = 'light') {
+  try {
+    const cap = (window as any).Capacitor;
+    const Haptics = cap?.Plugins?.Haptics;
+    if (Haptics && typeof Haptics.impact === 'function') {
+      // Native: matches iOS's UIImpactFeedbackGenerator styles exactly.
+      Haptics.impact({ style: style.toUpperCase() });
+      return;
+    }
+  } catch { /* fall through */ }
+  try {
+    if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
+      const ms = style === 'heavy' ? 18 : style === 'medium' ? 12 : 8;
+      navigator.vibrate(ms);
+    }
+  } catch { /* silent */ }
+}
+
+// playLikeBlip — short "tap" for double-tap-style like reactions. A
+// quick sine pulse at 900Hz, ~70ms total. Bright enough to be felt as
+// positive feedback without being distracting.
+function playLikeBlip() {
+  const ctx = getAudioCtx();
+  if (!ctx) return;
+  try {
+    const now = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(900, now);
+    osc.frequency.exponentialRampToValueAtTime(1200, now + 0.05);
+    gain.gain.setValueAtTime(0, now);
+    gain.gain.linearRampToValueAtTime(0.14, now + 0.005);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.08);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(now);
+    osc.stop(now + 0.1);
+  } catch { /* silent */ }
+}
+
+// playCommentSent — "thwip" send sound for posting a comment. Two
+// stacked oscillators (700Hz + 1100Hz) sweeping up briefly then fading,
+// gives a satisfying "off it goes" feel like IG's send sound.
+function playCommentSent() {
+  const ctx = getAudioCtx();
+  if (!ctx) return;
+  try {
+    const now = ctx.currentTime;
+    const dur = 0.12;
+    const o1 = ctx.createOscillator();
+    const o2 = ctx.createOscillator();
+    const gain = ctx.createGain();
+    o1.type = 'sine';
+    o2.type = 'sine';
+    o1.frequency.setValueAtTime(700, now);
+    o1.frequency.exponentialRampToValueAtTime(1400, now + dur);
+    o2.frequency.setValueAtTime(1100, now);
+    o2.frequency.exponentialRampToValueAtTime(2200, now + dur);
+    gain.gain.setValueAtTime(0, now);
+    gain.gain.linearRampToValueAtTime(0.12, now + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + dur);
+    o1.connect(gain);
+    o2.connect(gain);
+    gain.connect(ctx.destination);
+    o1.start(now);
+    o2.start(now);
+    o1.stop(now + dur + 0.02);
+    o2.stop(now + dur + 0.02);
+  } catch { /* silent */ }
+}
+
+// playPostShared — longer celebratory "shink!" for successfully creating
+// a DreadFeed post. Three-tone arpeggio (600 → 900 → 1200Hz) over
+// ~220ms. Bigger than playLikeBlip / playCommentSent because creating a
+// post is the more significant action.
+function playPostShared() {
+  const ctx = getAudioCtx();
+  if (!ctx) return;
+  try {
+    const now = ctx.currentTime;
+    const notes = [600, 900, 1200];
+    notes.forEach((freq, i) => {
+      const t = now + i * 0.05;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freq, t);
+      gain.gain.setValueAtTime(0, t);
+      gain.gain.linearRampToValueAtTime(0.12, t + 0.01);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.12);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(t);
+      osc.stop(t + 0.14);
+    });
   } catch { /* silent */ }
 }
 
@@ -829,6 +1864,17 @@ let _listLevelMemory: _ListLevelSnapshot | null = null;
 // pop normally."
 let _listSwipeBackHook: (() => boolean) | null = null;
 
+// When non-zero, the global swipe-back touch handler bails on touchstart.
+// Used by full-screen modal flows like the post editor where horizontal
+// swipes are part of the in-screen UI (font picker, filter strip, sticker
+// drawer scroll) and must not pop the nav stack. Reference-counted so
+// nested suppressors don't accidentally re-enable each other.
+let _swipeBackSuppressCount = 0;
+function beginSuppressSwipeBack() { _swipeBackSuppressCount++; }
+function endSuppressSwipeBack() {
+  _swipeBackSuppressCount = Math.max(0, _swipeBackSuppressCount - 1);
+}
+
 // ---------- Toasts ----------
 // Lightweight global toast system. Any component can call showToast(msg)
 // and a small notification slides up from above the bottom bar for ~2.5
@@ -868,6 +1914,7 @@ const TILE_RED = '#FF3B3B';
 import cellCrime      from './assets/cell-crime.jpg';
 import cellHaunting   from './assets/cell-haunting.jpg';
 import cellCult       from './assets/cell-cult.jpg';
+import cellUfo        from './assets/cell-ufo.jpg';
 import cellKiller     from './assets/cell-killer.jpg';
 import cellFilm       from './assets/cell-film.jpg';
 import cellHistorical from './assets/cell-historical.jpg';
@@ -891,26 +1938,32 @@ import backSound from './assets/back.mp3';
 // Submit button). A celebratory cue distinct from the regular click.
 import bellSound from './assets/bell.mp3';
 
-type CategoryKey = 'crime' | 'film' | 'haunting' | 'cult' | 'killer' | 'historical';
-// `hidden: true` removes a category from the home grid and List View
-// top level, but keeps its data intact in sites.json and its filtering
-// machinery (CATEGORY_COLOR, DetailView, etc.) functional. Easy to flip
-// back on later — just drop `hidden`.
+type CategoryKey = 'crime' | 'film' | 'haunting' | 'ufo' | 'killer' | 'historical';
+// `hidden: true` removes a category from the home grid, List View top
+// level, DreadFeed filter chips, and the submission form dropdown.
+// Data stays intact in sites.json and all the per-site machinery
+// (CATEGORY_COLOR, DetailView, etc.) keeps working — so existing sites
+// in hidden categories still render correctly if reached via direct
+// link or admin tools. Easy to flip back on later — just drop `hidden`.
 // For launch we show only: True Crime, Film Locations, Hauntings.
 // Serial Killers are folded into True Crime (see CATEGORY_HOME_MERGE
-// below). Cults and Grave Sites are hidden entirely until we relaunch
-// those categories.
+// below). UFO Sightings and Grave Sites are hidden until relaunch.
 const CATEGORIES: { key: CategoryKey; label: string; gridIndex: number; cascadeOrder: number; borderColor: string; image: string; hidden?: boolean }[] = [
   { key: 'crime',      label: 'True Crime',     gridIndex: 0, cascadeOrder: 0, borderColor: TILE_RED, image: cellCrime      },
   { key: 'film',       label: 'Film Locations', gridIndex: 1, cascadeOrder: 5, borderColor: TILE_RED, image: cellFilm       },
   { key: 'haunting',   label: 'Hauntings',      gridIndex: 2, cascadeOrder: 1, borderColor: WHITE,    image: cellHaunting   },
-  { key: 'cult',       label: 'Cults',          gridIndex: 3, cascadeOrder: 4, borderColor: WHITE,    image: cellCult,        hidden: true },
+  // UFO Sightings replaced Cults in v1.11. Server-side migration runs on
+  // boot to move legacy category='cult' sites to category='crime'. The
+  // tile image is a vintage 1960s UFO Polaroid that lives at
+  // src/assets/cell-ufo.jpg.
+  { key: 'ufo',        label: 'UFO Sightings',  gridIndex: 3, cascadeOrder: 4, borderColor: WHITE,    image: cellUfo,         hidden: true },
   { key: 'killer',     label: 'Serial Killers', gridIndex: 4, cascadeOrder: 2, borderColor: TILE_RED, image: cellKiller,      hidden: true },
   { key: 'historical', label: 'Grave Sites',    gridIndex: 5, cascadeOrder: 3, borderColor: TILE_RED, image: cellHistorical,  hidden: true },
 ];
 
-// Visible category list for the home grid + List View top level. Filters
-// out anything flagged hidden.
+// Visible category list for the home grid, List View top level,
+// DreadFeed filter chips, and submission form dropdown. Filters out
+// anything flagged hidden.
 const VISIBLE_CATEGORIES = CATEGORIES.filter((c) => !c.hidden);
 
 // Home-page merge map: when the user opens True Crime from the home grid
@@ -929,7 +1982,7 @@ const CATEGORY_COLOR: Record<CategoryKey, string> = {
   crime:      '#FF3B3B',
   film:       '#FF9D2E',
   haunting:   '#3FA9FF',
-  cult:       '#34D058',
+  ufo:        '#34D058',
   killer:     '#A45CFF',
   historical: '#FFD93B',
 };
@@ -967,7 +2020,7 @@ const EMBERS: { left: number; size: number; duration: number; delay: number; swa
 //   - Brightness swing: 1.0 -> 1.18 (was 1.35)
 //   - Flicker opacity range tightened 0.78-0.92 (was 0.7-1.0)
 function buildStyleCss() {
-  let css = `@import url('https://fonts.bunny.net/css?family=jolly-lodger:400');\n`;
+  let css = `@import url('https://fonts.bunny.net/css?family=jolly-lodger:400|creepster:400|special-elite:400|permanent-marker:400|oswald:400,700|share-tech-mono:400');\n`;
 
   CATEGORIES.forEach((cat) => {
     const T = cat.cascadeOrder;
@@ -1247,31 +2300,31 @@ function buildStyleCss() {
    - The native iOS overlay scrollbar (this is the thin grey one
      that briefly appears during scroll). It can't be hidden via
      CSS in all iOS versions, but recent versions DO honor
-     scrollbar-width: none on the scrolling element. */
-body[data-view="detail"]::-webkit-scrollbar,
-body[data-view="about"]::-webkit-scrollbar,
-body[data-view="leaders"]::-webkit-scrollbar,
-body[data-view="detail"]::-webkit-scrollbar-thumb,
-body[data-view="about"]::-webkit-scrollbar-thumb,
-body[data-view="leaders"]::-webkit-scrollbar-thumb,
-body[data-view="detail"]::-webkit-scrollbar-track,
-body[data-view="about"]::-webkit-scrollbar-track,
-body[data-view="leaders"]::-webkit-scrollbar-track,
-html[data-view="detail"]::-webkit-scrollbar,
-html[data-view="about"]::-webkit-scrollbar,
-html[data-view="leaders"]::-webkit-scrollbar {
+     scrollbar-width: none on the scrolling element.
+
+   v1.12 globalized this from per-view (detail/about/leaders) to
+   everywhere. The white scrollbar was still showing up on DreadFeed,
+   the home screen, and any other view that wasn't in the enumerated
+   list. There's no view where we WANT to show a scrollbar — they all
+   look cheap on iOS — so the global rule is correct. */
+html::-webkit-scrollbar,
+body::-webkit-scrollbar,
+html::-webkit-scrollbar-thumb,
+body::-webkit-scrollbar-thumb,
+html::-webkit-scrollbar-track,
+body::-webkit-scrollbar-track,
+*::-webkit-scrollbar,
+*::-webkit-scrollbar-thumb,
+*::-webkit-scrollbar-track {
   display: none !important;
   width: 0 !important;
   height: 0 !important;
   -webkit-appearance: none !important;
   background: transparent !important;
 }
-body[data-view="detail"],
-body[data-view="about"],
-body[data-view="leaders"],
-html[data-view="detail"],
-html[data-view="about"],
-html[data-view="leaders"] {
+html,
+body,
+* {
   scrollbar-width: none !important;
   -ms-overflow-style: none !important;
 }
@@ -1503,7 +2556,12 @@ type View =
   | { name: 'list' }
   | { name: 'social' }
   | { name: 'userProfile'; handle: string }
-  | { name: 'post'; postId: string; postList?: string[] };
+  | { name: 'hashtag'; tag: string }
+  | { name: 'dmInbox' }
+  | { name: 'dmThread'; conversationId: string; otherHandle: string }
+  | { name: 'post'; postId: string; postList?: string[]; preloadedPosts?: SocialPost[] }
+  | { name: 'notifications' }
+  | { name: 'settings' };
 
 export default function App() {
   const [view, _setViewRaw] = useState<View>({ name: 'home' });
@@ -1543,6 +2601,15 @@ export default function App() {
         // (from home) still records home below it, so swipe-back from
         // any peer always lands on home.
         const homePeers = new Set(['list', 'social', 'leaders', 'about']);
+        // DreadFeed-context views — every screen that lives "inside"
+        // the DreadFeed mini-app. When the user returns to the social
+        // root (the feed), we strip these off the top of the history
+        // stack so swipe-back from the feed goes straight to whatever
+        // was OUTSIDE DreadFeed (usually home), never back into the
+        // DreadFeed sub-views the user already navigated past.
+        const dreadFeedSubViews = new Set([
+          'social', 'userProfile', 'post', 'badges', 'settings', 'notifications',
+        ]);
         const prevIsPeer = homePeers.has(prev.name);
         const nextIsPeer = homePeers.has(next.name);
         if (opts?.replace) {
@@ -1557,6 +2624,20 @@ export default function App() {
         } else {
           _navHistory.current.push({ view: prev, scrollY: sy });
           if (_navHistory.current.length > 50) _navHistory.current.shift();
+        }
+        // Whenever the destination is the DreadFeed root (social), the
+        // stack should hold only entries from BEFORE the user entered
+        // DreadFeed. Pop any DreadFeed-sub-view entries off the top.
+        // This handles the case where the user navigates social →
+        // userProfile → post, then taps the DreadFeed home tab from
+        // inside a sub-view — we'd otherwise push userProfile onto the
+        // stack and a subsequent swipe-back from social would land on
+        // userProfile instead of home.
+        if (next.name === 'social') {
+          const stack = _navHistory.current;
+          while (stack.length > 0 && dreadFeedSubViews.has(stack[stack.length - 1].view.name)) {
+            stack.pop();
+          }
         }
       }
       return next;
@@ -1575,6 +2656,29 @@ export default function App() {
   // on a re-prompt, never on first ask). Persisted decision in localStorage
   // so we never nag a user who has already accepted or declined.
   const [showAlwaysModal, setShowAlwaysModal] = useState(false);
+  // EULA acceptance — App Store guideline 1.2 + 5.1.1(v) require an EULA
+  // for apps with user-generated content. On first launch (or after a
+  // version bump) we show the modal until the user accepts. localStorage
+  // persists acceptance across launches; bumping EULA_VERSION re-prompts.
+  const [showEula, setShowEula] = useState(() => {
+    try {
+      return localStorage.getItem(EULA_LS_KEY) !== '1';
+    } catch {
+      // Storage unavailable (private mode etc) — show it; better to
+      // re-prompt than to skip the legal gate.
+      return true;
+    }
+  });
+
+  // Email-migration prompt for grandfathered handles. Set true at app
+  // boot when /handles/me reports the user owns a handle but is missing
+  // either an email OR an Apple ID link. The modal blocks dismissal —
+  // they have to add the missing recovery method to continue.
+  const [showMigrateEmail, setShowMigrateEmail] = useState(false);
+  // Snapshot of which recovery methods are already on the account at
+  // boot — used by the modal to hide buttons for methods that exist.
+  const [migrateHasEmail, setMigrateHasEmail] = useState(false);
+  const [migrateHasApple, setMigrateHasApple] = useState(false);
   // Sites are loaded from the server at startup. While the network call is
   // pending, we use the bundled FALLBACK_SITES so the app isn't empty.
   // After the fetch completes, `sites` is replaced with the live data.
@@ -1607,13 +2711,22 @@ export default function App() {
         const id = await getOrCreateDeviceId();
         if (cancelled) return;
         setDeviceId(id);
-        const myHandle = await apiGetMyHandle(id);
+        const me = await apiGetMyHandle(id);
         if (cancelled) return;
-        if (myHandle) {
-          setHandle(myHandle);
+        if (me.handle) {
+          setHandle(me.handle);
+          // Migration prompt fires when EITHER recovery method is missing —
+          // we want every account to have both an email and an Apple ID
+          // for redundant recovery. Apple is preferred (one-tap on next
+          // device), email is the universal fallback.
+          if (!me.hasEmail || !me.hasApple) {
+            setMigrateHasEmail(me.hasEmail);
+            setMigrateHasApple(me.hasApple);
+            setShowMigrateEmail(true);
+          }
           // Load visit history so DetailView can show the visited state
           // immediately without a flash of the unclaimed button.
-          const siteIds = await apiGetMyVisits(myHandle);
+          const siteIds = await apiGetMyVisits(me.handle);
           if (cancelled) return;
           if (siteIds.size) setVisitedSiteIds(siteIds);
         }
@@ -1688,6 +2801,7 @@ export default function App() {
     };
 
     const onStart = (e: TouchEvent) => {
+      if (_swipeBackSuppressCount > 0) return;
       if (!e.touches || e.touches.length !== 1) return;
       const tch = e.touches[0];
       startX = tch.clientX;
@@ -2049,9 +3163,6 @@ export default function App() {
       // v.state -> show every location in the category across all states.
       // The CategoryView search bar lets the user refine by state name,
       // location title, or description.
-      // Honor CATEGORY_HOME_MERGE so True Crime pulls in serial killer
-      // sites here too — keeps the experience consistent with the home
-      // grid and NearbyView.
       const allowed = new Set<CategoryKey>(categoriesForKey(v.category));
       const filtered = v.state
         ? sites.filter(s => allowed.has(s.category as CategoryKey) && s.state === v.state)
@@ -2097,7 +3208,7 @@ export default function App() {
         ),
       };
     } else if (v.name === 'submit') {
-      return { key: 'submit', element: <SubmitView currentLocation={currentLocation} deviceId={deviceId} handle={handle} onHandleClaimed={setHandle} onBack={goHome} /> };
+      return { key: 'submit', element: <SubmitView currentLocation={currentLocation} deviceId={deviceId} handle={handle} onHandleClaimed={setHandle} onBack={goHome} onGoToSocial={goSocial} /> };
     } else if (v.name === 'about') {
       return { key: 'about', element: <AboutView onBack={goHome} /> };
     } else if (v.name === 'leaders') {
@@ -2130,7 +3241,12 @@ export default function App() {
             onSelectSite={goDetail}
             onBack={goHome}
             onSelectHandle={(h) => setView({ name: 'userProfile', handle: h })}
-            onSelectPost={(postId, postList) => setView({ name: 'post', postId, postList })}
+            onSelectHashtag={(tag) => setView({ name: 'hashtag', tag })}
+            onSelectPost={(postId, postList, preloadedPosts) => setView({ name: 'post', postId, postList, preloadedPosts })}
+            onHandleClaimed={setHandle}
+            onSelectSettings={() => setView({ name: 'settings' })}
+            onSelectNotifications={() => setView({ name: 'notifications' })}
+            onSelectInbox={() => setView({ name: 'dmInbox' })}
           />
         ),
       };
@@ -2145,8 +3261,62 @@ export default function App() {
             sites={sites}
             onSelectSite={goDetail}
             onSelectBadges={(h) => setView({ name: 'badges', handle: h })}
-            onSelectPost={(postId, postList) => setView({ name: 'post', postId, postList })}
+            onSelectPost={(postId, postList, preloadedPosts) => setView({ name: 'post', postId, postList, preloadedPosts })}
+            onSelectHandle={(h) => setView({ name: 'userProfile', handle: h })}
+            onSelectDMThread={(conversationId, otherHandle) => setView({ name: 'dmThread', conversationId, otherHandle })}
+            onSelectExposureTab={(tab) => {
+              _exposureSubTabMemory = tab;
+              setView({ name: 'social' });
+            }}
             onBack={goHome}
+          />
+        ),
+      };
+    } else if (v.name === 'hashtag') {
+      return {
+        key: `hashtag:${v.tag}`,
+        element: (
+          <HashtagView
+            tag={v.tag}
+            onSelectPost={(postId, postList, preloadedPosts) => setView({ name: 'post', postId, postList, preloadedPosts })}
+            onBack={goBack}
+          />
+        ),
+      };
+    } else if (v.name === 'dmInbox') {
+      // Inbox requires a claimed handle — anything else returns home.
+      if (!handle || !deviceId) {
+        // Defer the redirect to a useEffect since we're inside render.
+        // For now, render an empty placeholder; AppShell will re-render
+        // when handle becomes available.
+        return { key: 'dmInbox', element: <div /> };
+      }
+      return {
+        key: 'dmInbox',
+        element: (
+          <DMInboxView
+            currentHandle={handle}
+            deviceId={deviceId}
+            onSelectThread={(conversationId, otherHandle) =>
+              setView({ name: 'dmThread', conversationId, otherHandle })
+            }
+            onBack={goBack}
+          />
+        ),
+      };
+    } else if (v.name === 'dmThread') {
+      if (!handle || !deviceId) {
+        return { key: `dmThread:${v.conversationId}`, element: <div /> };
+      }
+      return {
+        key: `dmThread:${v.conversationId}`,
+        element: (
+          <DMThreadView
+            conversationId={v.conversationId}
+            otherHandle={v.otherHandle}
+            currentHandle={handle}
+            deviceId={deviceId}
+            onBack={goBack}
           />
         ),
       };
@@ -2157,13 +3327,67 @@ export default function App() {
           <PostDetailView
             postId={v.postId}
             postList={v.postList}
+            preloadedPosts={v.preloadedPosts}
             currentHandle={handle}
             deviceId={deviceId}
             sites={sites}
             onSelectSite={goDetail}
             onSelectHandle={(h) => setView({ name: 'userProfile', handle: h })}
-            onNavigatePost={(postId, postList) => setView({ name: 'post', postId, postList }, { replace: true })}
+            onSelectHashtag={(tag) => setView({ name: 'hashtag', tag })}
+            onSelectExposureTab={(tab) => {
+              // Tapping a bottom-bar tab from inside post detail jumps
+              // back to eXposure on that sub-tab. Updating the module-
+              // level memory before navigating means SocialView's mount
+              // picks up the right starting tab — no flicker through
+              // 'feed' first.
+              _exposureSubTabMemory = tab;
+              setView({ name: 'social' });
+            }}
             onBack={goHome}
+          />
+        ),
+      };
+    } else if (v.name === 'settings') {
+      return {
+        key: 'settings',
+        element: (
+          <SettingsView
+            handle={handle}
+            deviceId={deviceId}
+            onBack={() => {
+              // Settings is only entered from your own profile, so back
+              // returns there via SocialView with profile sub-tab restored.
+              _exposureSubTabMemory = 'profile';
+              setView({ name: 'social' });
+            }}
+            onSignedOut={() => {
+              // After account deletion the local handle state must clear
+              // so we don't re-render screens with a stale handle.
+              setHandle(null);
+              setView({ name: 'home' });
+            }}
+          />
+        ),
+      };
+    } else if (v.name === 'notifications') {
+      // The bell is only tappable when a handle exists, so handle/deviceId
+      // should be present — but defensively fall back to home if not.
+      if (!handle || !deviceId) {
+        return { key: 'notifications-noauth', element: null };
+      }
+      return {
+        key: 'notifications',
+        element: (
+          <NotificationsView
+            handle={handle}
+            deviceId={deviceId}
+            onSelectHandle={(h) => setView({ name: 'userProfile', handle: h })}
+            onSelectPost={(postId) => setView({ name: 'post', postId })}
+            onBack={() => {
+              // Back returns to DreadFeed feed tab.
+              _exposureSubTabMemory = 'feed';
+              setView({ name: 'social' });
+            }}
           />
         ),
       };
@@ -2364,7 +3588,14 @@ export default function App() {
           DetailView is excluded because the page already has Get Directions
           + Claim Visit as its primary actions; layering the bottom bar on
           top makes the page feel busy and competes with those CTAs. */}
-      {view.name !== 'nearby' && view.name !== 'detail' && view.name !== 'submit' && view.name !== 'social' && (
+      {/* HomeBottomBar appears ONLY on the main home page. Previously it
+          also rendered on home-peer views (list, about, leaders) but that
+          made those pages feel cluttered — the home bar's 4 large icons
+          competed visually with the list/leaders content. Each non-home
+          view has its own back/nav affordances and doesn't need the home
+          bar layered on top. Per-screen IG-style bars (e.g. on DreadFeed)
+          are rendered by those views themselves. */}
+      {view.name === 'home' && (
         <HomeBottomBar
           onSubmit={goSubmit}
           onList={goList}
@@ -2373,6 +3604,31 @@ export default function App() {
         />
       )}
       <ToastHost />
+      {/* First-launch EULA gate — top of the stacking order so it sits
+          above everything else (even other modals). Persisted to
+          localStorage on accept. */}
+      {showEula && (
+        <EulaModal
+          onAccept={() => {
+            try {
+              localStorage.setItem(EULA_LS_KEY, '1');
+            } catch { /* ignore — fine to re-prompt next launch */ }
+            setShowEula(false);
+          }}
+        />
+      )}
+      {/* Grandfathered-handle email migration. Only renders when EULA
+          is already accepted (so we never stack two full-screen gates).
+          Required to dismiss — no Skip button. */}
+      {!showEula && showMigrateEmail && handle && deviceId && (
+        <MigrateEmailModal
+          handle={handle}
+          deviceId={deviceId}
+          hasEmail={migrateHasEmail}
+          hasApple={migrateHasApple}
+          onDone={() => setShowMigrateEmail(false)}
+        />
+      )}
       {showAlwaysModal && (
         <AlwaysLocationModal
           onEnable={async () => {
@@ -2628,7 +3884,7 @@ function HomeBottomBar({ onSubmit, onList, onAbout, onSocial }: {
         className="sinister-icon-btn" style={S.homeBarBtn}
         onClick={() => { playSubDrop(); onList(); }}
       >
-        <img src={listIconUrl} alt="" style={S.homeBarIcon} />
+        <img src={listIconUrl} alt="" style={{ ...S.homeBarIcon, ...S.homeBarIconSmall }} />
         <span style={S.homeBarLabel}>List View</span>
       </button>
       <button
@@ -2636,21 +3892,21 @@ function HomeBottomBar({ onSubmit, onList, onAbout, onSocial }: {
         onClick={() => { playBackSound(); onSocial(); }}
       >
         <img src={exposureIconUrl} alt="" style={S.homeBarIcon} />
-        <span style={S.homeBarLabel}>eXposure</span>
+        <span style={S.homeBarLabel}>DreadFeed</span>
       </button>
       <button
         className="sinister-icon-btn" style={S.homeBarBtn}
         onClick={() => { playSubDrop(); onSubmit(); }}
         aria-label="Submit a Location"
       >
-        <img src={locationIconUrl} alt="" style={S.homeBarIcon} />
+        <img src={locationIconUrl} alt="" style={{ ...S.homeBarIcon, ...S.homeBarIconSmall }} />
         <span style={S.homeBarLabel}>Submit</span>
       </button>
       <button
         className="sinister-icon-btn" style={S.homeBarBtn}
         onClick={() => { playSubDrop(); onAbout(); }}
       >
-        <img src={aboutIconUrl} alt="" style={S.homeBarIcon} />
+        <img src={aboutIconUrl} alt="" style={{ ...S.homeBarIcon, ...S.homeBarIconLarge }} />
         <span style={S.homeBarLabel}>About</span>
       </button>
     </div>
@@ -2680,7 +3936,1402 @@ function HomeBottomBar({ onSubmit, onList, onAbout, onSocial }: {
 type _ExposureSubTab = 'feed' | 'search' | 'post' | 'profile';
 let _exposureSubTabMemory: _ExposureSubTab = 'feed';
 
-function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, onBack, onSelectHandle, onSelectPost }: {
+// Snapshot of SocialView's feed state, preserved across unmounts so
+// navigating from DreadFeed → UserProfileView → swipe-back lands the
+// user on the same post at the same scroll position they were viewing.
+// Without this, each remount kicks off a fresh fetch of page 1 from
+// the server and the user is dumped at the top of the feed — frustrating
+// when they were 30 posts deep.
+//
+// We snapshot ONLY the 'all' feed (not 'following'), because the
+// following filter is cheap enough to recompute and tends to have many
+// fewer posts. Scroll position is window.scrollY since the SocialView
+// uses the document scroll, not an inner overflow container.
+type _SocialFeedSnapshot = {
+  posts: SocialPost[];
+  nextBefore: string | null;
+  scrollY: number;
+  // Wall-clock timestamp when this snapshot was captured. If the user
+  // comes back hours later we discard the snapshot and refetch — a
+  // stale feed is worse than a momentary scroll-to-top.
+  capturedAt: number;
+};
+let _socialFeedMemory: _SocialFeedSnapshot | null = null;
+const SOCIAL_FEED_MEMORY_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+// ---------- Settings View ----------
+// Reached from a gear icon on your own DreadFeed profile. Centralizes
+// the account management surface that App Store guideline 5.1.1(v)
+// requires to be reachable and discoverable:
+//   - Add / verify a recovery email
+//   - View blocked users
+//   - View terms / privacy
+//   - Delete account (with confirmation)
+//
+// Visually matches the DreadFeed aesthetic — black background, white
+// text, system-ui sans-serif, IG-style rows with a chevron.
+function SettingsView({ handle, deviceId, onBack, onSignedOut }: {
+  handle: string | null;
+  deviceId: string | null;
+  onBack: () => void;
+  onSignedOut: () => void;
+}) {
+  // Modal states. Only one open at a time.
+  const [emailModalOpen, setEmailModalOpen] = useState(false);
+  const [verifyModalOpen, setVerifyModalOpen] = useState(false);
+  const [pendingEmail, setPendingEmail] = useState('');
+  const [blockedModalOpen, setBlockedModalOpen] = useState(false);
+  const [deleteModalOpen, setDeleteModalOpen] = useState(false);
+
+  if (!handle || !deviceId) {
+    return (
+      <div style={S.settingsWrap}>
+        <SettingsHeader title="Settings" onBack={onBack} />
+        <div style={S.settingsEmpty}>You need a handle to manage settings.</div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={S.settingsWrap}>
+      <SettingsHeader title="Settings" onBack={onBack} />
+
+      <div style={S.settingsSectionLabel}>Account</div>
+      <SettingsRow
+        label="Add recovery email"
+        sublabel="Required to recover your account if you lose your phone"
+        onClick={() => setEmailModalOpen(true)}
+      />
+      <SettingsRow
+        label="Blocked users"
+        sublabel="Manage who you've blocked"
+        onClick={() => setBlockedModalOpen(true)}
+      />
+
+      <div style={S.settingsSectionLabel}>Legal</div>
+      <SettingsRow
+        label="Terms of Service"
+        onClick={() => {
+          // Open external link to terms page. Will be a hosted page on
+          // sinistertrivia.com once Drew writes them — placeholder for now.
+          try { (window as any).open?.('https://sinistertrivia.com/terms', '_blank'); }
+          catch { showToast('Opening terms…', 'default'); }
+        }}
+      />
+      <SettingsRow
+        label="Privacy Policy"
+        onClick={() => {
+          try { (window as any).open?.('https://sinistertrivia.com/privacy', '_blank'); }
+          catch { showToast('Opening privacy policy…', 'default'); }
+        }}
+      />
+
+      <div style={S.settingsSectionLabel}>Danger zone</div>
+      <SettingsRow
+        label="Delete account"
+        sublabel="Permanently delete your handle, posts, comments, follows"
+        destructive
+        onClick={() => setDeleteModalOpen(true)}
+      />
+
+      <div style={S.settingsFooter}>
+        @{handle} · The Dread Directory
+      </div>
+
+      {emailModalOpen && (
+        <AddEmailModal
+          handle={handle}
+          deviceId={deviceId}
+          onClose={() => setEmailModalOpen(false)}
+          onCodeSent={(email) => {
+            setPendingEmail(email);
+            setEmailModalOpen(false);
+            setVerifyModalOpen(true);
+          }}
+        />
+      )}
+      {verifyModalOpen && (
+        <VerifyEmailModal
+          handle={handle}
+          deviceId={deviceId}
+          email={pendingEmail}
+          onClose={() => setVerifyModalOpen(false)}
+          onVerified={() => {
+            setVerifyModalOpen(false);
+            showToast('Email verified — you can now recover your account', 'success');
+          }}
+        />
+      )}
+      {blockedModalOpen && (
+        <BlockedListModal
+          handle={handle}
+          deviceId={deviceId}
+          onClose={() => setBlockedModalOpen(false)}
+        />
+      )}
+      {deleteModalOpen && (
+        <DeleteAccountModal
+          handle={handle}
+          deviceId={deviceId}
+          onClose={() => setDeleteModalOpen(false)}
+          onDeleted={() => {
+            setDeleteModalOpen(false);
+            showToast('Account deleted', 'success');
+            onSignedOut();
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function SettingsHeader({ title, onBack }: { title: string; onBack: () => void }) {
+  return (
+    <div style={S.settingsHeaderBar}>
+      <button onClick={onBack} style={S.settingsBackBtn} aria-label="Back">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <polyline points="15 18 9 12 15 6" />
+        </svg>
+      </button>
+      <div style={S.settingsHeaderTitle}>{title}</div>
+      <div style={{ width: 36 }} />
+    </div>
+  );
+}
+
+function SettingsRow({ label, sublabel, onClick, destructive }: {
+  label: string;
+  sublabel?: string;
+  onClick: () => void;
+  destructive?: boolean;
+}) {
+  return (
+    <button onClick={onClick} style={S.settingsRow}>
+      <div style={S.settingsRowTextCol}>
+        <div style={{ ...S.settingsRowLabel, color: destructive ? '#ff6b6b' : '#FFFFFF' }}>{label}</div>
+        {sublabel && <div style={S.settingsRowSublabel}>{sublabel}</div>}
+      </div>
+      <div style={S.settingsRowChevron}>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#666" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <polyline points="9 18 15 12 9 6" />
+        </svg>
+      </div>
+    </button>
+  );
+}
+
+// ---------- Add Email Modal ----------
+// Modal that takes an email address and triggers a server send of the
+// 6-digit verification code. On success it closes and opens the verify
+// modal. Centered modal sheet, IG-style.
+function AddEmailModal({ handle, deviceId, onClose, onCodeSent }: {
+  handle: string;
+  deviceId: string;
+  onClose: () => void;
+  onCodeSent: (email: string) => void;
+}) {
+  const [email, setEmail] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const submit = async () => {
+    const trimmed = email.trim();
+    if (!trimmed || busy) return;
+    setBusy(true);
+    setErr(null);
+    const result = await apiAddEmail({ handle, deviceId, email: trimmed });
+    setBusy(false);
+    if (result.ok) {
+      onCodeSent(trimmed);
+    } else {
+      setErr(result.reason || 'Could not send verification code');
+    }
+  };
+
+  return (
+    <CenteredModal title="Add recovery email" onClose={onClose}>
+      <div style={S.modalBody}>
+        <div style={S.modalText}>
+          Enter your email. We'll send a 6-digit code to confirm.
+        </div>
+        <input
+          type="email"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          placeholder="you@example.com"
+          autoCorrect="off"
+          autoCapitalize="off"
+          spellCheck={false}
+          style={S.modalInput}
+          disabled={busy}
+        />
+        {err && <div style={S.modalError}>{err}</div>}
+        <button
+          onClick={submit}
+          disabled={busy || !email.trim()}
+          style={busy || !email.trim() ? S.modalBtnDisabled : S.modalBtnPrimary}
+        >
+          {busy ? 'Sending…' : 'Send code'}
+        </button>
+      </div>
+    </CenteredModal>
+  );
+}
+
+// ---------- Verify Email Modal ----------
+function VerifyEmailModal({ handle, deviceId, email, onClose, onVerified }: {
+  handle: string;
+  deviceId: string;
+  email: string;
+  onClose: () => void;
+  onVerified: () => void;
+}) {
+  const [code, setCode] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const submit = async () => {
+    if (!/^\d{6}$/.test(code.trim()) || busy) return;
+    setBusy(true);
+    setErr(null);
+    const result = await apiVerifyEmail({ handle, deviceId, code: code.trim() });
+    setBusy(false);
+    if (result.ok) {
+      onVerified();
+    } else {
+      setErr(result.reason || 'Invalid code');
+    }
+  };
+
+  return (
+    <CenteredModal title="Verify your email" onClose={onClose}>
+      <div style={S.modalBody}>
+        <div style={S.modalText}>
+          Enter the 6-digit code we sent to <strong>{email}</strong>. Code expires in 15 minutes.
+        </div>
+        <input
+          type="text"
+          inputMode="numeric"
+          value={code}
+          onChange={(e) => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+          placeholder="000000"
+          maxLength={6}
+          style={{ ...S.modalInput, textAlign: 'center', letterSpacing: '0.4em', fontSize: 20 }}
+          disabled={busy}
+        />
+        {err && <div style={S.modalError}>{err}</div>}
+        <button
+          onClick={submit}
+          disabled={busy || code.length !== 6}
+          style={busy || code.length !== 6 ? S.modalBtnDisabled : S.modalBtnPrimary}
+        >
+          {busy ? 'Verifying…' : 'Verify'}
+        </button>
+      </div>
+    </CenteredModal>
+  );
+}
+
+// ---------- Blocked List Modal ----------
+function BlockedListModal({ handle, deviceId, onClose }: {
+  handle: string;
+  deviceId: string;
+  onClose: () => void;
+}) {
+  const [list, setList] = useState<{ handle: string; createdAt: string }[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      const data = await apiBlockedList(handle);
+      if (cancelled) return;
+      setList(data);
+      setLoading(false);
+    })();
+    return () => { cancelled = true; };
+  }, [handle]);
+
+  const unblock = async (target: string) => {
+    const result = await apiUnblock({ blocker: handle, blocked: target, deviceId });
+    if (result.ok) {
+      setList((prev) => prev.filter((b) => b.handle.toLowerCase() !== target.toLowerCase()));
+      invalidateHiddenSet();
+      showToast(`Unblocked ${target}`, 'success');
+    } else {
+      showToast(result.reason || 'Unblock failed', 'error');
+    }
+  };
+
+  return (
+    <CenteredModal title="Blocked users" onClose={onClose}>
+      <div style={S.modalBody}>
+        {loading ? (
+          <div style={S.modalText}>Loading…</div>
+        ) : list.length === 0 ? (
+          <div style={S.modalText}>You haven't blocked anyone.</div>
+        ) : (
+          list.map((b) => (
+            <div key={b.handle} style={S.blockedRow}>
+              <div style={S.blockedHandle}>{b.handle}</div>
+              <button onClick={() => unblock(b.handle)} style={S.blockedUnblockBtn}>
+                Unblock
+              </button>
+            </div>
+          ))
+        )}
+      </div>
+    </CenteredModal>
+  );
+}
+
+// ---------- Post / Comment action sheet (3-dot menu) ----------
+// Bottom-sheet that slides up from the bottom on iOS / Android pattern.
+// Used for both posts (Report, Block author, Cancel) and comments (Report,
+// Block author, Cancel). Own posts/comments show no menu — Delete on own
+// content lives on the row itself.
+//
+// Rendered via portal so it floats above feed cards regardless of the
+// parent's transform context (the same trick CommentSheet uses).
+function ActionSheet({ title, actions, onClose }: {
+  title?: string;
+  actions: { label: string; onClick: () => void; destructive?: boolean }[];
+  onClose: () => void;
+}) {
+  const [mounted, setMounted] = useState(false);
+  const [closing, setClosing] = useState(false);
+
+  useEffect(() => {
+    const id = requestAnimationFrame(() => setMounted(true));
+    return () => cancelAnimationFrame(id);
+  }, []);
+
+  const animateClose = () => {
+    if (closing) return;
+    setClosing(true);
+    window.setTimeout(onClose, 180);
+  };
+
+  const visible = mounted && !closing;
+  return createPortal(
+    <div
+      style={{ ...S.actionSheetBackdrop, opacity: visible ? 1 : 0 }}
+      onClick={animateClose}
+    >
+      <div
+        style={{ ...S.actionSheet, transform: visible ? 'translateY(0)' : 'translateY(100%)' }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        {title && <div style={S.actionSheetTitle}>{title}</div>}
+        {actions.map((a, i) => (
+          <button
+            key={i}
+            onClick={() => { animateClose(); window.setTimeout(a.onClick, 200); }}
+            style={a.destructive ? S.actionSheetBtnDestructive : S.actionSheetBtn}
+          >
+            {a.label}
+          </button>
+        ))}
+        <button onClick={animateClose} style={S.actionSheetCancelBtn}>
+          Cancel
+        </button>
+      </div>
+    </div>,
+    document.body
+  );
+}
+
+// ---------- EULA / Terms acceptance modal ----------
+// Shown on first launch. App Store guideline 1.2 + 5.1.1(v) require an
+// EULA for apps with user-generated content, particularly when those
+// apps include blocking/reporting features. We persist acceptance in
+// localStorage so the user only sees this once. Bumping the EULA_VERSION
+// constant below re-prompts existing users (e.g. after a material terms
+// change).
+const EULA_VERSION = '1';
+const EULA_LS_KEY = 'sinister.eulaAccepted.v' + EULA_VERSION;
+
+function EulaModal({ onAccept }: { onAccept: () => void }) {
+  // No close button — user must accept to continue.
+  return (
+    <div style={S.eulaBackdrop}>
+      <div style={S.eulaSheet}>
+        <div style={S.eulaTitle}>Welcome to The Dread Directory</div>
+        <div style={S.eulaBody}>
+          <p style={S.eulaPara}>
+            Before you start, please review and accept our terms.
+          </p>
+          <p style={S.eulaPara}>
+            <strong>Community guidelines.</strong> The Dread Directory is for
+            sharing real haunted, abandoned, and sinister locations.
+            Don't post objectionable content — no harassment, hate speech,
+            sexual content, violence, or illegal activity. Posts and
+            comments are reviewed and may be removed.
+          </p>
+          <p style={S.eulaPara}>
+            <strong>Zero tolerance.</strong> Accounts that post abusive
+            material will be banned with no warning. You can report or
+            block any user from the 3-dot menu on their posts or profile.
+          </p>
+          <p style={S.eulaPara}>
+            <strong>Your content.</strong> You retain ownership of photos
+            you post but grant us a license to display them in the app.
+            You can delete your account and all your data at any time
+            from Settings.
+          </p>
+          <p style={S.eulaPara}>
+            By tapping Accept you agree to our{' '}
+            <a
+              href="https://sinistertrivia.com/terms"
+              target="_blank"
+              rel="noopener noreferrer"
+              style={S.eulaLink}
+            >Terms of Service</a>{' '}and{' '}
+            <a
+              href="https://sinistertrivia.com/privacy"
+              target="_blank"
+              rel="noopener noreferrer"
+              style={S.eulaLink}
+            >Privacy Policy</a>.
+          </p>
+        </div>
+        <button onClick={onAccept} style={S.eulaAcceptBtn}>
+          Accept &amp; Continue
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ---------- Email migration modal for grandfathered handles ----------
+// Shown on launch to handles that were claimed before email-at-signup
+// was required. Two paths:
+//   1. Sign in with Apple — links the Apple ID + email to the existing
+//      handle in one tap. (Server's handleSignInApple "existing user
+//      signing in" branch already handles the email-attach.)
+//   2. Add email manually — uses the existing /handles/add-email +
+//      /handles/verify-email flow (Drew's been able to do this in
+//      Settings; this just surfaces it on launch with no Skip).
+//
+// No close button — must complete one path. Once an email is on file,
+// the modal never shows again for this handle.
+function MigrateEmailModal({ handle, deviceId, hasEmail, hasApple, onDone }: {
+  handle: string;
+  deviceId: string;
+  hasEmail: boolean;
+  hasApple: boolean;
+  onDone: () => void;
+}) {
+  type Step = 'choose' | 'email-pick' | 'email-code';
+  const [step, setStep] = useState<Step>('choose');
+  const [email, setEmail] = useState('');
+  const [code, setCode] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const onApple = async () => {
+    if (busy) return;
+    setBusy(true);
+    setErr(null);
+    const native = await nativeSignInWithApple();
+    if (!native.ok) {
+      setBusy(false);
+      const fail = native as { ok: false; reason: string; cancelled?: boolean };
+      if (!fail.cancelled) setErr(fail.reason);
+      return;
+    }
+    // Use link-apple, NOT sign-in-apple. We want to ATTACH this Apple ID
+    // to the handle the user is already signed in as — not log in by
+    // Apple ID (which would fail for a new Apple ID with no handle).
+    const r = await apiLinkApple({
+      handle,
+      deviceId,
+      identityToken: native.identityToken,
+    });
+    setBusy(false);
+    if (r.ok) {
+      onDone();
+    } else {
+      // Most likely failure: Apple ID already linked to a different handle.
+      // Surface the conflict; the user can use the email path instead.
+      if (r.existingHandle) {
+        setErr(`This Apple ID is already linked to @${r.existingHandle}. Use email recovery instead.`);
+      } else {
+        setErr(r.reason || 'Could not link Apple ID.');
+      }
+    }
+  };
+
+  const onSend = async () => {
+    const trimmed = email.trim();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed) || busy) {
+      setErr('Please enter a valid email.');
+      return;
+    }
+    setBusy(true);
+    setErr(null);
+    const r = await apiAddEmail({ handle, deviceId, email: trimmed });
+    setBusy(false);
+    if (r.ok) {
+      setStep('email-code');
+    } else {
+      setErr(r.reason || 'Could not send code.');
+    }
+  };
+
+  const onVerify = async () => {
+    const cleanCode = code.trim();
+    if (!/^\d{6}$/.test(cleanCode) || busy) return;
+    setBusy(true);
+    setErr(null);
+    const r = await apiVerifyEmail({ handle, deviceId, code: cleanCode });
+    setBusy(false);
+    if (r.ok) {
+      onDone();
+    } else {
+      setErr(r.reason || 'Invalid code.');
+    }
+  };
+
+  return (
+    <div style={S.eulaBackdrop}>
+      <div style={S.eulaSheet}>
+        {step === 'choose' && (
+          <>
+            <div style={S.eulaTitle}>One more thing</div>
+            <div style={S.eulaBody}>
+              <p style={S.eulaPara}>
+                Welcome back, <strong>@{handle}</strong>. {hasEmail && !hasApple
+                  ? "Link your Apple ID so you can sign in on a new device with one tap."
+                  : !hasEmail && hasApple
+                  ? "Add a recovery email as a backup in case you lose access to your Apple ID."
+                  : "We need a recovery method on your account so you don't lose access if you lose your phone."}
+              </p>
+            </div>
+            {!hasApple && (
+              <button
+                onClick={onApple}
+                disabled={busy}
+                style={S.dreadFeedAppleBtn}
+              >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="#FFFFFF" style={{ marginRight: 8 }}>
+                  <path d="M17.05 20.28c-.98.95-2.05.8-3.08.35-1.09-.46-2.09-.48-3.24 0-1.44.62-2.2.44-3.06-.35C2.79 15.25 3.51 7.59 9.05 7.31c1.35.07 2.29.74 3.08.8 1.18-.24 2.31-.93 3.57-.84 1.51.12 2.65.72 3.4 1.8-3.12 1.87-2.38 5.98.48 7.13-.57 1.5-1.31 2.99-2.54 4.09zM12.03 7.25c-.15-2.23 1.66-4.07 3.74-4.25.29 2.58-2.34 4.5-3.74 4.25z" />
+                </svg>
+                {busy ? 'Connecting…' : (hasEmail ? 'Link Apple ID' : 'Sign in with Apple')}
+              </button>
+            )}
+            {!hasApple && !hasEmail && (
+              <div style={S.dreadFeedClaimOrRow}>
+                <div style={S.dreadFeedClaimOrLine} />
+                <span style={S.dreadFeedClaimOrText}>or</span>
+                <div style={S.dreadFeedClaimOrLine} />
+              </div>
+            )}
+            {!hasEmail && (
+              <button
+                onClick={() => { setStep('email-pick'); setErr(null); }}
+                style={S.dreadFeedEmailBtn}
+              >
+                Add recovery email
+              </button>
+            )}
+            {err && <div style={S.modalError}>{err}</div>}
+          </>
+        )}
+
+        {step === 'email-pick' && (
+          <>
+            <div style={S.eulaTitle}>Add recovery email</div>
+            <div style={S.eulaBody}>
+              <p style={S.eulaPara}>
+                We'll send a 6-digit code to verify your email.
+              </p>
+            </div>
+            <input
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="you@example.com"
+              autoCorrect="off"
+              autoCapitalize="off"
+              spellCheck={false}
+              inputMode="email"
+              style={S.modalInput}
+              disabled={busy}
+              autoFocus
+            />
+            <button
+              onClick={onSend}
+              disabled={busy || !email.trim()}
+              style={!busy && email.trim() ? S.modalBtnPrimary : S.modalBtnDisabled}
+            >
+              {busy ? 'Sending…' : 'Send code'}
+            </button>
+            <button
+              onClick={() => { setStep('choose'); setErr(null); }}
+              disabled={busy}
+              style={S.modalBtnSecondary}
+            >
+              Back
+            </button>
+            {err && <div style={S.modalError}>{err}</div>}
+          </>
+        )}
+
+        {step === 'email-code' && (
+          <>
+            <div style={S.eulaTitle}>Check your email</div>
+            <div style={S.eulaBody}>
+              <p style={S.eulaPara}>
+                We sent a 6-digit code to <strong>{email.trim()}</strong>.
+              </p>
+            </div>
+            <input
+              type="text"
+              inputMode="numeric"
+              pattern="\d{6}"
+              value={code}
+              onChange={(e) => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+              placeholder="123456"
+              maxLength={6}
+              style={{ ...S.modalInput, letterSpacing: 6, textAlign: 'center', fontSize: 22, fontFamily: 'monospace' }}
+              disabled={busy}
+              autoFocus
+            />
+            <button
+              onClick={onVerify}
+              disabled={busy || code.length !== 6}
+              style={!busy && code.length === 6 ? S.modalBtnPrimary : S.modalBtnDisabled}
+            >
+              {busy ? 'Verifying…' : 'Verify'}
+            </button>
+            <button
+              onClick={() => { setStep('email-pick'); setCode(''); setErr(null); }}
+              disabled={busy}
+              style={S.modalBtnSecondary}
+            >
+              Back
+            </button>
+            {err && <div style={S.modalError}>{err}</div>}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---------- Recover Account Modal ----------
+// Two-step flow inside a CenteredModal:
+//   Step 1 — user types their handle, we POST /handles/request-recovery.
+//            Server sends a 6-digit code to the email on file (if any).
+//            For privacy, server always returns ok=true regardless, so
+//            we just advance to step 2.
+//   Step 2 — user types the 6-digit code, we POST /handles/recover
+//            with { handle, code, newDeviceId }. On success, the
+//            handle's deviceId is swapped to this device and we notify
+//            the parent which sets the handle and dismisses the modal.
+function RecoverAccountModal({ newDeviceId, onClose, onRecovered }: {
+  newDeviceId: string;
+  onClose: () => void;
+  onRecovered: (handle: string) => void;
+}) {
+  const [step, setStep] = useState<'handle' | 'code'>('handle');
+  const [handle, setHandle] = useState('');
+  const [code, setCode] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const requestCode = async () => {
+    const trimmed = handle.trim();
+    if (!trimmed || busy) return;
+    setBusy(true);
+    setErr(null);
+    const result = await apiRequestRecovery(trimmed);
+    setBusy(false);
+    if (result.ok) {
+      // Always advance — server doesn't reveal whether an email exists.
+      setStep('code');
+    } else {
+      setErr(result.reason || 'Could not request a recovery code.');
+    }
+  };
+
+  const submitCode = async () => {
+    const cleanCode = code.trim();
+    if (!/^\d{6}$/.test(cleanCode) || busy) return;
+    setBusy(true);
+    setErr(null);
+    const result = await apiRecover({
+      handle: handle.trim(),
+      code: cleanCode,
+      newDeviceId,
+    });
+    setBusy(false);
+    if (result.ok && result.handle) {
+      onRecovered(result.handle);
+    } else {
+      setErr(result.reason || 'Invalid code or expired.');
+    }
+  };
+
+  return (
+    <CenteredModal
+      title={step === 'handle' ? 'Recover account' : 'Enter recovery code'}
+      onClose={onClose}
+    >
+      <div style={S.modalBody}>
+        {step === 'handle' ? (
+          <>
+            <div style={S.modalText}>
+              Enter your handle. If you have a recovery email on file, we'll send a 6-digit code.
+            </div>
+            <input
+              type="text"
+              value={handle}
+              onChange={(e) => setHandle(e.target.value.replace(/[^A-Za-z0-9_]/g, ''))}
+              placeholder="your handle"
+              maxLength={20}
+              autoCorrect="off"
+              autoCapitalize="off"
+              spellCheck={false}
+              style={{ ...S.modalInput, marginTop: 10 }}
+              disabled={busy}
+            />
+            {err && <div style={S.modalError}>{err}</div>}
+            <button
+              onClick={requestCode}
+              disabled={!handle.trim() || busy}
+              style={!handle.trim() || busy ? S.modalBtnDisabled : S.modalBtnPrimary}
+            >
+              {busy ? 'Sending…' : 'Send code'}
+            </button>
+          </>
+        ) : (
+          <>
+            <div style={S.modalText}>
+              We sent a 6-digit code to the email on file for <strong>{handle.trim()}</strong>. Enter it below.
+            </div>
+            <input
+              type="text"
+              inputMode="numeric"
+              pattern="\d{6}"
+              value={code}
+              onChange={(e) => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+              placeholder="123456"
+              maxLength={6}
+              style={{ ...S.modalInput, marginTop: 10, letterSpacing: 6, textAlign: 'center', fontSize: 20, fontFamily: 'monospace' }}
+              disabled={busy}
+            />
+            {err && <div style={S.modalError}>{err}</div>}
+            <button
+              onClick={submitCode}
+              disabled={code.length !== 6 || busy}
+              style={code.length !== 6 || busy ? S.modalBtnDisabled : S.modalBtnPrimary}
+            >
+              {busy ? 'Verifying…' : 'Recover account'}
+            </button>
+            <button
+              onClick={() => { setStep('handle'); setCode(''); setErr(null); }}
+              style={S.modalBtnSecondary}
+              disabled={busy}
+            >
+              Back
+            </button>
+          </>
+        )}
+      </div>
+    </CenteredModal>
+  );
+}
+
+
+function DeleteAccountModal({ handle, deviceId, onClose, onDeleted }: {
+  handle: string;
+  deviceId: string;
+  onClose: () => void;
+  onDeleted: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [confirmText, setConfirmText] = useState('');
+  const [err, setErr] = useState<string | null>(null);
+  // User must type DELETE before the button activates. Standard
+  // confirmation pattern for destructive actions.
+  const canSubmit = confirmText.trim().toUpperCase() === 'DELETE' && !busy;
+
+  const submit = async () => {
+    if (!canSubmit) return;
+    setBusy(true);
+    setErr(null);
+    const result = await apiDeleteAccount({ handle, deviceId });
+    setBusy(false);
+    if (result.ok) {
+      onDeleted();
+    } else {
+      setErr(result.reason || 'Delete failed');
+    }
+  };
+
+  return (
+    <CenteredModal title="Delete account" onClose={onClose}>
+      <div style={S.modalBody}>
+        <div style={S.modalText}>
+          This permanently deletes your handle <strong>@{handle}</strong>, all your posts,
+          comments, follows, and visits. <strong>This cannot be undone.</strong>
+        </div>
+        <div style={{ ...S.modalText, marginTop: 8 }}>
+          Type <strong>DELETE</strong> below to confirm.
+        </div>
+        <input
+          type="text"
+          value={confirmText}
+          onChange={(e) => setConfirmText(e.target.value)}
+          placeholder="DELETE"
+          style={S.modalInput}
+          disabled={busy}
+        />
+        {err && <div style={S.modalError}>{err}</div>}
+        <button
+          onClick={submit}
+          disabled={!canSubmit}
+          style={canSubmit ? S.modalBtnDanger : S.modalBtnDisabled}
+        >
+          {busy ? 'Deleting…' : 'Permanently delete account'}
+        </button>
+      </div>
+    </CenteredModal>
+  );
+}
+
+// ---------- Centered Modal (shared chrome) ----------
+function CenteredModal({ title, onClose, children }: {
+  title: string;
+  onClose: () => void;
+  children: React.ReactNode;
+}) {
+  return createPortal(
+    <div style={S.modalOverlay}>
+      <div style={S.modalBackdrop} onClick={onClose} />
+      <div style={S.modalPanel}>
+        <div style={S.modalHeader}>
+          <div style={{ width: 32 }} />
+          <div style={S.modalTitle}>{title}</div>
+          <button onClick={onClose} style={S.modalCloseBtn} aria-label="Close">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <line x1="18" y1="6" x2="6" y2="18" />
+              <line x1="6" y1="6" x2="18" y2="18" />
+            </svg>
+          </button>
+        </div>
+        {children}
+      </div>
+    </div>,
+    document.body
+  );
+}
+
+// ---------- Report Modal ----------
+// Opened from a "Report" option on post / comment menus. Lets the user
+// pick a reason and add an optional note. App Store 1.2 compliance.
+function ReportModal({ targetType, targetId, handle, deviceId, onClose, onReported }: {
+  targetType: 'post' | 'comment';
+  targetId: string;
+  handle: string;
+  deviceId: string;
+  onClose: () => void;
+  onReported: () => void;
+}) {
+  const [reason, setReason] = useState<ReportReason | null>(null);
+  const [note, setNote] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const reasons: { value: ReportReason; label: string }[] = [
+    { value: 'spam', label: 'Spam' },
+    { value: 'harassment', label: 'Harassment or bullying' },
+    { value: 'hate', label: 'Hate speech' },
+    { value: 'violence', label: 'Violence or threats' },
+    { value: 'sexual', label: 'Sexual content' },
+    { value: 'illegal', label: 'Illegal activity' },
+    { value: 'off-topic', label: 'Off-topic' },
+    { value: 'other', label: 'Other' },
+  ];
+
+  const submit = async () => {
+    if (!reason || busy) return;
+    setBusy(true);
+    setErr(null);
+    const result = await apiReport({
+      type: targetType,
+      targetId,
+      reason,
+      note: note.trim() || undefined,
+      handle,
+      deviceId,
+    });
+    setBusy(false);
+    if (result.ok) {
+      onReported();
+    } else {
+      setErr(result.reason || 'Report failed');
+    }
+  };
+
+  return (
+    <CenteredModal title={`Report ${targetType}`} onClose={onClose}>
+      <div style={S.modalBody}>
+        <div style={S.modalText}>Why are you reporting this {targetType}?</div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 8 }}>
+          {reasons.map((r) => (
+            <button
+              key={r.value}
+              onClick={() => setReason(r.value)}
+              style={reason === r.value ? S.reasonBtnActive : S.reasonBtn}
+            >
+              {r.label}
+            </button>
+          ))}
+        </div>
+        <textarea
+          value={note}
+          onChange={(e) => setNote(e.target.value.slice(0, 500))}
+          placeholder="Add a note (optional)"
+          rows={3}
+          style={{ ...S.modalInput, resize: 'none' as const, marginTop: 10 }}
+          disabled={busy}
+        />
+        {err && <div style={S.modalError}>{err}</div>}
+        <button
+          onClick={submit}
+          disabled={!reason || busy}
+          style={!reason || busy ? S.modalBtnDisabled : S.modalBtnPrimary}
+        >
+          {busy ? 'Submitting…' : 'Submit report'}
+        </button>
+      </div>
+    </CenteredModal>
+  );
+}
+
+
+// ---------- DreadFeed Claim Screen ----------
+// IG-style "Create your account" screen that lives in the Profile sub-tab
+// when the user has no handle claimed. Previously this slot just told the
+// user to "Open Submit a Location to claim one" — terrible UX for a
+// DreadFeed-only user who never plans to submit a haunted site.
+//
+// Reuses the same apiCheckHandle / apiClaimHandle backend as the inline
+// claim in SubmitView. On success, calls onClaimed which lifts to the
+// App-level handle state — like buttons, comments, follows immediately
+// start working without a refresh.
+function DreadFeedClaimScreen({ deviceId, onClaimed }: {
+  deviceId: string | null;
+  onClaimed: (handle: string) => void;
+}) {
+  // Steps:
+  //   'entry'      — Apple button (primary) + "Use email instead" (secondary) + Recover link
+  //   'apple-pick' — Apple succeeded but the Apple ID isn't bound to a handle yet;
+  //                  ask the user to pick a username, then claim with appleUserId+appleEmail
+  //   'email-pick' — User chose email path. Ask for handle + email; on submit, server emails a code
+  //   'email-code' — Code entry; on submit, server verifies and claims
+  type Step = 'entry' | 'apple-pick' | 'email-pick' | 'email-code';
+  const [step, setStep] = useState<Step>('entry');
+
+  // Apple-state — populated when entry → apple-pick is triggered.
+  const [appleUserId, setAppleUserId] = useState<string | null>(null);
+  const [appleEmail, setAppleEmail] = useState<string | null>(null);
+  const [appleBusy, setAppleBusy] = useState(false);
+
+  // Shared username input + availability state, used by both apple-pick
+  // and email-pick.
+  const [typed, setTyped] = useState('');
+  const [status, setStatus] = useState<'idle' | 'checking' | 'available' | 'taken' | 'invalid'>('idle');
+  const [statusMsg, setStatusMsg] = useState('');
+  const [claiming, setClaiming] = useState(false);
+  const [claimErr, setClaimErr] = useState<string | null>(null);
+  const debounceRef = useRef<number | null>(null);
+
+  // Email-path state.
+  const [email, setEmail] = useState('');
+  const [code, setCode] = useState('');
+  const [sending, setSending] = useState(false);
+  const [verifying, setVerifying] = useState(false);
+
+  // Recover-account modal — reachable from the entry step.
+  const [recoverOpen, setRecoverOpen] = useState(false);
+
+  // Live availability check, debounced 350ms. Active on the screens where
+  // the user types a username (apple-pick + email-pick).
+  useEffect(() => {
+    if (step !== 'apple-pick' && step !== 'email-pick') return;
+    if (debounceRef.current) {
+      window.clearTimeout(debounceRef.current);
+      debounceRef.current = null;
+    }
+    const trimmed = typed.trim();
+    if (trimmed.length === 0) {
+      setStatus('idle');
+      setStatusMsg('');
+      return;
+    }
+    setStatus('checking');
+    setStatusMsg('checking…');
+    debounceRef.current = window.setTimeout(async () => {
+      const r = await apiCheckHandle(trimmed);
+      if (r.available) {
+        setStatus('available');
+        setStatusMsg('available');
+      } else if (r.reason && r.reason.toLowerCase().includes('taken')) {
+        setStatus('taken');
+        setStatusMsg('taken');
+      } else {
+        setStatus('invalid');
+        setStatusMsg(r.reason || 'invalid');
+      }
+    }, 350);
+    return () => {
+      if (debounceRef.current) window.clearTimeout(debounceRef.current);
+    };
+  }, [typed, step]);
+
+  const statusColor =
+    status === 'available' ? '#5dd069' :
+    status === 'taken' ? '#ff6b6b' :
+    status === 'invalid' ? '#ffb648' :
+    '#888888';
+
+  // ---- Apple path ----
+  const onAppleTap = async () => {
+    if (!deviceId || appleBusy) return;
+    setAppleBusy(true);
+    setClaimErr(null);
+    const native = await nativeSignInWithApple();
+    if (!native.ok) {
+      setAppleBusy(false);
+      const fail = native as { ok: false; reason: string; cancelled?: boolean };
+      if (!fail.cancelled) {
+        setClaimErr(fail.reason);
+      }
+      return;
+    }
+    // Hand the token to the server.
+    const r = await apiSignInApple({
+      identityToken: native.identityToken,
+      deviceId,
+    });
+    setAppleBusy(false);
+    if (!r.ok) {
+      setClaimErr(r.reason || 'Apple sign-in failed.');
+      return;
+    }
+    if (r.handle) {
+      // Existing Apple user — straight in.
+      playPostShared();
+      onClaimed(r.handle);
+      return;
+    }
+    // New Apple user — need to pick a handle.
+    setAppleUserId(r.appleUserId || null);
+    setAppleEmail(r.appleEmail || null);
+    setStep('apple-pick');
+    setTyped('');
+    setStatus('idle');
+    setStatusMsg('');
+  };
+
+  const onAppleClaim = async () => {
+    const trimmed = typed.trim();
+    if (!deviceId || !trimmed || status !== 'available' || claiming) return;
+    setClaiming(true);
+    setClaimErr(null);
+    const r = await apiClaimHandle(trimmed, deviceId, {
+      appleUserId: appleUserId || undefined,
+      appleEmail: appleEmail || undefined,
+    });
+    setClaiming(false);
+    if (r.ok && r.handle) {
+      playPostShared();
+      onClaimed(r.handle);
+    } else {
+      setClaimErr(r.reason || 'Claim failed.');
+    }
+  };
+
+  // ---- Email path ----
+  const onSendCode = async () => {
+    const trimmedHandle = typed.trim();
+    const trimmedEmail = email.trim();
+    if (!deviceId || !trimmedHandle || status !== 'available') return;
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmedEmail)) {
+      setClaimErr('Please enter a valid email.');
+      return;
+    }
+    if (sending) return;
+    setSending(true);
+    setClaimErr(null);
+    const r = await apiStartEmailClaim({
+      handle: trimmedHandle,
+      email: trimmedEmail,
+      deviceId,
+    });
+    setSending(false);
+    if (r.ok) {
+      setStep('email-code');
+    } else {
+      setClaimErr(r.reason || 'Could not send code.');
+    }
+  };
+
+  const onVerifyCode = async () => {
+    const trimmedHandle = typed.trim();
+    const cleanCode = code.trim();
+    if (!deviceId || !trimmedHandle || !/^\d{6}$/.test(cleanCode)) return;
+    if (verifying) return;
+    setVerifying(true);
+    setClaimErr(null);
+    const r = await apiFinishEmailClaim({
+      handle: trimmedHandle,
+      code: cleanCode,
+      deviceId,
+    });
+    setVerifying(false);
+    if (r.ok && r.handle) {
+      playPostShared();
+      onClaimed(r.handle);
+    } else {
+      setClaimErr(r.reason || 'Verification failed.');
+    }
+  };
+
+  // ---- Render ----
+  return (
+    <div style={S.dreadFeedClaimWrap}>
+      <div style={S.dreadFeedClaimInner}>
+
+        {/* ============================================================
+            ENTRY STEP — Apple primary, email secondary, recover link.
+            ============================================================ */}
+        {step === 'entry' && (
+          <>
+            <div style={S.dreadFeedClaimTitle}>Create your account</div>
+            <div style={S.dreadFeedClaimSubtitle}>
+              Sign in with Apple to get started in one tap.
+            </div>
+
+            <button
+              onClick={onAppleTap}
+              disabled={appleBusy}
+              style={S.dreadFeedAppleBtn}
+              aria-label="Sign in with Apple"
+            >
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="#FFFFFF" style={{ marginRight: 8 }}>
+                <path d="M17.05 20.28c-.98.95-2.05.8-3.08.35-1.09-.46-2.09-.48-3.24 0-1.44.62-2.2.44-3.06-.35C2.79 15.25 3.51 7.59 9.05 7.31c1.35.07 2.29.74 3.08.8 1.18-.24 2.31-.93 3.57-.84 1.51.12 2.65.72 3.4 1.8-3.12 1.87-2.38 5.98.48 7.13-.57 1.5-1.31 2.99-2.54 4.09zM12.03 7.25c-.15-2.23 1.66-4.07 3.74-4.25.29 2.58-2.34 4.5-3.74 4.25z" />
+              </svg>
+              {appleBusy ? 'Connecting…' : 'Sign in with Apple'}
+            </button>
+
+            {claimErr && <div style={S.dreadFeedClaimError}>{claimErr}</div>}
+
+            <div style={S.dreadFeedClaimOrRow}>
+              <div style={S.dreadFeedClaimOrLine} />
+              <span style={S.dreadFeedClaimOrText}>or</span>
+              <div style={S.dreadFeedClaimOrLine} />
+            </div>
+
+            <button
+              onClick={() => {
+                setStep('email-pick');
+                setClaimErr(null);
+                setTyped('');
+                setEmail('');
+                setStatus('idle');
+                setStatusMsg('');
+              }}
+              style={S.dreadFeedEmailBtn}
+            >
+              Use email instead
+            </button>
+
+            <button
+              onClick={() => setRecoverOpen(true)}
+              style={S.dreadFeedRecoverLink}
+            >
+              Lost my phone? Recover account
+            </button>
+          </>
+        )}
+
+        {/* ============================================================
+            APPLE-PICK STEP — Apple succeeded, pick a handle.
+            ============================================================ */}
+        {step === 'apple-pick' && (
+          <>
+            <div style={S.dreadFeedClaimTitle}>Pick your handle</div>
+            <div style={S.dreadFeedClaimSubtitle}>
+              This is your forever name on DreadFeed — you can't change it later.
+            </div>
+            <input
+              type="text"
+              value={typed}
+              onChange={(e) => setTyped(e.target.value.replace(/[^A-Za-z0-9_]/g, ''))}
+              placeholder="username"
+              maxLength={20}
+              autoCorrect="off"
+              autoCapitalize="off"
+              spellCheck={false}
+              style={S.dreadFeedClaimInput}
+              disabled={claiming}
+              autoFocus
+            />
+            {statusMsg && (
+              <div style={{ ...S.dreadFeedClaimStatus, color: statusColor }}>
+                {status === 'available' ? '✓ ' :
+                 status === 'taken' ? '✗ ' :
+                 status === 'invalid' ? '⚠ ' : ''}{statusMsg}
+              </div>
+            )}
+            <button
+              onClick={onAppleClaim}
+              disabled={status !== 'available' || claiming}
+              style={status === 'available' && !claiming ? S.dreadFeedClaimBtn : S.dreadFeedClaimBtnDisabled}
+            >
+              {claiming ? 'Creating…' : 'Create Account'}
+            </button>
+            {claimErr && <div style={S.dreadFeedClaimError}>{claimErr}</div>}
+            <div style={S.dreadFeedClaimFooter}>
+              3–20 characters. Letters, numbers, underscores.
+            </div>
+            <button
+              onClick={() => { setStep('entry'); setClaimErr(null); }}
+              style={S.dreadFeedRecoverLink}
+            >
+              ← Use a different sign-in
+            </button>
+          </>
+        )}
+
+        {/* ============================================================
+            EMAIL-PICK STEP — Handle + email, server sends a code.
+            ============================================================ */}
+        {step === 'email-pick' && (
+          <>
+            <div style={S.dreadFeedClaimTitle}>Create your account</div>
+            <div style={S.dreadFeedClaimSubtitle}>
+              Pick a handle and add your email so you can recover your account if you lose your phone.
+            </div>
+            <input
+              type="text"
+              value={typed}
+              onChange={(e) => setTyped(e.target.value.replace(/[^A-Za-z0-9_]/g, ''))}
+              placeholder="username"
+              maxLength={20}
+              autoCorrect="off"
+              autoCapitalize="off"
+              spellCheck={false}
+              style={S.dreadFeedClaimInput}
+              disabled={sending}
+              autoFocus
+            />
+            {statusMsg && (
+              <div style={{ ...S.dreadFeedClaimStatus, color: statusColor }}>
+                {status === 'available' ? '✓ ' :
+                 status === 'taken' ? '✗ ' :
+                 status === 'invalid' ? '⚠ ' : ''}{statusMsg}
+              </div>
+            )}
+            <input
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="email"
+              autoCorrect="off"
+              autoCapitalize="off"
+              spellCheck={false}
+              inputMode="email"
+              style={{ ...S.dreadFeedClaimInput, marginTop: 10 }}
+              disabled={sending}
+            />
+            <button
+              onClick={onSendCode}
+              disabled={status !== 'available' || sending || !email.trim()}
+              style={status === 'available' && !sending && email.trim()
+                ? S.dreadFeedClaimBtn
+                : S.dreadFeedClaimBtnDisabled}
+            >
+              {sending ? 'Sending…' : 'Send verification code'}
+            </button>
+            {claimErr && <div style={S.dreadFeedClaimError}>{claimErr}</div>}
+            <div style={S.dreadFeedClaimFooter}>
+              We'll email you a 6-digit code to verify it's really you.
+            </div>
+            <button
+              onClick={() => { setStep('entry'); setClaimErr(null); }}
+              style={S.dreadFeedRecoverLink}
+            >
+              ← Use Sign in with Apple instead
+            </button>
+          </>
+        )}
+
+        {/* ============================================================
+            EMAIL-CODE STEP — Type the 6-digit code.
+            ============================================================ */}
+        {step === 'email-code' && (
+          <>
+            <div style={S.dreadFeedClaimTitle}>Check your email</div>
+            <div style={S.dreadFeedClaimSubtitle}>
+              We sent a 6-digit code to <strong>{email.trim()}</strong>. Enter it below.
+            </div>
+            <input
+              type="text"
+              inputMode="numeric"
+              pattern="\d{6}"
+              value={code}
+              onChange={(e) => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+              placeholder="123456"
+              maxLength={6}
+              style={{ ...S.dreadFeedClaimInput, letterSpacing: 6, textAlign: 'center', fontSize: 22, fontFamily: 'monospace' }}
+              disabled={verifying}
+              autoFocus
+            />
+            <button
+              onClick={onVerifyCode}
+              disabled={code.length !== 6 || verifying}
+              style={code.length === 6 && !verifying
+                ? S.dreadFeedClaimBtn
+                : S.dreadFeedClaimBtnDisabled}
+            >
+              {verifying ? 'Verifying…' : 'Verify & create account'}
+            </button>
+            {claimErr && <div style={S.dreadFeedClaimError}>{claimErr}</div>}
+            <button
+              onClick={() => { setStep('email-pick'); setCode(''); setClaimErr(null); }}
+              style={S.dreadFeedRecoverLink}
+            >
+              ← Back
+            </button>
+          </>
+        )}
+      </div>
+
+      {/* Recover-account modal (Apple-or-email-recovery for existing handles) */}
+      {recoverOpen && deviceId && (
+        <RecoverAccountModal
+          newDeviceId={deviceId}
+          onClose={() => setRecoverOpen(false)}
+          onRecovered={(recoveredHandle) => {
+            setRecoverOpen(false);
+            playPostShared();
+            onClaimed(recoveredHandle);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+
+function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, onBack, onSelectHandle, onSelectHashtag, onSelectPost, onHandleClaimed, onSelectSettings, onSelectNotifications, onSelectInbox }: {
   handle: string | null;
   deviceId: string | null;
   sites: SinisterSite[];
@@ -2688,7 +5339,23 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
   onSelectSite: (site: SinisterSite) => void;
   onBack: () => void;
   onSelectHandle: (handle: string) => void;
-  onSelectPost: (postId: string, postList?: string[]) => void;
+  // v1.14: tapping a hashtag in any caption inside SocialView routes to
+  // the dedicated HashtagView for that tag.
+  onSelectHashtag: (tag: string) => void;
+  onSelectPost: (postId: string, postList?: string[], preloadedPosts?: SocialPost[]) => void;
+  // Called when the user successfully claims a handle from the inline
+  // ClaimHandleScreen in the Profile tab. The parent App lifts this
+  // into its top-level `handle` state so subsequent likes/comments/
+  // follows immediately work without a refresh.
+  onHandleClaimed: (h: string) => void;
+  // Opens the Settings screen, plumbed down to the embedded
+  // UserProfileView's gear icon.
+  onSelectSettings: () => void;
+  // Routes to the NotificationsView when the user taps the bell in
+  // the DreadFeed header.
+  onSelectNotifications: () => void;
+  // v1.15: opens the DM inbox view.
+  onSelectInbox: () => void;
 }) {
   // Sub-tab inside eXposure. The static black bottom bar switches
   // between four sub-screens: 'feed' (the post feed, eXposure home),
@@ -2718,12 +5385,109 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
   // site is within 100m, it shows a "get closer" message; otherwise it
   // surfaces the existing AddPhotoButton composer.
   const [postSheetOpen, setPostSheetOpen] = useState(false);
+  // ➕ tap opens a small chooser sheet (Photo vs Poll) before routing
+  // to the matching composer. setChooserOpen(true) on ➕ tap; the chooser
+  // then either opens postSheetOpen (photo) or pollSheetOpen (poll) and
+  // closes itself.
+  const [chooserOpen, setChooserOpen] = useState(false);
+  const [pollSheetOpen, setPollSheetOpen] = useState(false);
 
-  const [posts, setPosts] = useState<SocialPost[]>([]);
-  const [nextBefore, setNextBefore] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  // Unread notifications badge count, shown on the bell in the brand
+  // header. Polled on mount + every 60 seconds while DreadFeed is open.
+  const [unreadCount, setUnreadCount] = useState(0);
+  useEffect(() => {
+    if (!handle) {
+      setUnreadCount(0);
+      return;
+    }
+    let cancelled = false;
+    const refresh = async () => {
+      const n = await apiFetchUnreadCount(handle);
+      if (!cancelled) setUnreadCount(n);
+    };
+    refresh();
+    const id = window.setInterval(refresh, 60000);
+    return () => { cancelled = true; window.clearInterval(id); };
+  }, [handle]);
+
+  // v1.15: same pattern for DM unread count. Polls every 30s so the
+  // airplane badge updates without the user manually opening the inbox.
+  const [dmUnreadCount, setDmUnreadCount] = useState(0);
+  useEffect(() => {
+    if (!handle) {
+      setDmUnreadCount(0);
+      return;
+    }
+    let cancelled = false;
+    const refresh = async () => {
+      const n = await apiUnreadDMs(handle);
+      if (!cancelled) setDmUnreadCount(n);
+    };
+    refresh();
+    const id = window.setInterval(refresh, 30000);
+    return () => { cancelled = true; window.clearInterval(id); };
+  }, [handle]);
+
+  // If we have a recent snapshot from a previous mount, seed feed state
+  // from it. This makes returning to DreadFeed via swipe-back land the
+  // user on the same posts they were viewing instead of refetching from
+  // the top. Snapshots expire after 10 minutes so the feed eventually
+  // freshens. Only the 'all' feed gets cached this way.
+  const initialSnap = (() => {
+    if (!_socialFeedMemory) return null;
+    if (Date.now() - _socialFeedMemory.capturedAt > SOCIAL_FEED_MEMORY_TTL_MS) {
+      _socialFeedMemory = null;
+      return null;
+    }
+    return _socialFeedMemory;
+  })();
+  const [posts, setPosts] = useState<SocialPost[]>(initialSnap ? initialSnap.posts : []);
+  const [nextBefore, setNextBefore] = useState<string | null>(initialSnap ? initialSnap.nextBefore : null);
+  // Polls live in parallel with posts. Fetched alongside the feed and
+  // merged chronologically at render time. Separate state keeps the
+  // post code paths (search view, profile grid, etc.) untouched. Pagination
+  // is independent — polls have their own nextBefore cursor.
+  const [polls, setPolls] = useState<PollEntry[]>([]);
+  const [pollsNextBefore, setPollsNextBefore] = useState<string | null>(null);
+  // Loading=true only if we have nothing seeded. If we restored from a
+  // snapshot, we already have posts to show — no loading flicker.
+  const [loading, setLoading] = useState(!initialSnap);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Feed mode toggle — 'all' shows every approved post; 'following'
+  // restricts to posts by handles the current user follows. Persists
+  // for the session only (resets on remount). When the user has no
+  // handle claimed, 'following' is hidden in the UI.
+  type FeedMode = 'all' | 'following';
+  const [feedMode, setFeedMode] = useState<FeedMode>('all');
+
+  // Helper: load a page from the right endpoint depending on feed mode.
+  // Following mode requires a handle; falls back to empty page if not.
+  // After fetching, we filter out posts authored by handles the viewer
+  // has blocked AND posts the viewer has personally hidden. Server
+  // doesn't know about either, so filtering is client-side. Anonymous
+  // viewers (no handle) skip the block list but still get post hides.
+  const loadPage = async (before: string | null): Promise<FeedPage> => {
+    let page: FeedPage;
+    if (feedMode === 'following') {
+      if (!handle) return { posts: [], nextBefore: null };
+      page = await apiFetchFollowingFeed({ handle, limit: 20, before });
+    } else {
+      page = await apiFetchFeed({ limit: 20, before });
+    }
+    const hiddenPosts = await loadHiddenPosts();
+    let filtered = page.posts;
+    if (hiddenPosts.size > 0) {
+      filtered = filtered.filter((p) => !hiddenPosts.has(p.id));
+    }
+    if (handle) {
+      const hidden = await getHiddenSet(handle);
+      if (hidden.size > 0) {
+        filtered = filtered.filter((p) => !hidden.has((p.handle || '').toLowerCase()));
+      }
+    }
+    return { posts: filtered, nextBefore: page.nextBefore };
+  };
 
   // ---- Pull-to-refresh state ----
   // When the user is at scrollY=0 and starts dragging down, we record the
@@ -2737,52 +5501,124 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
   const [pullDistance, setPullDistance] = useState(0);
   const [refreshing, setRefreshing] = useState(false);
   const _pullStartY = useRef<number | null>(null);
+  // True once the current drag has crossed PULL_THRESHOLD_PX. Used to
+  // fire the haptic tap exactly once per drag (when crossing the line)
+  // rather than continuously while held past threshold. Resets on touch
+  // start so the next drag fires fresh.
+  const _pullCrossedThreshold = useRef<boolean>(false);
 
   // Refresh = reload from the top. Called by pull-to-refresh on release
   // past threshold. Replaces the entire feed since we're back to the
-  // newest post; resets the nextBefore cursor.
+  // newest post; resets the nextBefore cursor. Also wipes the memory
+  // snapshot so the next remount fetches fresh — pull-refresh is an
+  // Polls fetch — runs in parallel with posts. Only in 'all' mode; the
+  // following feed stays photo-only. Returns empty if the call fails so
+  // a polls outage never breaks the photo feed.
+  const loadPollsPage = async (before: string | null): Promise<PollFeedPage> => {
+    if (feedMode === 'following') return { polls: [], nextBefore: null };
+    return apiFetchPollsFeed({ limit: 20, before, handle });
+  };
+
+  // explicit "I want new content" signal from the user.
   const refreshFeed = async () => {
     if (refreshing) return;
     setRefreshing(true);
     try {
-      const page = await apiFetchFeed({ limit: 20, before: null });
+      const [page, pollsPage] = await Promise.all([
+        loadPage(null),
+        loadPollsPage(null),
+      ]);
       setPosts(page.posts);
       setNextBefore(page.nextBefore);
+      setPolls(pollsPage.polls);
+      setPollsNextBefore(pollsPage.nextBefore);
+      _socialFeedMemory = null;
     } catch { /* silent — keep prior feed visible */ }
     setRefreshing(false);
     setPullDistance(0);
   };
 
-  // Initial load
+  // Initial load — and also re-load when feedMode flips between
+  // All / Following so the user gets fresh content for the chosen tab.
+  // SPECIAL CASE: on first mount, if we restored from _socialFeedMemory,
+  // skip the network fetch entirely — we already have posts seeded.
+  // The user gets an instant return-to-feed experience. We still fire
+  // a refresh on feedMode flips or handle changes since those are user
+  // actions that imply they want fresh data.
+  const skipInitialLoadRef = useRef(initialSnap !== null);
   useEffect(() => {
+    if (skipInitialLoadRef.current) {
+      // Only skip the FIRST run — subsequent feedMode/handle changes
+      // still trigger a real fetch.
+      skipInitialLoadRef.current = false;
+      // Restore scroll position. RAF gives the layout one frame to
+      // commit so document height is correct before we scroll.
+      const targetY = initialSnap ? initialSnap.scrollY : 0;
+      requestAnimationFrame(() => { window.scrollTo(0, targetY); });
+      return;
+    }
     let cancelled = false;
     (async () => {
       setLoading(true);
       setError(null);
-      const page = await apiFetchFeed({ limit: 20, before: null });
+      const [page, pollsPage] = await Promise.all([
+        loadPage(null),
+        loadPollsPage(null),
+      ]);
       if (cancelled) return;
       setPosts(page.posts);
       setNextBefore(page.nextBefore);
+      setPolls(pollsPage.polls);
+      setPollsNextBefore(pollsPage.nextBefore);
       setLoading(false);
     })();
     return () => { cancelled = true; };
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [feedMode, handle]);
 
-  // Load more — called when the user scrolls near the bottom.
+  // Snapshot feed state to module-level memory on unmount so a return
+  // to DreadFeed restores the same feed + scroll position the user
+  // was viewing. Only snapshots the 'all' feed (skip 'following' to
+  // keep the cache simple and small).
+  useEffect(() => {
+    return () => {
+      if (feedMode === 'all' && posts.length > 0) {
+        _socialFeedMemory = {
+          posts,
+          nextBefore,
+          scrollY: window.scrollY,
+          capturedAt: Date.now(),
+        };
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [posts, nextBefore, feedMode]);
+
+  // Load more — called when the user scrolls near the bottom. Pulls
+  // the next page of posts AND polls in parallel (each has its own
+  // cursor). Either may exhaust before the other; we only stop calling
+  // when both are exhausted.
   const loadMore = async () => {
-    if (loadingMore || !nextBefore) return;
+    if (loadingMore) return;
+    if (!nextBefore && !pollsNextBefore) return;
     setLoadingMore(true);
-    const page = await apiFetchFeed({ limit: 20, before: nextBefore });
+    const [page, pollsPage] = await Promise.all([
+      nextBefore ? loadPage(nextBefore) : Promise.resolve({ posts: [], nextBefore: null } as FeedPage),
+      pollsNextBefore ? loadPollsPage(pollsNextBefore) : Promise.resolve({ polls: [], nextBefore: null } as PollFeedPage),
+    ]);
     setPosts((prev) => [...prev, ...page.posts]);
     setNextBefore(page.nextBefore);
+    setPolls((prev) => [...prev, ...pollsPage.polls]);
+    setPollsNextBefore(pollsPage.nextBefore);
     setLoadingMore(false);
   };
 
   // Scroll listener for infinite scroll. Trigger when user is within
-  // ~800px of the bottom of the page.
+  // ~800px of the bottom of the page. Either cursor (posts or polls)
+  // being non-null means there's still more to fetch.
   useEffect(() => {
     const onScroll = () => {
-      if (!nextBefore || loadingMore) return;
+      if ((!nextBefore && !pollsNextBefore) || loadingMore) return;
       const scrollPos = window.scrollY + window.innerHeight;
       const docHeight = document.documentElement.scrollHeight;
       if (docHeight - scrollPos < 800) {
@@ -2792,7 +5628,7 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
     window.addEventListener('scroll', onScroll, { passive: true });
     return () => window.removeEventListener('scroll', onScroll);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nextBefore, loadingMore]);
+  }, [nextBefore, pollsNextBefore, loadingMore]);
 
   // Site lookup for tap-to-DetailView. Sites are passed down from App so
   // we don't refetch.
@@ -2802,6 +5638,28 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
     return m;
   }, [sites]);
 
+  // ====== ACCOUNT GATE ======
+  // DreadFeed is a social mini-app — feed, posts, likes, comments,
+  // follows, profiles all require an identity. Rather than letting
+  // anonymous users browse and hit "sign up to react" on every tap,
+  // we gate the entire mini-app: the very first thing a no-account
+  // user sees inside DreadFeed is the signup screen. They either
+  // complete signup (Apple ID or email) and land in the feed, or
+  // swipe back to exit DreadFeed entirely.
+  //
+  // No bottom bar, no brand header — just the signup screen full-
+  // bleed so it reads as a gate, not a sub-tab.
+  if (!handle) {
+    return (
+      <div style={S.socialViewWrap}>
+        <DreadFeedClaimScreen
+          deviceId={deviceId}
+          onClaimed={onHandleClaimed}
+        />
+      </div>
+    );
+  }
+
   return (
     <div
       style={S.socialViewWrap}
@@ -2810,6 +5668,7 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
         // top of the page. Anywhere mid-scroll, this is a normal scroll.
         if (window.scrollY > 0 || refreshing) return;
         _pullStartY.current = e.touches[0].clientY;
+        _pullCrossedThreshold.current = false;
       }}
       onTouchMove={(e) => {
         if (_pullStartY.current === null || refreshing) return;
@@ -2823,6 +5682,13 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
         const eased = dy < PULL_THRESHOLD_PX
           ? dy
           : PULL_THRESHOLD_PX + (dy - PULL_THRESHOLD_PX) * 0.5;
+        // Fire a single light haptic tap the moment the user crosses
+        // the trigger line, matching IG's pattern: it confirms "release
+        // now and the feed will refresh" without buzzing continuously.
+        if (!_pullCrossedThreshold.current && eased >= PULL_THRESHOLD_PX) {
+          _pullCrossedThreshold.current = true;
+          haptic('light');
+        }
         setPullDistance(Math.min(eased, PULL_MAX_PX));
       }}
       onTouchEnd={() => {
@@ -2840,7 +5706,12 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
           Black bar with the eXposure brand on top and a short tagline
           underneath. Sticky so it stays visible while the feed scrolls.
           Pull-to-refresh and per-sub-tab headers render BELOW this. */}
-      <ExposureBrandHeader />
+      <ExposureBrandHeader
+        unreadCount={unreadCount}
+        dmUnreadCount={dmUnreadCount}
+        onTapBell={onSelectNotifications}
+        onTapInbox={handle ? onSelectInbox : undefined}
+      />
 
       {/* ====== FEED sub-tab ====== */}
       {subTab === 'feed' && (
@@ -2860,35 +5731,96 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
             </span>
           </div>
 
+          {/* Following / For You segmented toggle — only shown when the
+              user has a claimed handle (Following mode is meaningless
+              without one). Two equal-width buttons, the active one is
+              underlined and bold. Tapping flips feedMode which triggers
+              a refetch via the useEffect dep. */}
+          {handle && (
+            <div style={S.feedModeRow}>
+              <button
+                onClick={() => setFeedMode('all')}
+                style={feedMode === 'all' ? S.feedModeBtnActive : S.feedModeBtn}
+              >
+                For You
+              </button>
+              <button
+                onClick={() => setFeedMode('following')}
+                style={feedMode === 'following' ? S.feedModeBtnActive : S.feedModeBtn}
+              >
+                Following
+              </button>
+            </div>
+          )}
+
           {/* Feed body */}
           {loading ? (
             <div style={S.socialEmpty}>Loading the feed…</div>
           ) : error ? (
             <div style={S.socialEmpty}>⚠ {error}</div>
-          ) : posts.length === 0 ? (
+          ) : posts.length === 0 && polls.length === 0 ? (
             <div style={S.socialEmpty}>
-              No posts yet.<br />
+              {feedMode === 'following'
+                ? 'No posts from accounts you follow yet.'
+                : 'No posts yet.'}<br />
               <span style={{ opacity: 0.7, fontSize: 13 }}>
-                Visit a site and tap "Post to eXposure" to be the first.
+                Visit a site and tap "Post to DreadFeed" to be the first.
               </span>
             </div>
           ) : (
             <div style={{ ...S.socialFeed, paddingBottom: 80 }}>
-              {posts.map((p) => (
-                <SocialPostCard
-                  key={p.id}
-                  post={p}
-                  currentHandle={handle}
-                  deviceId={deviceId}
-                  onSiteTap={() => {
-                    const s = siteById.get(p.siteId);
-                    if (s) onSelectSite(s);
-                  }}
-                  onHandleTap={() => onSelectHandle(p.handle)}
-                />
-              ))}
+              {/* Merge posts and polls into one chronological feed by
+                  createdAt/approvedAt. Each item is tagged with a `kind`
+                  so the render switch can pick the right card. Polls
+                  carry their `type:'poll'` discriminator from the
+                  server; posts don't, hence the dual approach. */}
+              {(() => {
+                type FeedItem =
+                  | { kind: 'post'; item: SocialPost; ts: string }
+                  | { kind: 'poll'; item: PollEntry; ts: string };
+                const merged: FeedItem[] = [];
+                for (const p of posts) {
+                  merged.push({ kind: 'post', item: p, ts: p.approvedAt || p.createdAt || '' });
+                }
+                for (const pl of polls) {
+                  merged.push({ kind: 'poll', item: pl, ts: pl.createdAt || '' });
+                }
+                merged.sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
+                return merged.map((entry) => {
+                  if (entry.kind === 'poll') {
+                    const pl = entry.item;
+                    return (
+                      <SocialPollCard
+                        key={'poll:' + pl.id}
+                        poll={pl}
+                        currentHandle={handle}
+                        deviceId={deviceId}
+                        onHandleTap={() => onSelectHandle(pl.handle)}
+                      />
+                    );
+                  }
+                  const p = entry.item;
+                  return (
+                    <SocialPostCard
+                      key={p.id}
+                      post={p}
+                      currentHandle={handle}
+                      deviceId={deviceId}
+                      onSiteTap={() => {
+                        const s = siteById.get(p.siteId);
+                        if (s) onSelectSite(s);
+                      }}
+                      onHandleTap={() => onSelectHandle(p.handle)}
+                      onHashtagTap={(tag) => onSelectHashtag(tag)}
+                      onPostRemoved={(postId) => {
+                        setPosts((prev) => prev.filter((x) => x.id !== postId));
+                      }}
+                    />
+                  );
+                });
+              })()}
               {loadingMore && <div style={S.socialEmpty}>Loading more…</div>}
-              {!nextBefore && posts.length > 0 && (
+              {!nextBefore && !pollsNextBefore && (posts.length > 0 || polls.length > 0) && (
                 <div style={{ ...S.socialEmpty, paddingTop: 20, paddingBottom: 40 }}>
                   <span style={{ opacity: 0.5, fontSize: 12 }}>— end of feed —</span>
                 </div>
@@ -2907,32 +5839,28 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
           sites={sites}
           onSelectSite={onSelectSite}
           onSelectHandle={onSelectHandle}
+          onSelectHashtag={onSelectHashtag}
         />
       )}
 
-      {/* ====== PROFILE sub-tab ====== */}
+      {/* ====== PROFILE sub-tab ======
+          handle is guaranteed non-null here because the account gate
+          at the top of SocialView short-circuits when there's no
+          handle, rendering the signup screen instead. */}
       {subTab === 'profile' && (
-        handle ? (
-          <UserProfileView
-            profileHandle={handle}
-            currentHandle={handle}
-            deviceId={deviceId}
-            sites={sites}
-            onSelectSite={onSelectSite}
-            onSelectBadges={(h) => { /* tab-bound; ignore deep link */ void h; }}
-            onSelectPost={onSelectPost}
-            onBack={() => setSubTab('feed')}
-            embedded
-          />
-        ) : (
-          <div style={S.socialEmpty}>
-            <div style={{ marginBottom: 14, fontSize: 16 }}>No handle claimed yet.</div>
-            <span style={{ opacity: 0.7, fontSize: 13 }}>
-              Claim a handle to build your eXposure profile.<br />
-              Open Submit a Location to claim one.
-            </span>
-          </div>
-        )
+        <UserProfileView
+          profileHandle={handle}
+          currentHandle={handle}
+          deviceId={deviceId}
+          sites={sites}
+          onSelectSite={onSelectSite}
+          onSelectBadges={(h) => { /* tab-bound; ignore deep link */ void h; }}
+          onSelectPost={onSelectPost}
+          onSelectHandle={onSelectHandle}
+          onSelectSettings={onSelectSettings}
+          onBack={() => setSubTab('feed')}
+          embedded
+        />
       )}
 
       {/* ====== POST sub-tab — never renders a sub-screen, just triggers
@@ -2947,10 +5875,11 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
         active={subTab}
         onSelect={(tab) => {
           if (tab === 'post') {
-            // Post is an action, not a sub-screen — open the composer
-            // sheet. It handles the GPS check internally.
+            // ➕ opens a chooser (Photo vs Poll) — the chooser then
+            // routes to ExposurePostSheet or PollComposerSheet. We don't
+            // switch sub-tabs because Post is an action, not a screen.
             playSubDrop();
-            setPostSheetOpen(true);
+            setChooserOpen(true);
             return;
           }
           playSubDrop();
@@ -2958,8 +5887,24 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
         }}
       />
 
-      {/* Post composer sheet — opened by the ➕ tab. Finds the nearest
-          site within 100m and runs the camera flow. */}
+      {/* ➕ chooser — Photo vs Poll. Tiny bottom-sheet modal that
+          routes the user to the matching composer flow. */}
+      {chooserOpen && (
+        <ChoosePostTypeSheet
+          onPickPhoto={() => {
+            setChooserOpen(false);
+            setPostSheetOpen(true);
+          }}
+          onPickPoll={() => {
+            setChooserOpen(false);
+            setPollSheetOpen(true);
+          }}
+          onCancel={() => setChooserOpen(false)}
+        />
+      )}
+
+      {/* Post composer sheet — opened by the chooser after picking Photo.
+          Runs the IG-style multi-stage camera + editor + caption flow. */}
       {postSheetOpen && (
         <ExposurePostSheet
           handle={handle}
@@ -2967,7 +5912,22 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
           onClose={() => setPostSheetOpen(false)}
           onPosted={() => {
             setPostSheetOpen(false);
-            showToast('Posted to eXposure', 'success');
+            showToast('Posted to DreadFeed', 'success');
+            void refreshFeed();
+          }}
+        />
+      )}
+
+      {/* Poll composer sheet — opened by the chooser after picking Poll.
+          Question + 4 options. Auto-approved server-side, no admin queue. */}
+      {pollSheetOpen && (
+        <PollComposerSheet
+          handle={handle}
+          deviceId={deviceId}
+          onClose={() => setPollSheetOpen(false)}
+          onPosted={() => {
+            setPollSheetOpen(false);
+            showToast('Poll posted', 'success');
             void refreshFeed();
           }}
         />
@@ -3035,6 +5995,1161 @@ function ExposureBottomBar({ active, onSelect }: {
   );
 }
 
+// ---------- ExposurePostEditor ----------
+// Photo editing screen that sits between 'pick' and 'caption' in the
+// IG-style composer. Lets the user:
+//   - Toggle a filmstrip border overlay (on by default)
+//   - Drag 12 horror SVG stickers onto the photo
+//   - Add a single freeform text caption (Jolly Lodger) draggable to position
+//
+// When the user taps "Next", we bake every layer into a flat JPEG via
+// canvas and hand the resulting File back to the parent. The server-side
+// pipeline (Sharp resize + EXIF strip + R2 upload) doesn't change.
+
+// ---- Sticker library ----
+// OpenMoji horror stickers via jsDelivr's GitHub CDN. Licensed CC BY-SA 4.0
+// — credit in the app About page is the only obligation. SVG format,
+// crisp at any size, ~5-15KB each. The /gh/ jsDelivr path serves files
+// from the GitHub repo directly (the /npm/ path doesn't include the PNG
+// build artifacts — only the source SVGs are published to npm).
+//
+// Codepoints are uppercase hex with hyphens for ZWJ-joined sequences.
+type HorrorSticker = {
+  id: string;
+  name: string;
+  url: string;
+};
+
+const OPENMOJI_BASE = 'https://cdn.jsdelivr.net/gh/hfg-gmuend/openmoji@15.1.0/color/svg';
+
+const HORROR_STICKERS: HorrorSticker[] = [
+  { id: 'skull',     name: 'Skull',           url: `${OPENMOJI_BASE}/1F480.svg` },
+  { id: 'skullbones',name: 'Skull & bones',   url: `${OPENMOJI_BASE}/2620.svg` },
+  { id: 'ghost',     name: 'Ghost',           url: `${OPENMOJI_BASE}/1F47B.svg` },
+  { id: 'vampire',   name: 'Vampire',         url: `${OPENMOJI_BASE}/1F9DB.svg` },
+  { id: 'zombie',    name: 'Zombie',          url: `${OPENMOJI_BASE}/1F9DF.svg` },
+  { id: 'pumpkin',   name: 'Jack-o-lantern',  url: `${OPENMOJI_BASE}/1F383.svg` },
+  { id: 'bat',       name: 'Bat',             url: `${OPENMOJI_BASE}/1F987.svg` },
+  { id: 'spider',    name: 'Spider',          url: `${OPENMOJI_BASE}/1F577.svg` },
+  { id: 'web',       name: 'Spider web',      url: `${OPENMOJI_BASE}/1F578.svg` },
+  { id: 'crystalball',name: 'Crystal ball',   url: `${OPENMOJI_BASE}/1F52E.svg` },
+  { id: 'candle',    name: 'Candle',          url: `${OPENMOJI_BASE}/1F56F.svg` },
+  { id: 'coffin',    name: 'Coffin',          url: `${OPENMOJI_BASE}/26B0.svg` },
+  { id: 'fire',      name: 'Fire',            url: `${OPENMOJI_BASE}/1F525.svg` },
+  { id: 'eye',       name: 'Eye',             url: `${OPENMOJI_BASE}/1F441.svg` },
+];
+
+// Layers placed on the photo. Position is normalized (0-1) so layers
+// rescale with the preview vs the final baked canvas. Scale is a multiplier
+// of base size (stickers: 80px on preview). Rotation in degrees.
+type StickerLayer = {
+  kind: 'sticker';
+  id: string;          // local instance id
+  stickerId: string;   // index into HORROR_STICKERS
+  x: number;           // 0..1 normalized center
+  y: number;           // 0..1 normalized center
+  scale: number;       // 1.0 = base
+  rotation: number;    // degrees
+};
+
+// Editor text fonts — 6 horror-themed faces. The id is what's persisted
+// on the TextLayer; the cssStack is what gets passed to ctx.font during
+// bake AND to fontFamily in the live preview, so the user sees exactly
+// what they'll get in the final JPEG. Bunny.net imports are issued once
+// in buildStyleCss(); system fallbacks cover the cases where the user is
+// offline mid-bake.
+type FontId = 'jollyLodger' | 'creepster' | 'specialElite' | 'permanentMarker' | 'oswald' | 'shareTechMono';
+const EDITOR_FONTS: { id: FontId; name: string; cssStack: string; weight: number }[] = [
+  { id: 'jollyLodger',     name: 'Jolly Lodger', cssStack: '"Jolly Lodger", serif',                       weight: 700 },
+  { id: 'creepster',       name: 'Creepster',    cssStack: '"Creepster", "Jolly Lodger", serif',          weight: 400 },
+  { id: 'specialElite',    name: 'Typewriter',   cssStack: '"Special Elite", "Courier New", monospace',   weight: 400 },
+  { id: 'permanentMarker', name: 'Marker',       cssStack: '"Permanent Marker", "Jolly Lodger", cursive', weight: 400 },
+  { id: 'oswald',          name: 'Display',      cssStack: '"Oswald", "Impact", system-ui, sans-serif',   weight: 700 },
+  { id: 'shareTechMono',   name: 'Mono',         cssStack: '"Share Tech Mono", "Courier New", monospace', weight: 400 },
+];
+function fontFor(id: FontId): { cssStack: string; weight: number } {
+  return EDITOR_FONTS.find((f) => f.id === id) || EDITOR_FONTS[0];
+}
+
+type TextLayer = {
+  kind: 'text';
+  id: string;
+  text: string;
+  x: number;
+  y: number;
+  scale: number;       // font scaling
+  rotation: number;
+  fontId: FontId;      // which face from EDITOR_FONTS (defaults to jollyLodger for back-compat)
+};
+
+type EditorLayer = StickerLayer | TextLayer;
+
+function makeLayerId() {
+  return 'l_' + Math.random().toString(36).slice(2, 10);
+}
+
+// Filter presets — applied via canvas `filter` property at bake time
+// and via the equivalent CSS filter on the live preview. Keys match the
+// FILTER_PRESETS array entries.
+type FilterId = 'none' | 'foundFootage' | 'polaroid' | 'nightVision' | 'vhs' | 'crimeScene' | 'cursed' | 'asylum' | 'bloodstain' | 'ouija' | 'static' | 'coldCase' | 'witness';
+
+const FILTER_PRESETS: { id: FilterId; name: string; css: string }[] = [
+  { id: 'none',         name: 'Original',      css: 'none' },
+  { id: 'foundFootage', name: 'Found Footage', css: 'grayscale(0.4) sepia(0.25) hue-rotate(60deg) contrast(1.15) brightness(0.9)' },
+  { id: 'polaroid',     name: 'Polaroid',      css: 'sepia(0.6) contrast(0.95) brightness(1.05) saturate(0.85)' },
+  { id: 'nightVision',  name: 'Night Vision',  css: 'grayscale(1) sepia(1) hue-rotate(60deg) saturate(8) brightness(0.8) contrast(1.4)' },
+  { id: 'vhs',          name: 'VHS',           css: 'contrast(1.2) saturate(1.4) brightness(0.95) hue-rotate(-5deg)' },
+  { id: 'crimeScene',   name: 'Crime Scene',   css: 'contrast(1.6) brightness(0.85) saturate(0.3)' },
+  { id: 'cursed',       name: 'Cursed',        css: 'contrast(1.4) saturate(1.6) hue-rotate(-15deg) brightness(0.88)' },
+  // New filters added in the second editor pass.
+  { id: 'asylum',       name: 'Asylum',        css: 'grayscale(0.7) sepia(0.2) hue-rotate(180deg) saturate(1.2) brightness(0.92) contrast(1.15)' },
+  { id: 'bloodstain',   name: 'Bloodstain',    css: 'saturate(2) hue-rotate(-25deg) contrast(1.35) brightness(0.9)' },
+  { id: 'ouija',        name: 'Ouija',         css: 'sepia(0.85) saturate(0.9) brightness(0.95) contrast(1.2) hue-rotate(-10deg)' },
+  { id: 'static',       name: 'Static',        css: 'grayscale(1) contrast(1.5) brightness(1.1)' },
+  { id: 'coldCase',     name: 'Cold Case',     css: 'saturate(0.5) contrast(0.95) brightness(1.05) sepia(0.15)' },
+  { id: 'witness',      name: 'Witness',       css: 'blur(0.4px) contrast(1.1) brightness(0.93) saturate(1.1)' },
+];
+
+function filterCssFor(id: FilterId): string {
+  return FILTER_PRESETS.find((f) => f.id === id)?.css || 'none';
+}
+
+// Crop rectangle in normalized coords (0..1 of source).
+type CropRect = { x: number; y: number; w: number; h: number };
+const FULL_CROP: CropRect = { x: 0, y: 0, w: 1, h: 1 };
+
+// Bake the photo + crop + rotate + filter + filmstrip + layers into a JPEG File.
+// Order: crop → rotate → filter → filmstrip → stickers/text → JPEG export.
+// canvasSize targets 1200px max edge to match server Sharp resize.
+async function bakePostImage(opts: {
+  sourceFile: File;
+  crop: CropRect;
+  rotation: 0 | 90 | 180 | 270;
+  filter: FilterId;
+  filmstripOn: boolean;
+  layers: EditorLayer[];
+  stickers: HorrorSticker[];
+}): Promise<File> {
+  const { sourceFile, crop, rotation, filter, filmstripOn, layers, stickers } = opts;
+
+  // Load source image
+  const sourceImg = await new Promise<HTMLImageElement>((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error('source image load failed'));
+    img.src = URL.createObjectURL(sourceFile);
+  });
+
+  // Compute cropped pixel rect on the source image.
+  const srcW = sourceImg.naturalWidth;
+  const srcH = sourceImg.naturalHeight;
+  const cropPxW = Math.max(1, Math.round(crop.w * srcW));
+  const cropPxH = Math.max(1, Math.round(crop.h * srcH));
+  const cropPxX = Math.round(crop.x * srcW);
+  const cropPxY = Math.round(crop.y * srcH);
+
+  // After rotation, dimensions may swap.
+  const isPortraitFromRotation = rotation === 90 || rotation === 270;
+  const postRotW = isPortraitFromRotation ? cropPxH : cropPxW;
+  const postRotH = isPortraitFromRotation ? cropPxW : cropPxH;
+
+  // Scale to max 1200 longest edge.
+  const maxDim = 1200;
+  let outW = postRotW;
+  let outH = postRotH;
+  if (outW > outH && outW > maxDim) {
+    outH = Math.round(outH * (maxDim / outW));
+    outW = maxDim;
+  } else if (outH > maxDim) {
+    outW = Math.round(outW * (maxDim / outH));
+    outH = maxDim;
+  }
+
+  const canvas = document.createElement('canvas');
+  canvas.width = outW;
+  canvas.height = outH;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('canvas 2d unavailable');
+
+  // 1) Apply filter (via ctx.filter — Safari iOS 15+ supports this).
+  // CSS filter syntax is the same we use on the preview img.
+  ctx.filter = filterCssFor(filter);
+
+  // 2) Draw crop + rotate. We rotate the canvas around its center so
+  // the cropped region lands in [0,0,outW,outH] regardless of orientation.
+  ctx.save();
+  ctx.translate(outW / 2, outH / 2);
+  ctx.rotate((rotation * Math.PI) / 180);
+  // Draw the cropped region centered on the (now-rotated) canvas.
+  // Source rect comes from the original image; dest rect is the unrotated bounds.
+  const drawW = isPortraitFromRotation ? outH : outW;
+  const drawH = isPortraitFromRotation ? outW : outH;
+  ctx.drawImage(
+    sourceImg,
+    cropPxX, cropPxY, cropPxW, cropPxH,
+    -drawW / 2, -drawH / 2, drawW, drawH
+  );
+  ctx.restore();
+
+  // Reset filter so overlays draw clean.
+  ctx.filter = 'none';
+
+  // 3) Filmstrip border overlay
+  if (filmstripOn) {
+    const barH = Math.round(outH * 0.06);
+    ctx.fillStyle = '#0a0a0a';
+    ctx.fillRect(0, 0, outW, barH);
+    ctx.fillRect(0, outH - barH, outW, barH);
+
+    const holeW = Math.round(barH * 0.5);
+    const holeH = Math.round(barH * 0.55);
+    const holeY1 = Math.round((barH - holeH) / 2);
+    const holeY2 = outH - barH + holeY1;
+    const gap = Math.round(holeW * 1.6);
+    const totalStep = holeW + gap;
+    const startX = Math.round((outW % totalStep) / 2);
+
+    ctx.fillStyle = '#F5EFE0';
+    for (let x = startX; x + holeW < outW; x += totalStep) {
+      const r = Math.min(holeW, holeH) * 0.25;
+      const drawHole = (yPos: number) => {
+        ctx.beginPath();
+        ctx.moveTo(x + r, yPos);
+        ctx.lineTo(x + holeW - r, yPos);
+        ctx.arcTo(x + holeW, yPos, x + holeW, yPos + r, r);
+        ctx.lineTo(x + holeW, yPos + holeH - r);
+        ctx.arcTo(x + holeW, yPos + holeH, x + holeW - r, yPos + holeH, r);
+        ctx.lineTo(x + r, yPos + holeH);
+        ctx.arcTo(x, yPos + holeH, x, yPos + holeH - r, r);
+        ctx.lineTo(x, yPos + r);
+        ctx.arcTo(x, yPos, x + r, yPos, r);
+        ctx.closePath();
+        ctx.fill();
+      };
+      drawHole(holeY1);
+      drawHole(holeY2);
+    }
+  }
+
+  // 4) Draw layers (stickers + text) — these sit on top of crop/rotate/filter,
+  // so they appear at the position the user dragged them on the preview.
+  const stickerBase = Math.round(Math.min(outW, outH) * 0.16);
+
+  // Pre-load PNG stickers needed by this post. crossOrigin='anonymous' so
+  // the canvas doesn't get tainted (JSDelivr serves the right CORS header).
+  const stickerImgs = new Map<string, HTMLImageElement>();
+  await Promise.all(
+    Array.from(new Set(
+      layers.filter((l): l is StickerLayer => l.kind === 'sticker').map((l) => l.stickerId)
+    )).map(async (sid) => {
+      const def = stickers.find((s) => s.id === sid);
+      if (!def) return;
+      try {
+        const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+          const im = new Image();
+          im.crossOrigin = 'anonymous';
+          im.onload = () => resolve(im);
+          im.onerror = () => reject(new Error('sticker png load failed: ' + sid));
+          im.src = def.url;
+        });
+        stickerImgs.set(sid, img);
+      } catch (e) {
+        // Silently skip stickers that fail to load — better than failing
+        // the whole bake when one CDN asset is down.
+        console.warn('[editor] sticker load failed', sid, e);
+      }
+    })
+  );
+
+  for (const layer of layers) {
+    ctx.save();
+    const cx = layer.x * outW;
+    const cy = layer.y * outH;
+    ctx.translate(cx, cy);
+    ctx.rotate((layer.rotation * Math.PI) / 180);
+
+    if (layer.kind === 'sticker') {
+      const img = stickerImgs.get(layer.stickerId);
+      if (img) {
+        const size = stickerBase * layer.scale;
+        ctx.drawImage(img, -size / 2, -size / 2, size, size);
+      }
+    } else if (layer.kind === 'text') {
+      const fontSize = Math.round(stickerBase * 0.45 * layer.scale);
+      const font = fontFor(layer.fontId);
+      ctx.font = `${font.weight} ${fontSize}px ${font.cssStack}`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.shadowColor = '#DC2626';
+      ctx.shadowBlur = Math.round(fontSize * 0.15);
+      ctx.shadowOffsetX = Math.round(fontSize * 0.06);
+      ctx.shadowOffsetY = Math.round(fontSize * 0.06);
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillText(layer.text, 0, 0);
+    }
+
+    ctx.restore();
+  }
+
+  // 5) Export to JPEG File. Note: if a cross-origin sticker tainted the
+  // canvas, toBlob throws — we catch that and rethrow with a clearer message.
+  let blob: Blob | null;
+  try {
+    blob = await new Promise<Blob | null>((resolve, reject) => {
+      canvas.toBlob((b) => {
+        if (!b) reject(new Error('toBlob returned null'));
+        else resolve(b);
+      }, 'image/jpeg', 0.92);
+    });
+  } catch (err: any) {
+    throw new Error('canvas export failed (possibly CORS): ' + (err?.message || err));
+  }
+  if (!blob) throw new Error('canvas toBlob failed');
+
+  const origName = sourceFile.name || 'post';
+  const baseName = origName.replace(/\.[^.]+$/, '');
+  return new File([blob], `${baseName}.jpg`, { type: 'image/jpeg' });
+}
+
+// ---- The editor screen ----
+function ExposurePostEditor({ photoFile, onBack, onNext }: {
+  photoFile: File;
+  onBack: () => void;
+  onNext: (editedFile: File) => void;
+}) {
+  const [filmstripOn, setFilmstripOn] = useState(false);
+  const [filterId, setFilterId] = useState<FilterId>('none');
+  const [crop, setCrop] = useState<CropRect>(FULL_CROP);
+  const [rotation, setRotation] = useState<0 | 90 | 180 | 270>(0);
+  const [layers, setLayers] = useState<EditorLayer[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  // tray null = normal editor with stickers/text/filmstrip toolbar
+  // tray 'crop' / 'filter' = full-screen sub-tool
+  // tray 'stickers' / 'text' = bottom drawer
+  const [tray, setTray] = useState<'stickers' | 'text' | 'crop' | 'filter' | null>(null);
+  const [textInput, setTextInput] = useState('');
+  // Selected font for the next text layer added. Once a layer is created, it
+  // carries its own fontId so changing this doesn't retroactively affect
+  // existing text layers — to change one of those, the user tags it as
+  // selected and picks a new font in the tray header.
+  const [selectedFont, setSelectedFont] = useState<FontId>('jollyLodger');
+  const [baking, setBaking] = useState(false);
+
+  const previewRef = useRef<HTMLDivElement | null>(null);
+  const previewUrl = useMemo(() => URL.createObjectURL(photoFile), [photoFile]);
+  useEffect(() => () => URL.revokeObjectURL(previewUrl), [previewUrl]);
+
+  // Disable the global swipe-back gesture while the editor is open.
+  // Horizontal swipes inside the editor (font picker, filter strip, sticker
+  // drawer scroll, dragging stickers/text across the canvas) would otherwise
+  // be hijacked by the swipe-back handler and pop the user back to the
+  // pick-photo screen mid-edit, losing all their work.
+  useEffect(() => {
+    beginSuppressSwipeBack();
+    return () => { endSuppressSwipeBack(); };
+  }, []);
+
+  const addSticker = (stickerId: string) => {
+    setLayers((prev) => [
+      ...prev,
+      { kind: 'sticker', id: makeLayerId(), stickerId, x: 0.5, y: 0.5, scale: 1, rotation: 0 },
+    ]);
+    setTray(null);
+  };
+
+  const addText = () => {
+    const trimmed = textInput.trim();
+    if (!trimmed) return;
+    setLayers((prev) => [
+      ...prev,
+      { kind: 'text', id: makeLayerId(), text: trimmed, x: 0.5, y: 0.5, scale: 1, rotation: 0, fontId: selectedFont },
+    ]);
+    setTextInput('');
+    setTray(null);
+  };
+
+  const deleteSelected = () => {
+    if (!selectedId) return;
+    setLayers((prev) => prev.filter((l) => l.id !== selectedId));
+    setSelectedId(null);
+  };
+
+  // Layer drag — pointer events normalize touch/mouse on iOS.
+  const onLayerPointerDown = (e: React.PointerEvent, layerId: string) => {
+    e.stopPropagation();
+    setSelectedId(layerId);
+    const target = e.currentTarget as HTMLElement;
+    target.setPointerCapture(e.pointerId);
+    const rect = previewRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const move = (ev: PointerEvent) => {
+      const nx = (ev.clientX - rect.left) / rect.width;
+      const ny = (ev.clientY - rect.top) / rect.height;
+      setLayers((prev) => prev.map((l) =>
+        l.id === layerId ? { ...l, x: Math.max(0, Math.min(1, nx)), y: Math.max(0, Math.min(1, ny)) } : l
+      ));
+    };
+    const up = () => {
+      target.removeEventListener('pointermove', move as any);
+      target.removeEventListener('pointerup', up as any);
+      target.removeEventListener('pointercancel', up as any);
+    };
+    target.addEventListener('pointermove', move as any);
+    target.addEventListener('pointerup', up as any);
+    target.addEventListener('pointercancel', up as any);
+  };
+
+  const adjustScale = (delta: number) => {
+    if (!selectedId) return;
+    setLayers((prev) => prev.map((l) =>
+      l.id === selectedId ? { ...l, scale: Math.max(0.3, Math.min(3, l.scale + delta)) } : l
+    ));
+  };
+  const adjustRotation = (delta: number) => {
+    if (!selectedId) return;
+    setLayers((prev) => prev.map((l) =>
+      l.id === selectedId ? { ...l, rotation: (l.rotation + delta) % 360 } : l
+    ));
+  };
+  // Absolute setters used by the slider controls. Clamped the same way
+  // the +/− buttons would have been. Named setLayerScale/setLayerRotation
+  // to avoid colliding with the editor's overall image-rotation state.
+  const setLayerScale = (value: number) => {
+    if (!selectedId) return;
+    const clamped = Math.max(0.3, Math.min(3, value));
+    setLayers((prev) => prev.map((l) =>
+      l.id === selectedId ? { ...l, scale: clamped } : l
+    ));
+  };
+  const setLayerRotation = (value: number) => {
+    if (!selectedId) return;
+    // Slider range -180..180; bake's ctx.rotate accepts any radian value.
+    setLayers((prev) => prev.map((l) =>
+      l.id === selectedId ? { ...l, rotation: value } : l
+    ));
+  };
+  // Re-skin the currently selected text layer with a different font face.
+  // No-op if the selection is a sticker or nothing is selected. Also nudges
+  // the "default for next text layer" so the user's last font choice
+  // persists when they create another.
+  const setLayerFont = (fontId: FontId) => {
+    if (!selectedId) return;
+    setLayers((prev) => prev.map((l) =>
+      l.id === selectedId && l.kind === 'text' ? { ...l, fontId } : l
+    ));
+    setSelectedFont(fontId);
+  };
+
+  const onConfirm = async () => {
+    if (baking) return;
+    setBaking(true);
+    try {
+      const baked = await bakePostImage({
+        sourceFile: photoFile,
+        crop,
+        rotation,
+        filter: filterId,
+        filmstripOn,
+        layers,
+        stickers: HORROR_STICKERS,
+      });
+      onNext(baked);
+    } catch (err) {
+      showToast('Could not save edits — try again', 'error');
+      setBaking(false);
+    }
+  };
+
+  // ---- Crop sub-view ----
+  // Renders the image inside a wrapper sized to its display area, with a
+  // draggable rectangle overlay. State (`crop`) is normalized 0..1 of
+  // source dimensions so it's resolution-independent.
+  if (tray === 'crop') {
+    return (
+      <ExposureCropScreen
+        sourceUrl={previewUrl}
+        crop={crop}
+        rotation={rotation}
+        onChangeCrop={setCrop}
+        onChangeRotation={(r) => setRotation(r)}
+        onDone={() => setTray(null)}
+        onCancel={() => setTray(null)}
+      />
+    );
+  }
+
+  // Filter sub-view stays inline (just a horizontal scroll strip + preview).
+
+  // Compute live preview transform: apply filter via CSS filter, and
+  // rotate via CSS transform. Crop is approximated visually by
+  // object-position cropping. Since we use object-fit:contain in the
+  // base view, we instead show a "crop preview" mask while in editor.
+  const liveFilter = filterCssFor(filterId);
+  const liveTransform = rotation ? `rotate(${rotation}deg)` : undefined;
+
+  // The crop on live preview is shown via clip-path on the image so the
+  // user sees roughly what will be exported. Crop is in normalized coords
+  // (0..1) of source — clip-path inset uses % of the rendered image, which
+  // matches our source-normalized coords since object-fit:contain preserves
+  // aspect ratio. Crop applies BEFORE rotation in the bake, but for the
+  // preview we approximate with clip-path on the un-rotated image to
+  // avoid coordinate confusion.
+  const cropClip =
+    crop.x === 0 && crop.y === 0 && crop.w === 1 && crop.h === 1
+      ? undefined
+      : `inset(${crop.y * 100}% ${(1 - crop.x - crop.w) * 100}% ${(1 - crop.y - crop.h) * 100}% ${crop.x * 100}%)`;
+
+  return (
+    <>
+      <div style={S.igComposerHeader}>
+        <button onClick={onBack} style={S.igComposerHeaderBtn} aria-label="Back" disabled={baking}>‹</button>
+        <div style={S.igComposerHeaderTitle}>Edit</div>
+        <button
+          onClick={onConfirm}
+          disabled={baking}
+          style={{ ...S.igComposerHeaderNext, color: baking ? '#1B4F7A' : '#3B9DFF', cursor: baking ? 'default' : 'pointer' }}
+        >
+          {baking ? '...' : 'Next'}
+        </button>
+      </div>
+
+      <div
+        ref={previewRef}
+        style={S.editorPreviewWrap}
+        onPointerDown={() => setSelectedId(null)}
+      >
+        <img
+          src={previewUrl}
+          alt=""
+          style={{
+            ...S.editorPreviewImg,
+            filter: liveFilter,
+            transform: liveTransform,
+            clipPath: cropClip,
+          }}
+        />
+
+        {filmstripOn && (
+          <>
+            <div style={S.editorFilmstripBarTop}>
+              {Array.from({ length: 14 }).map((_, i) => (
+                <div key={i} style={S.editorFilmstripHole} />
+              ))}
+            </div>
+            <div style={S.editorFilmstripBarBottom}>
+              {Array.from({ length: 14 }).map((_, i) => (
+                <div key={i} style={S.editorFilmstripHole} />
+              ))}
+            </div>
+          </>
+        )}
+
+        {layers.map((layer) => {
+          const isSel = layer.id === selectedId;
+          const transform = `translate(-50%, -50%) rotate(${layer.rotation}deg) scale(${layer.scale})`;
+          const wrapStyle: React.CSSProperties = {
+            position: 'absolute',
+            left: `${layer.x * 100}%`,
+            top: `${layer.y * 100}%`,
+            transform,
+            transformOrigin: 'center',
+            touchAction: 'none',
+            cursor: 'grab',
+            outline: isSel ? '2px dashed #3B9DFF' : 'none',
+            outlineOffset: 4,
+            padding: 4,
+          };
+          if (layer.kind === 'sticker') {
+            const def = HORROR_STICKERS.find((s) => s.id === layer.stickerId);
+            if (!def) return null;
+            return (
+              <div
+                key={layer.id}
+                style={wrapStyle}
+                onPointerDown={(e) => onLayerPointerDown(e, layer.id)}
+              >
+                <img
+                  src={def.url}
+                  alt=""
+                  crossOrigin="anonymous"
+                  style={{ width: 80, height: 80, display: 'block', pointerEvents: 'none' }}
+                  draggable={false}
+                />
+              </div>
+            );
+          }
+          return (
+            <div
+              key={layer.id}
+              style={{
+                ...wrapStyle,
+                fontFamily: fontFor(layer.fontId).cssStack,
+                fontWeight: fontFor(layer.fontId).weight,
+                fontSize: 36,
+                color: '#FFFFFF',
+                textShadow: '2px 2px 0 #DC2626, 0 0 6px rgba(220,38,38,0.6)',
+                whiteSpace: 'nowrap',
+                userSelect: 'none',
+              }}
+              onPointerDown={(e) => onLayerPointerDown(e, layer.id)}
+            >
+              {layer.text}
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Font picker for the selected TEXT layer. Hidden when nothing is
+          selected OR when the selection is a sticker. Sits above the
+          layer controls; tap any font cell to re-skin the layer live. */}
+      {(() => {
+        if (!selectedId) return null;
+        const sel = layers.find((l) => l.id === selectedId);
+        if (!sel || sel.kind !== 'text') return null;
+        const currentFontId = sel.fontId;
+        return (
+          <div
+            style={{
+              position: 'absolute',
+              left: 0,
+              right: 0,
+              bottom: 130,
+              display: 'flex',
+              gap: 8,
+              padding: '0 12px',
+              overflowX: 'auto',
+              WebkitOverflowScrolling: 'touch',
+              zIndex: 10,
+            }}
+          >
+            {EDITOR_FONTS.map((f) => {
+              const isSel = currentFontId === f.id;
+              return (
+                <button
+                  key={f.id}
+                  onClick={() => setLayerFont(f.id)}
+                  style={{
+                    flex: '0 0 auto',
+                    minWidth: 56,
+                    padding: '4px 10px',
+                    background: isSel ? 'rgba(255,59,92,0.18)' : 'rgba(0,0,0,0.65)',
+                    border: isSel ? '2px solid #FF3B5C' : '1px solid rgba(255,255,255,0.15)',
+                    borderRadius: 8,
+                    color: '#FFF',
+                    fontFamily: f.cssStack,
+                    fontWeight: f.weight,
+                    fontSize: 18,
+                    lineHeight: 1.1,
+                    cursor: 'pointer',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    alignItems: 'center',
+                    backdropFilter: 'blur(8px)',
+                    WebkitBackdropFilter: 'blur(8px)',
+                  }}
+                  aria-label={`Set font to ${f.name}`}
+                >
+                  <span>Aa</span>
+                  <span style={{ fontFamily: 'system-ui, -apple-system, sans-serif', fontSize: 8, fontWeight: 400, color: '#BBB', marginTop: 1 }}>
+                    {f.name}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        );
+      })()}
+
+      {selectedId && (() => {
+        // Read the current selected layer once so the sliders reflect
+        // its actual scale/rotation. If nothing's selected the block
+        // doesn't render (outer && guard).
+        const sel = layers.find((l) => l.id === selectedId);
+        if (!sel) return null;
+        // Stop propagation on touch events so dragging the slider
+        // doesn't trigger the global swipe-back gesture.
+        const stopBubble = (e: React.TouchEvent | React.PointerEvent) => e.stopPropagation();
+        return (
+          <div style={S.editorLayerControls}>
+            <div style={S.editorSliderRow}>
+              <span style={S.editorSliderIcon} aria-hidden="true">⤢</span>
+              <input
+                type="range"
+                min={0.3}
+                max={3}
+                step={0.01}
+                value={sel.scale}
+                onChange={(e) => setLayerScale(parseFloat(e.target.value))}
+                onTouchStart={stopBubble}
+                onTouchMove={stopBubble}
+                onTouchEnd={stopBubble}
+                onPointerDown={stopBubble}
+                style={S.editorSlider}
+                aria-label="Size"
+              />
+            </div>
+            <div style={S.editorSliderRow}>
+              <span style={S.editorSliderIcon} aria-hidden="true">↻</span>
+              <input
+                type="range"
+                min={-180}
+                max={180}
+                step={1}
+                value={sel.rotation}
+                onChange={(e) => setLayerRotation(parseFloat(e.target.value))}
+                onTouchStart={stopBubble}
+                onTouchMove={stopBubble}
+                onTouchEnd={stopBubble}
+                onPointerDown={stopBubble}
+                style={S.editorSlider}
+                aria-label="Rotation"
+              />
+            </div>
+            <button style={S.editorLayerDeleteBtn} onClick={deleteSelected} aria-label="Delete">🗑</button>
+          </div>
+        );
+      })()}
+
+      {/* Filter strip — horizontal scroll of preset thumbs above toolbar */}
+      {tray === 'filter' && (
+        <div style={S.editorFilterStrip}>
+          {FILTER_PRESETS.map((p) => (
+            <button
+              key={p.id}
+              style={{
+                ...S.editorFilterCell,
+                outline: filterId === p.id ? '2px solid #FF3B5C' : '1px solid rgba(255,255,255,0.1)',
+              }}
+              onClick={() => setFilterId(p.id)}
+              aria-label={p.name}
+            >
+              <img
+                src={previewUrl}
+                alt=""
+                style={{ width: 56, height: 56, objectFit: 'cover', display: 'block', filter: p.css }}
+                draggable={false}
+              />
+              <span style={S.editorFilterLabel}>{p.name}</span>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* Sticker tray */}
+      {tray === 'stickers' && (
+        <div style={S.editorTray}>
+          <div style={S.editorTrayHeader}>
+            <span style={S.editorTrayTitle}>Stickers</span>
+            <button onClick={() => setTray(null)} style={S.editorTrayClose}>✕</button>
+          </div>
+          <div style={S.editorStickerGrid}>
+            {HORROR_STICKERS.map((s) => (
+              <button
+                key={s.id}
+                style={S.editorStickerCell}
+                onClick={() => addSticker(s.id)}
+                aria-label={s.name}
+              >
+                <img
+                  src={s.url}
+                  alt={s.name}
+                  crossOrigin="anonymous"
+                  style={{ width: 48, height: 48, display: 'block' }}
+                  draggable={false}
+                />
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Text tray */}
+      {tray === 'text' && (
+        <div style={S.editorTray}>
+          <div style={S.editorTrayHeader}>
+            <span style={S.editorTrayTitle}>Add text</span>
+            <button onClick={() => setTray(null)} style={S.editorTrayClose}>✕</button>
+          </div>
+          {/* Font picker — horizontal scroll of 6 fonts, each rendering "Aa"
+              in its own face so the user previews exactly what they'll get. */}
+          <div
+            style={{
+              display: 'flex',
+              gap: 8,
+              padding: '8px 12px 4px',
+              overflowX: 'auto',
+              WebkitOverflowScrolling: 'touch',
+            }}
+          >
+            {EDITOR_FONTS.map((f) => {
+              const isSel = selectedFont === f.id;
+              return (
+                <button
+                  key={f.id}
+                  onClick={() => setSelectedFont(f.id)}
+                  style={{
+                    flex: '0 0 auto',
+                    minWidth: 64,
+                    padding: '6px 12px',
+                    background: isSel ? 'rgba(255,59,92,0.15)' : 'rgba(255,255,255,0.05)',
+                    border: isSel ? '2px solid #FF3B5C' : '1px solid rgba(255,255,255,0.1)',
+                    borderRadius: 8,
+                    color: '#FFF',
+                    fontFamily: f.cssStack,
+                    fontWeight: f.weight,
+                    fontSize: 20,
+                    lineHeight: 1.2,
+                    cursor: 'pointer',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    alignItems: 'center',
+                  }}
+                  aria-label={f.name}
+                >
+                  <span>Aa</span>
+                  <span style={{ fontFamily: 'system-ui, -apple-system, sans-serif', fontSize: 9, fontWeight: 400, color: '#999', marginTop: 2 }}>
+                    {f.name}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+          <div style={{ padding: 12, display: 'flex', gap: 8 }}>
+            <input
+              autoFocus
+              value={textInput}
+              onChange={(e) => setTextInput(e.target.value.slice(0, 40))}
+              placeholder="Type text..."
+              style={{ ...S.editorTextInput, fontFamily: fontFor(selectedFont).cssStack, fontWeight: fontFor(selectedFont).weight }}
+              onKeyDown={(e) => { if (e.key === 'Enter') addText(); }}
+            />
+            <button onClick={addText} style={S.editorTextAddBtn} disabled={!textInput.trim()}>
+              Add
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Bottom toolbar — 5 tools: Crop, Filter, Frame, Stickers, Text */}
+      <div style={S.editorToolbar}>
+        <button
+          style={{ ...S.editorToolBtn, color: (crop.w < 1 || crop.h < 1 || rotation !== 0) ? '#FF3B5C' : '#FFF' }}
+          onClick={() => setTray('crop')}
+        >
+          <span style={S.editorToolIcon}>⊡</span>
+          <span style={S.editorToolLabel}>Crop</span>
+        </button>
+        <button
+          style={{ ...S.editorToolBtn, color: tray === 'filter' ? '#FF3B5C' : (filterId !== 'none' ? '#FF8AA3' : '#FFF') }}
+          onClick={() => setTray((t) => (t === 'filter' ? null : 'filter'))}
+        >
+          <span style={S.editorToolIcon}>◐</span>
+          <span style={S.editorToolLabel}>Filter</span>
+        </button>
+        <button
+          style={{ ...S.editorToolBtn, color: filmstripOn ? '#FF3B5C' : '#888' }}
+          onClick={() => setFilmstripOn((v) => !v)}
+        >
+          <span style={S.editorToolIcon}>▤</span>
+          <span style={S.editorToolLabel}>Frame</span>
+        </button>
+        <button
+          style={{ ...S.editorToolBtn, color: tray === 'stickers' ? '#FF3B5C' : '#FFF' }}
+          onClick={() => setTray((t) => (t === 'stickers' ? null : 'stickers'))}
+        >
+          <span style={S.editorToolIcon}>💀</span>
+          <span style={S.editorToolLabel}>Stickers</span>
+        </button>
+        <button
+          style={{ ...S.editorToolBtn, color: tray === 'text' ? '#FF3B5C' : '#FFF' }}
+          onClick={() => setTray((t) => (t === 'text' ? null : 'text'))}
+        >
+          <span style={S.editorToolIcon}>Aa</span>
+          <span style={S.editorToolLabel}>Text</span>
+        </button>
+      </div>
+    </>
+  );
+}
+
+// ---------- ExposureCropScreen ----------
+// Standalone full-screen crop tool. Image rendered behind a darkened
+// scrim with a transparent crop window over the center. Edges/corners
+// are draggable, body is draggable for repositioning. 90° rotate button
+// in the top toolbar. "Done" applies the crop and returns. "Cancel"
+// reverts to whatever crop was already set.
+//
+// Crop is in normalized image coords (0..1). The screen tracks its own
+// `working` state and commits on Done.
+function ExposureCropScreen({ sourceUrl, crop, rotation, onChangeCrop, onChangeRotation, onDone, onCancel }: {
+  sourceUrl: string;
+  crop: CropRect;
+  rotation: 0 | 90 | 180 | 270;
+  onChangeCrop: (c: CropRect) => void;
+  onChangeRotation: (r: 0 | 90 | 180 | 270) => void;
+  onDone: () => void;
+  onCancel: () => void;
+}) {
+  const [working, setWorking] = useState<CropRect>(crop);
+  const [workingRotation, setWorkingRotation] = useState<0 | 90 | 180 | 270>(rotation);
+  const wrapRef = useRef<HTMLDivElement | null>(null);
+  // We measure the rendered image bounds (object-fit:contain) so drag math
+  // works in image-space, not in the wrapper's letterbox-space.
+  const [imgRect, setImgRect] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
+  const imgRef = useRef<HTMLImageElement | null>(null);
+
+  useEffect(() => {
+    const measure = () => {
+      const wrap = wrapRef.current;
+      const img = imgRef.current;
+      if (!wrap || !img || !img.complete) return;
+      const wrapR = wrap.getBoundingClientRect();
+      // object-fit:contain — image's display rect is centered in wrap
+      const naturalRatio = img.naturalWidth / img.naturalHeight;
+      const wrapRatio = wrapR.width / wrapR.height;
+      let dispW: number, dispH: number;
+      if (naturalRatio > wrapRatio) {
+        dispW = wrapR.width;
+        dispH = wrapR.width / naturalRatio;
+      } else {
+        dispH = wrapR.height;
+        dispW = wrapR.height * naturalRatio;
+      }
+      const left = (wrapR.width - dispW) / 2;
+      const top = (wrapR.height - dispH) / 2;
+      setImgRect({ left, top, width: dispW, height: dispH });
+    };
+    measure();
+    window.addEventListener('resize', measure);
+    return () => window.removeEventListener('resize', measure);
+  }, [sourceUrl]);
+
+  // Drag handlers for crop window. Mode = which part is being dragged.
+  type DragMode = 'move' | 'tl' | 'tr' | 'bl' | 'br';
+  const startDrag = (e: React.PointerEvent, mode: DragMode) => {
+    e.stopPropagation();
+    if (!imgRect) return;
+    const target = e.currentTarget as HTMLElement;
+    target.setPointerCapture(e.pointerId);
+    const startCrop = { ...working };
+    const startX = e.clientX;
+    const startY = e.clientY;
+
+    const move = (ev: PointerEvent) => {
+      if (!imgRect) return;
+      const dx = (ev.clientX - startX) / imgRect.width;
+      const dy = (ev.clientY - startY) / imgRect.height;
+      let { x, y, w, h } = startCrop;
+      if (mode === 'move') {
+        x = Math.max(0, Math.min(1 - w, x + dx));
+        y = Math.max(0, Math.min(1 - h, y + dy));
+      } else if (mode === 'tl') {
+        const newX = Math.max(0, Math.min(x + w - 0.1, x + dx));
+        const newY = Math.max(0, Math.min(y + h - 0.1, y + dy));
+        w = w - (newX - x);
+        h = h - (newY - y);
+        x = newX;
+        y = newY;
+      } else if (mode === 'tr') {
+        const newY = Math.max(0, Math.min(y + h - 0.1, y + dy));
+        const newW = Math.max(0.1, Math.min(1 - x, w + dx));
+        h = h - (newY - y);
+        y = newY;
+        w = newW;
+      } else if (mode === 'bl') {
+        const newX = Math.max(0, Math.min(x + w - 0.1, x + dx));
+        w = w - (newX - x);
+        x = newX;
+        h = Math.max(0.1, Math.min(1 - y, h + dy));
+      } else if (mode === 'br') {
+        w = Math.max(0.1, Math.min(1 - x, w + dx));
+        h = Math.max(0.1, Math.min(1 - y, h + dy));
+      }
+      setWorking({ x, y, w, h });
+    };
+    const up = () => {
+      target.removeEventListener('pointermove', move as any);
+      target.removeEventListener('pointerup', up as any);
+      target.removeEventListener('pointercancel', up as any);
+    };
+    target.addEventListener('pointermove', move as any);
+    target.addEventListener('pointerup', up as any);
+    target.addEventListener('pointercancel', up as any);
+  };
+
+  const applyPreset = (ratio: number | 'free' | 'original') => {
+    if (ratio === 'free') return; // free leaves the crop alone
+    if (ratio === 'original') {
+      setWorking(FULL_CROP);
+      return;
+    }
+    // Set a centered crop matching the requested aspect ratio.
+    // Aspect ratio = w/h. We need a rectangle inside [0,1]x[0,1] of
+    // the SOURCE image (which has its own aspect). The crop is in
+    // normalized source-image coords, so we have to factor that in.
+    const img = imgRef.current;
+    const srcAspect = img && img.naturalHeight ? img.naturalWidth / img.naturalHeight : 1;
+    // We want display crop = ratio (w/h in display pixels)
+    // Source-normalized crop w / h must satisfy:
+    //   (w * srcW) / (h * srcH) = ratio
+    //   w / h = ratio * (srcH / srcW) = ratio / srcAspect
+    const normRatio = ratio / srcAspect;
+    let cw: number, ch: number;
+    if (normRatio >= 1) {
+      cw = 1;
+      ch = 1 / normRatio;
+    } else {
+      ch = 1;
+      cw = normRatio;
+    }
+    const cx = (1 - cw) / 2;
+    const cy = (1 - ch) / 2;
+    setWorking({ x: cx, y: cy, w: cw, h: ch });
+  };
+
+  const rotate90 = () => {
+    const next: 0 | 90 | 180 | 270 = (((workingRotation + 90) % 360) as 0 | 90 | 180 | 270);
+    setWorkingRotation(next);
+  };
+
+  const onDoneClick = () => {
+    onChangeCrop(working);
+    onChangeRotation(workingRotation);
+    onDone();
+  };
+
+  // Compute crop overlay pixel rect from working state + imgRect
+  const overlayRect = imgRect ? {
+    left: imgRect.left + working.x * imgRect.width,
+    top: imgRect.top + working.y * imgRect.height,
+    width: working.w * imgRect.width,
+    height: working.h * imgRect.height,
+  } : null;
+
+  return (
+    <>
+      <div style={S.igComposerHeader}>
+        <button onClick={onCancel} style={S.igComposerHeaderBtn} aria-label="Cancel">Cancel</button>
+        <div style={S.igComposerHeaderTitle}>Crop</div>
+        <button onClick={onDoneClick} style={{ ...S.igComposerHeaderNext, color: '#3B9DFF', cursor: 'pointer' }}>Done</button>
+      </div>
+
+      <div ref={wrapRef} style={S.editorCropWrap}>
+        <img
+          ref={imgRef}
+          src={sourceUrl}
+          alt=""
+          onLoad={() => {
+            // re-measure once loaded
+            const w = wrapRef.current?.getBoundingClientRect();
+            const img = imgRef.current;
+            if (!w || !img) return;
+            const naturalRatio = img.naturalWidth / img.naturalHeight;
+            const wrapRatio = w.width / w.height;
+            let dispW: number, dispH: number;
+            if (naturalRatio > wrapRatio) {
+              dispW = w.width;
+              dispH = w.width / naturalRatio;
+            } else {
+              dispH = w.height;
+              dispW = w.height * naturalRatio;
+            }
+            setImgRect({ left: (w.width - dispW) / 2, top: (w.height - dispH) / 2, width: dispW, height: dispH });
+          }}
+          style={{
+            ...S.editorCropImg,
+            transform: workingRotation ? `rotate(${workingRotation}deg)` : undefined,
+          }}
+          draggable={false}
+        />
+
+        {/* Dark scrim everywhere except inside crop */}
+        {overlayRect && (
+          <div
+            style={{
+              position: 'absolute',
+              inset: 0,
+              pointerEvents: 'none',
+              background: `linear-gradient(rgba(0,0,0,0.55),rgba(0,0,0,0.55))`,
+              WebkitMaskImage: `linear-gradient(#000, #000), linear-gradient(#000, #000)`,
+              WebkitMaskComposite: 'xor' as any,
+              maskComposite: 'exclude' as any,
+              clipPath: `polygon(
+                0% 0%, 0% 100%, ${overlayRect.left}px 100%, ${overlayRect.left}px ${overlayRect.top}px,
+                ${overlayRect.left + overlayRect.width}px ${overlayRect.top}px,
+                ${overlayRect.left + overlayRect.width}px ${overlayRect.top + overlayRect.height}px,
+                ${overlayRect.left}px ${overlayRect.top + overlayRect.height}px,
+                ${overlayRect.left}px 100%, 100% 100%, 100% 0%
+              )`,
+            }}
+          />
+        )}
+
+        {/* Crop window */}
+        {overlayRect && (
+          <div
+            style={{
+              position: 'absolute',
+              left: overlayRect.left,
+              top: overlayRect.top,
+              width: overlayRect.width,
+              height: overlayRect.height,
+              border: '1px solid rgba(255,255,255,0.9)',
+              boxShadow: '0 0 0 1px rgba(0,0,0,0.4)',
+              cursor: 'move',
+              touchAction: 'none',
+            }}
+            onPointerDown={(e) => startDrag(e, 'move')}
+          >
+            {/* Rule-of-thirds gridlines */}
+            <div style={{ position: 'absolute', left: 0, right: 0, top: '33.33%', height: 1, background: 'rgba(255,255,255,0.3)', pointerEvents: 'none' }} />
+            <div style={{ position: 'absolute', left: 0, right: 0, top: '66.66%', height: 1, background: 'rgba(255,255,255,0.3)', pointerEvents: 'none' }} />
+            <div style={{ position: 'absolute', top: 0, bottom: 0, left: '33.33%', width: 1, background: 'rgba(255,255,255,0.3)', pointerEvents: 'none' }} />
+            <div style={{ position: 'absolute', top: 0, bottom: 0, left: '66.66%', width: 1, background: 'rgba(255,255,255,0.3)', pointerEvents: 'none' }} />
+            {/* Corner handles */}
+            {(['tl','tr','bl','br'] as const).map((c) => (
+              <div
+                key={c}
+                style={{
+                  position: 'absolute',
+                  width: 28,
+                  height: 28,
+                  ...(c === 'tl' ? { left: -14, top: -14, cursor: 'nwse-resize' } : {}),
+                  ...(c === 'tr' ? { right: -14, top: -14, cursor: 'nesw-resize' } : {}),
+                  ...(c === 'bl' ? { left: -14, bottom: -14, cursor: 'nesw-resize' } : {}),
+                  ...(c === 'br' ? { right: -14, bottom: -14, cursor: 'nwse-resize' } : {}),
+                  touchAction: 'none',
+                }}
+                onPointerDown={(e) => startDrag(e, c)}
+              >
+                <div style={{
+                  position: 'absolute',
+                  inset: 8,
+                  background: '#FFFFFF',
+                  borderRadius: 2,
+                  boxShadow: '0 0 0 2px rgba(0,0,0,0.4)',
+                  pointerEvents: 'none',
+                }} />
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Aspect ratio + rotate row */}
+      <div style={S.editorCropRow}>
+        <button style={S.editorCropChip} onClick={() => applyPreset('free')}>Free</button>
+        <button style={S.editorCropChip} onClick={() => applyPreset('original')}>Original</button>
+        <button style={S.editorCropChip} onClick={() => applyPreset(1)}>1:1</button>
+        <button style={S.editorCropChip} onClick={() => applyPreset(4/5)}>4:5</button>
+        <button style={S.editorCropChip} onClick={() => applyPreset(16/9)}>16:9</button>
+        <button style={S.editorCropChip} onClick={() => applyPreset(9/16)}>9:16</button>
+        <button style={S.editorCropChip} onClick={rotate90} aria-label="Rotate 90 degrees">⟳</button>
+      </div>
+    </>
+  );
+}
+
 // Search sub-screen inside eXposure. Text input filters loaded posts by
 // caption / handle. Below the input, a horizontal chip strip lets users
 // filter by category. AND'd — both filters apply. Empty results show a
@@ -3056,24 +7171,102 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
   const fileRef = useRef<HTMLInputElement>(null);
   const [photoFile, setPhotoFile] = useState<File | null>(null);
   const [photoPreview, setPhotoPreview] = useState<string | null>(null);
+  // v1.12 multi-photo support. The first picked photo (photoFile) is
+  // the "primary" — it goes through the editor (filter/frame/stickers/
+  // text). Additional photos are extras that ride along untouched. IG
+  // works this way: photo 1 is the cover, the rest are uploaded raw.
+  // Server stores them as a carousel.
+  const [extraPhotos, setExtraPhotos] = useState<File[]>([]);
+  const [extraPreviews, setExtraPreviews] = useState<string[]>([]);
+  // v1.13: when the user picks a video instead of a photo, this flag
+  // routes the flow around the editor (which only handles images).
+  // Set by onPhotoChange when a video/* file lands.
+  const [isVideoPick, setIsVideoPick] = useState(false);
   const [caption, setCaption] = useState('');
   const [submitting, setSubmitting] = useState(false);
-  // Two-stage state: 'pick' while no photo or user is choosing one,
-  // 'caption' once a photo is selected. Tapping Next on stage 1 (only
-  // active when photoFile exists) advances; tapping back on stage 2
-  // returns to stage 1 with the photo cleared.
-  type Stage = 'pick' | 'caption';
+  // Three-stage flow: pick photo → edit (filmstrip/stickers/text) →
+  // caption. The 'edit' stage stores the baked, flattened JPEG so
+  // the original picked file is never sent — only the user's edited
+  // output goes to the server. Back from 'caption' returns to 'edit'
+  // (preserving the bake), back from 'edit' returns to 'pick'.
+  type Stage = 'pick' | 'edit' | 'caption';
   const [stage, setStage] = useState<Stage>('pick');
+  // The file we'll actually upload — the baked version from the editor.
+  // Falls back to the picked file if the editor is somehow skipped.
+  const [editedFile, setEditedFile] = useState<File | null>(null);
+  // Preview URL for the *edited* image — used on the caption screen so
+  // the user sees what they're about to share, not the unedited original.
+  const [editedPreview, setEditedPreview] = useState<string | null>(null);
 
   const captionTrim = caption.trim();
   // Server enforces 1-280 char caption.
-  const canShare = !!photoFile && captionTrim.length >= 1 && captionTrim.length <= 280 && !submitting && !!handle && !!deviceId;
+  const canShare = !!editedFile && captionTrim.length >= 1 && captionTrim.length <= 280 && !submitting && !!handle && !!deviceId;
 
+  // Accept up to 10 photos OR one video in a single pick. v1.13 added
+  // video support. Rules:
+  //   - All photos = carousel post (1-10 slots)
+  //   - One video = single-slot video post (no carousel)
+  //   - Mixed photos+video in one pick = rejected (we don't render
+  //     mixed carousels)
+  //   - Multiple videos in one pick = first one wins, rest dropped
+  // The first photo (if any) becomes the editable primary that goes
+  // through the editor. Extras ride along raw.
+  const MAX_PHOTOS = 10;
+  const MAX_VIDEO_BYTES = 40 * 1024 * 1024;     // 40 MB hard cap, mirrors server
   const onPhotoChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const f = e.target.files && e.target.files[0];
-    if (!f) return;
-    setPhotoFile(f);
-    setPhotoPreview(URL.createObjectURL(f));
+    const fl = e.target.files;
+    if (!fl || fl.length === 0) return;
+    const arr = Array.from(fl);
+
+    // CHECK SIZE FIRST — before any other validation. The most common
+    // failure mode is "I took a video and it was too big" and we want
+    // the toast to tell the user exactly what happened. Done up-front
+    // because the OS picker can hand us a video that's also reported
+    // alongside a thumbnail (some iOS versions do this), and the
+    // "mixed photo+video" check below would steal the error otherwise.
+    const tooBigVideo = arr.find((f) => f.type.startsWith('video/') && f.size > MAX_VIDEO_BYTES);
+    if (tooBigVideo) {
+      const actualMb = Math.round(tooBigVideo.size / 1024 / 1024);
+      const limitMb = Math.round(MAX_VIDEO_BYTES / 1024 / 1024);
+      showToast(`Video too large: ${actualMb}MB (max ${limitMb}MB). Trim it first in Photos.`, 'error');
+      // Reset the input so picking the same file again still re-triggers
+      // onChange. Without this iOS won't re-fire onChange for an
+      // identical pick.
+      if (fileRef.current) fileRef.current.value = '';
+      return;
+    }
+
+    const photos = arr.filter((f) => f.type.startsWith('image/'));
+    const videos = arr.filter((f) => f.type.startsWith('video/'));
+
+    if (photos.length > 0 && videos.length > 0) {
+      showToast('Pick photos OR a video, not both', 'error');
+      return;
+    }
+    if (videos.length > 0) {
+      const v = videos[0];
+      // Size already checked above; this branch is the happy path.
+      // Video post path: skip the editor entirely. Store the video as
+      // "photoFile" for the upload step (server routes by mimetype).
+      // No extras for video posts (v1).
+      setPhotoFile(v);
+      setPhotoPreview(URL.createObjectURL(v));
+      extraPreviews.forEach((u) => URL.revokeObjectURL(u));
+      setExtraPhotos([]);
+      setExtraPreviews([]);
+      setIsVideoPick(true);
+      return;
+    }
+
+    // Photo post path — up to 10 photos.
+    const trimmed = photos.slice(0, MAX_PHOTOS);
+    setPhotoFile(trimmed[0]);
+    setPhotoPreview(URL.createObjectURL(trimmed[0]));
+    extraPreviews.forEach((u) => URL.revokeObjectURL(u));
+    const extras = trimmed.slice(1);
+    setExtraPhotos(extras);
+    setExtraPreviews(extras.map((f) => URL.createObjectURL(f)));
+    setIsVideoPick(false);
   };
 
   const openPicker = () => {
@@ -3083,19 +7276,45 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
 
   const onNext = () => {
     if (!photoFile) return;
+    if (isVideoPick) {
+      // Video posts skip the editor entirely — there's nothing to edit
+      // (no filters/stickers/text on video in v1). The picked video file
+      // IS the file we upload, so we set it as editedFile directly and
+      // jump to the caption stage.
+      if (editedPreview) URL.revokeObjectURL(editedPreview);
+      setEditedFile(photoFile);
+      setEditedPreview(URL.createObjectURL(photoFile));
+      setStage('caption');
+      return;
+    }
+    setStage('edit');
+  };
+
+  const onEditorBack = () => {
+    if (submitting) return;
+    setStage('pick');
+  };
+
+  // Editor calls this with the baked JPEG. Save it, build a preview URL,
+  // and advance to caption.
+  const onEditorNext = (baked: File) => {
+    if (editedPreview) URL.revokeObjectURL(editedPreview);
+    setEditedFile(baked);
+    setEditedPreview(URL.createObjectURL(baked));
     setStage('caption');
   };
 
   const onBackFromCaption = () => {
     if (submitting) return;
-    setStage('pick');
+    setStage('edit');
   };
 
   const onShare = async () => {
-    if (!canShare || !photoFile || !handle || !deviceId) return;
+    if (!canShare || !editedFile || !handle || !deviceId) return;
     setSubmitting(true);
     const result = await apiCreatePost({
-      photo: photoFile,
+      photo: editedFile,
+      extras: extraPhotos,    // v1.12: carousel extras (raw, unedited)
       handle,
       deviceId,
       caption: captionTrim,
@@ -3103,6 +7322,7 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
     });
     setSubmitting(false);
     if (result.ok) {
+      playPostShared();
       onPosted();
     } else {
       showToast(`Post failed: ${result.reason || 'unknown error'}`, 'error');
@@ -3131,13 +7351,17 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
 
   return createPortal(
     <div style={S.igComposerScreen}>
-      {/* Hidden file input — same trick as before. accept="image/*" plus
-          no capture attribute lets iOS show the full picker (Photo
-          Library / Take Photo / Choose File). */}
+      {/* Hidden file input — multi-select enabled in v1.12 for IG-style
+          carousel posts. The user picks 1 to 10 photos at once; photo 1
+          becomes the editable "primary" and the rest ride along as raw
+          carousel extras. accept="image/*" plus no capture attribute
+          lets iOS show the full picker (Photo Library / Take Photo /
+          Choose File). */}
       <input
         ref={fileRef}
         type="file"
-        accept="image/*"
+        accept="image/*,video/*"
+        multiple
         style={{ display: 'none' }}
         onChange={onPhotoChange}
       />
@@ -3163,17 +7387,60 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
           </div>
 
           {/* Big preview area — either tap-to-pick prompt or the selected
-              photo. Edge-to-edge, square aspect ratio like IG. */}
+              photo. Edge-to-edge, square aspect ratio like IG. v1.12:
+              when the user picks multiple photos, a thumbnail strip of
+              the extras shows below the primary so they can see what's
+              going into the carousel. */}
           {photoPreview ? (
             <div style={S.igPickPreviewWrap}>
-              <img src={photoPreview} alt="" style={S.igPickPreviewImg} />
+              {isVideoPick ? (
+                <video
+                  src={photoPreview}
+                  style={S.igPickPreviewImg}
+                  muted
+                  autoPlay
+                  playsInline
+                  loop
+                />
+              ) : (
+                <img src={photoPreview} alt="" style={S.igPickPreviewImg} />
+              )}
               <button
                 type="button"
                 onClick={openPicker}
                 style={S.igPickChangeBtn}
               >
-                Change photo
+                {isVideoPick
+                  ? 'Video selected · Change'
+                  : (extraPhotos.length > 0 ? `${extraPhotos.length + 1} photos · Change` : 'Change photo')}
               </button>
+              {extraPhotos.length > 0 && (
+                <div style={{
+                  display: 'flex',
+                  gap: 6,
+                  padding: '10px 12px',
+                  overflowX: 'auto',
+                  WebkitOverflowScrolling: 'touch' as any,
+                }}>
+                  {/* Primary thumbnail with a "1" badge */}
+                  <div style={{ position: 'relative', flexShrink: 0 }}>
+                    <img
+                      src={photoPreview}
+                      alt=""
+                      style={{ width: 60, height: 60, objectFit: 'cover', borderRadius: 6, border: '2px solid #FF3B5C' }}
+                    />
+                  </div>
+                  {extraPreviews.map((url, i) => (
+                    <div key={i} style={{ position: 'relative', flexShrink: 0 }}>
+                      <img
+                        src={url}
+                        alt=""
+                        style={{ width: 60, height: 60, objectFit: 'cover', borderRadius: 6, border: '1px solid rgba(255,255,255,0.15)' }}
+                      />
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           ) : (
             <button
@@ -3188,11 +7455,26 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
                 <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" />
                 <circle cx="12" cy="13" r="4" />
               </svg>
-              <div style={S.igPickPromptLabel}>Tap to choose a photo</div>
+              <div style={S.igPickPromptLabel}>Tap to choose a photo or video</div>
               <div style={S.igPickPromptHint}>From your camera or library</div>
+              {/* Limits notice — keeps users from wondering why a huge
+                  video silently fails to upload. Only the 40MB file
+                  size is actually enforced (server + client); duration
+                  is not capped, so don't mention it. */}
+              <div style={S.igPickPromptHintSmall}>
+                Videos: max 40MB
+              </div>
             </button>
           )}
         </>
+      )}
+
+      {stage === 'edit' && photoFile && (
+        <ExposurePostEditor
+          photoFile={photoFile}
+          onBack={onEditorBack}
+          onNext={onEditorNext}
+        />
       )}
 
       {stage === 'caption' && (
@@ -3204,11 +7486,24 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
             <div style={{ width: 40 }} />
           </div>
 
-          {/* Smaller centered preview + caption field below */}
+          {/* Smaller centered preview + caption field below. For video
+              posts the preview is a muted, looping <video> so the user
+              sees what they're about to share. */}
           <div style={S.igCaptionBody}>
             <div style={S.igCaptionPreviewRow}>
-              {photoPreview && (
-                <img src={photoPreview} alt="" style={S.igCaptionPreviewImg} />
+              {editedPreview && (
+                isVideoPick ? (
+                  <video
+                    src={editedPreview}
+                    style={S.igCaptionPreviewImg}
+                    muted
+                    autoPlay
+                    playsInline
+                    loop
+                  />
+                ) : (
+                  <img src={editedPreview} alt="" style={S.igCaptionPreviewImg} />
+                )
               )}
               <textarea
                 value={caption}
@@ -3249,16 +7544,16 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
 // Search sub-screen inside eXposure. Text input filters loaded posts by
 // caption / handle. The sticky search bar lives just above the black
 // bottom bar; results scroll above it.
-function ExposureSearchView({ allPosts, currentHandle, deviceId, sites, onSelectSite, onSelectHandle }: {
+function ExposureSearchView({ allPosts, currentHandle, deviceId, sites, onSelectSite, onSelectHandle, onSelectHashtag }: {
   allPosts: SocialPost[];
   currentHandle: string | null;
   deviceId: string | null;
   sites: SinisterSite[];
   onSelectSite: (site: SinisterSite) => void;
   onSelectHandle: (handle: string) => void;
+  onSelectHashtag: (tag: string) => void;
 }) {
   const [query, setQuery] = useState('');
-  const [category, setCategory] = useState<string | null>(null);
 
   const siteById = useMemo(() => {
     const m = new Map<string, SinisterSite>();
@@ -3268,7 +7563,6 @@ function ExposureSearchView({ allPosts, currentHandle, deviceId, sites, onSelect
 
   const q = query.trim().toLowerCase();
   const filtered = allPosts.filter((p) => {
-    if (category && p.siteCategory !== category) return false;
     if (!q) return true;
     // Match against handle, caption, or site title.
     return (
@@ -3279,14 +7573,14 @@ function ExposureSearchView({ allPosts, currentHandle, deviceId, sites, onSelect
   });
 
   return (
-    <div style={{ paddingBottom: 156 }}>
+    <div style={{ paddingBottom: 120 }}>
       {/* Results — render newest-first as user types. Live above the
           sticky search input. paddingBottom on the parent div leaves
-          space for the input + chips + black bar (~156px) so the last
-          result isn't hidden. */}
+          space for the input + black bar (~120px) so the last result
+          isn't hidden. */}
       {filtered.length === 0 ? (
         <div style={S.socialEmpty}>
-          {q || category ? 'No matches.' : 'Start typing to search.'}<br />
+          {q ? 'No matches.' : 'Start typing to search.'}<br />
           <span style={{ opacity: 0.6, fontSize: 12 }}>
             Try a handle, a caption keyword, or a site name.
           </span>
@@ -3304,6 +7598,7 @@ function ExposureSearchView({ allPosts, currentHandle, deviceId, sites, onSelect
                 if (s) onSelectSite(s);
               }}
               onHandleTap={() => onSelectHandle(p.handle)}
+              onHashtagTap={(tag) => onSelectHashtag(tag)}
             />
           ))}
         </div>
@@ -3314,23 +7609,6 @@ function ExposureSearchView({ allPosts, currentHandle, deviceId, sites, onSelect
           transform doesn't break position:fixed. */}
       {createPortal(
         <div style={S.searchStickyBar}>
-          <div style={S.filterChipBar}>
-            <button
-              onClick={() => { playSubDrop(); setCategory(null); }}
-              style={{ ...S.filterChip, ...(category === null ? S.filterChipActive : {}) }}
-            >
-              All
-            </button>
-            {VISIBLE_CATEGORIES.map((cat) => (
-              <button
-                key={cat.key}
-                onClick={() => { playSubDrop(); setCategory(cat.key); }}
-                style={{ ...S.filterChip, ...(category === cat.key ? S.filterChipActive : {}) }}
-              >
-                {cat.label}
-              </button>
-            ))}
-          </div>
           <div style={{ padding: '8px 12px' }}>
             <input
               type="text"
@@ -3347,18 +7625,346 @@ function ExposureSearchView({ allPosts, currentHandle, deviceId, sites, onSelect
   );
 }
 
+// ---------- PhotoLightbox ----------
+// Full-screen image viewer for tapping into a feed post photo. Renders
+// the photo at its native aspect ratio, fit to screen, on a black
+// backdrop. Supports:
+//   - Pinch-to-zoom (1x to 4x)
+//   - Pan when zoomed in
+//   - Double-tap to zoom in (2x) / back to fit (1x)
+//   - Swipe down to dismiss (when at 1x, not zoomed)
+//   - Tap close button (X) to dismiss
+//
+// Implementation notes:
+//   - Single-pointer touch = drag (pan if zoomed, swipe-down dismiss if not)
+//   - Two-pointer touch = pinch (scale + translate around pinch center)
+//   - We use raw touch events for pinch because PointerEvents don't give
+//     us reliable simultaneous pinch tracking on iOS WebKit. Touch events
+//     are the established cross-iOS way to handle multi-touch gestures.
+//   - When zoomed out (scale=1), pan is locked and vertical drag triggers
+//     dismiss. When zoomed in, pan is enabled and swipe-down is disabled
+//     (otherwise the user can't pan up).
+//   - Background opacity tracks dismiss-drag progress for a nice fade-out
+//     feel — drag down 100px → backdrop at 70%, drag 250px → dismissed.
+function PhotoLightbox({ imageUrl, onClose }: {
+  imageUrl: string;
+  onClose: () => void;
+}) {
+  const [scale, setScale] = useState(1);
+  const [tx, setTx] = useState(0);
+  const [ty, setTy] = useState(0);
+  const [dismissDrag, setDismissDrag] = useState(0); // y-offset while swiping to dismiss
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  // Refs hold gesture state between events without re-rendering.
+  const gestureRef = useRef<{
+    mode: 'idle' | 'pan' | 'pinch' | 'dismiss';
+    startX: number;
+    startY: number;
+    startTx: number;
+    startTy: number;
+    startDist: number;
+    startScale: number;
+    pinchCx: number;        // pinch center at gesture start (image-space)
+    pinchCy: number;
+    lastTapTime: number;
+  }>({
+    mode: 'idle',
+    startX: 0, startY: 0,
+    startTx: 0, startTy: 0,
+    startDist: 0, startScale: 1,
+    pinchCx: 0, pinchCy: 0,
+    lastTapTime: 0,
+  });
+
+  // Lock body scroll while open. Restore on unmount.
+  useEffect(() => {
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => { document.body.style.overflow = prev; };
+  }, []);
+
+  // Esc to close (desktop nicety).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  // Helper — distance between two touches.
+  const touchDist = (a: Touch, b: Touch) =>
+    Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+
+  // Clamp pan so the image can't be dragged off-screen entirely. Bound
+  // is roughly (scale-1) * half-of-container-dimension on each axis.
+  const clampPan = (nextTx: number, nextTy: number, atScale: number) => {
+    const c = containerRef.current;
+    if (!c) return { tx: nextTx, ty: nextTy };
+    const w = c.clientWidth;
+    const h = c.clientHeight;
+    const maxX = Math.max(0, (atScale - 1) * w / 2);
+    const maxY = Math.max(0, (atScale - 1) * h / 2);
+    return {
+      tx: Math.max(-maxX, Math.min(maxX, nextTx)),
+      ty: Math.max(-maxY, Math.min(maxY, nextTy)),
+    };
+  };
+
+  const onTouchStart = (e: React.TouchEvent) => {
+    const g = gestureRef.current;
+    if (e.touches.length === 2) {
+      // Pinch start
+      const [t1, t2] = [e.touches[0], e.touches[1]];
+      g.mode = 'pinch';
+      g.startDist = touchDist(t1, t2);
+      g.startScale = scale;
+      g.startTx = tx;
+      g.startTy = ty;
+      g.pinchCx = (t1.clientX + t2.clientX) / 2;
+      g.pinchCy = (t1.clientY + t2.clientY) / 2;
+    } else if (e.touches.length === 1) {
+      const t = e.touches[0];
+      // Double-tap detection — two single-taps within 300ms.
+      const now = Date.now();
+      if (now - g.lastTapTime < 300) {
+        // Toggle zoom 1x <-> 2x at tap point.
+        if (scale > 1) {
+          setScale(1); setTx(0); setTy(0);
+        } else {
+          const c = containerRef.current;
+          if (c) {
+            const r = c.getBoundingClientRect();
+            const cx = r.left + r.width / 2;
+            const cy = r.top + r.height / 2;
+            const newScale = 2;
+            // Translate so the tapped point stays under the finger.
+            const newTx = (cx - t.clientX) * (newScale - 1);
+            const newTy = (cy - t.clientY) * (newScale - 1);
+            const clamped = clampPan(newTx, newTy, newScale);
+            setScale(newScale);
+            setTx(clamped.tx);
+            setTy(clamped.ty);
+          }
+        }
+        g.lastTapTime = 0;
+        g.mode = 'idle';
+        return;
+      }
+      g.lastTapTime = now;
+      g.startX = t.clientX;
+      g.startY = t.clientY;
+      g.startTx = tx;
+      g.startTy = ty;
+      // If zoomed in, single-pointer = pan. If at 1x, single-pointer =
+      // candidate for swipe-down-dismiss; we wait for movement to decide.
+      g.mode = scale > 1 ? 'pan' : 'dismiss';
+    }
+  };
+
+  const onTouchMove = (e: React.TouchEvent) => {
+    const g = gestureRef.current;
+    if (g.mode === 'pinch' && e.touches.length === 2) {
+      const [t1, t2] = [e.touches[0], e.touches[1]];
+      const dist = touchDist(t1, t2);
+      const rawScale = g.startScale * (dist / g.startDist);
+      const newScale = Math.max(1, Math.min(4, rawScale));
+      // Keep the pinch center stable under the fingers.
+      const cx = (t1.clientX + t2.clientX) / 2;
+      const cy = (t1.clientY + t2.clientY) / 2;
+      const dx = cx - g.pinchCx;
+      const dy = cy - g.pinchCy;
+      const clamped = clampPan(g.startTx + dx, g.startTy + dy, newScale);
+      setScale(newScale);
+      setTx(clamped.tx);
+      setTy(clamped.ty);
+    } else if (g.mode === 'pan' && e.touches.length === 1) {
+      const t = e.touches[0];
+      const dx = t.clientX - g.startX;
+      const dy = t.clientY - g.startY;
+      const clamped = clampPan(g.startTx + dx, g.startTy + dy, scale);
+      setTx(clamped.tx);
+      setTy(clamped.ty);
+    } else if (g.mode === 'dismiss' && e.touches.length === 1) {
+      const t = e.touches[0];
+      const dy = t.clientY - g.startY;
+      const dx = t.clientX - g.startX;
+      // Only count downward drag as dismiss; horizontal swipes do nothing.
+      // Allow some upward drag too so accidental tiny upward drift doesn't
+      // feel sticky. Anything > 12px down enters the dismiss visual state.
+      if (dy > 0 && Math.abs(dx) < dy * 1.5) {
+        setDismissDrag(dy);
+      } else {
+        setDismissDrag(0);
+      }
+    }
+  };
+
+  const onTouchEnd = (e: React.TouchEvent) => {
+    const g = gestureRef.current;
+    if (g.mode === 'dismiss') {
+      // Commit dismiss if dragged > 120px, otherwise snap back.
+      if (dismissDrag > 120) {
+        onClose();
+      } else {
+        setDismissDrag(0);
+      }
+    }
+    if (e.touches.length === 0) {
+      g.mode = 'idle';
+    } else if (e.touches.length === 1 && g.mode === 'pinch') {
+      // Lifted one finger out of a pinch — convert to pan if zoomed,
+      // else idle. Reset pan anchor to the remaining finger.
+      const t = e.touches[0];
+      g.startX = t.clientX;
+      g.startY = t.clientY;
+      g.startTx = tx;
+      g.startTy = ty;
+      g.mode = scale > 1 ? 'pan' : 'idle';
+    }
+  };
+
+  // Backdrop opacity fades with dismiss drag. 1 at rest, 0 fully dragged.
+  const backdropAlpha = Math.max(0.4, 1 - dismissDrag / 300);
+
+  return createPortal(
+    <div
+      ref={containerRef}
+      onTouchStart={onTouchStart}
+      onTouchMove={onTouchMove}
+      onTouchEnd={onTouchEnd}
+      onClick={(e) => {
+        // Plain click on backdrop (not on image) = dismiss. We check
+        // target to avoid dismissing when tapping the image itself,
+        // which is the normal way users interact with the viewer.
+        if (e.target === e.currentTarget) onClose();
+      }}
+      style={{
+        position: 'fixed',
+        inset: 0,
+        backgroundColor: `rgba(0,0,0,${backdropAlpha})`,
+        zIndex: 10000,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        overflow: 'hidden',
+        touchAction: 'none',
+        userSelect: 'none',
+      }}
+    >
+      {/* Close (X) button. Always available regardless of zoom state. */}
+      <button
+        onClick={(e) => { e.stopPropagation(); onClose(); }}
+        aria-label="Close"
+        style={{
+          position: 'absolute',
+          top: 'calc(env(safe-area-inset-top, 0px) + 12px)',
+          right: 12,
+          width: 40,
+          height: 40,
+          borderRadius: 20,
+          backgroundColor: 'rgba(0,0,0,0.5)',
+          border: '1px solid rgba(255,255,255,0.2)',
+          color: '#fff',
+          fontSize: 20,
+          fontWeight: 700,
+          cursor: 'pointer',
+          zIndex: 2,
+          backdropFilter: 'blur(6px)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+        }}
+      >
+        ✕
+      </button>
+
+      <img
+        src={imageUrl}
+        alt=""
+        draggable={false}
+        style={{
+          maxWidth: '100%',
+          maxHeight: '100%',
+          objectFit: 'contain',
+          display: 'block',
+          transform: `translate(${tx}px, ${ty + dismissDrag}px) scale(${scale})`,
+          transition: gestureRef.current.mode === 'idle' ? 'transform 0.2s ease-out' : 'none',
+          transformOrigin: 'center center',
+          pointerEvents: 'none',
+        }}
+      />
+    </div>,
+    document.body
+  );
+}
+
 // Single post card inside the feed. Owns its own like state so toggling
 // is fast and doesn't trigger a parent re-render of the whole list.
-function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap }: {
+function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap, onHashtagTap, onPostRemoved }: {
   post: SocialPost;
   currentHandle: string | null;
   deviceId: string | null;
   onSiteTap: () => void;
   onHandleTap: () => void;
+  // v1.14: called when the user taps a hashtag in the caption. Parent
+  // should navigate to the hashtag view. Optional — if omitted, hashtag
+  // taps are a no-op (still visually distinct, just don't navigate).
+  onHashtagTap?: (tag: string) => void;
+  // Optional. Called when the user hides or deletes this post — parent
+  // should remove it from its post list so it doesn't re-render. If
+  // omitted, the card hides itself locally.
+  onPostRemoved?: (postId: string) => void;
 }) {
   const [liked, setLiked] = useState(false);
   const [likeCount, setLikeCount] = useState(post.likeCount || 0);
   const [likeBusy, setLikeBusy] = useState(false);
+  // Local copy of the comment count so we can optimistically bump it
+  // when the user posts a new comment from the sheet without round-
+  // tripping back to the feed endpoint. Server is still the source of
+  // truth — we sync on sheet open via apiFetchComments.length.
+  const [commentCount, setCommentCount] = useState(post.commentCount || 0);
+  // Whether the IG-style comment sheet is open over this post.
+  const [commentsOpen, setCommentsOpen] = useState(false);
+  // 3-dot menu state — action sheet open, report modal open.
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [reportOpen, setReportOpen] = useState(false);
+  // Delete confirmation modal (own posts only).
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  // Local-hide fallback when no onPostRemoved callback is wired.
+  const [localHidden, setLocalHidden] = useState(false);
+  // Lightbox state — tapping the photo opens a full-screen viewer with
+  // pinch-zoom, pan, and swipe-down dismiss. See PhotoLightbox above.
+  const [lightboxOpen, setLightboxOpen] = useState(false);
+  // For multi-photo carousel posts: which slide (0-indexed) is centered.
+  // Drives the page-dots indicator and the "1/N" badge in the corner.
+  const [carouselIndex, setCarouselIndex] = useState(0);
+  // Repost state — server-backed. Optimistic toggle on tap, rollback
+  // on failure. Status is fetched on mount so reloads show the correct
+  // filled/empty icon for the current user.
+  const [reposted, setReposted] = useState(false);
+  const [repostCount, setRepostCount] = useState(post.repostCount || 0);
+  const [repostBusy, setRepostBusy] = useState(false);
+
+  // Load this user's current repost status when the card mounts. We
+  // don't block render on it — the icon starts empty and fills in if
+  // the server says we've reposted.
+  useEffect(() => {
+    if (!currentHandle) return;
+    let cancelled = false;
+    apiRepostStatus({ postId: post.id, handle: currentHandle }).then((s) => {
+      if (cancelled) return;
+      setReposted(s.reposted);
+      if (typeof s.count === 'number') setRepostCount(s.count);
+    });
+    return () => { cancelled = true; };
+  }, [post.id, currentHandle]);
+
+  // Follow state — only relevant for other people's posts. Inline
+  // button matches IG: "Follow" → "Following" after tap. Server is the
+  // source of truth, loaded once per mount.
+  const [isFollowing, setIsFollowing] = useState(false);
+  const [followBusy, setFollowBusy] = useState(false);
+
+  const isOwn = !!currentHandle && currentHandle.toLowerCase() === (post.handle || '').toLowerCase();
 
   // Fetch authoritative like state on mount. Server is the source of
   // truth — the post.likeCount cached on the feed is just a starting
@@ -3374,6 +7980,40 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap 
     return () => { cancelled = true; };
   }, [post.id, currentHandle]);
 
+  // Fetch follow status for the post author so we can render "Follow"
+  // vs "Following" inline. Skipped on own posts (no follow button there).
+  useEffect(() => {
+    if (isOwn || !currentHandle) return;
+    let cancelled = false;
+    (async () => {
+      const status = await apiFollowStatus({ target: post.handle, handle: currentHandle });
+      if (cancelled) return;
+      setIsFollowing(status.followedByYou);
+    })();
+    return () => { cancelled = true; };
+  }, [post.handle, currentHandle, isOwn]);
+
+  const onToggleFollow = async () => {
+    if (followBusy) return;
+    if (!currentHandle || !deviceId) {
+      showToast('Sign in to follow', 'error');
+      return;
+    }
+    setFollowBusy(true);
+    // Optimistic flip.
+    const wasFollowing = isFollowing;
+    setIsFollowing(!wasFollowing);
+    const r = wasFollowing
+      ? await apiUnfollow({ follower: currentHandle, target: post.handle, deviceId })
+      : await apiFollow({ follower: currentHandle, target: post.handle, deviceId });
+    setFollowBusy(false);
+    if (!r.ok) {
+      // Roll back on failure.
+      setIsFollowing(wasFollowing);
+      showToast(r.reason || 'Follow failed', 'error');
+    }
+  };
+
   const onToggleLike = async () => {
     if (!currentHandle || !deviceId) {
       showToast('Claim a handle to like posts', 'error');
@@ -3381,6 +8021,10 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap 
     }
     if (likeBusy) return;
     setLikeBusy(true);
+
+    // Sound only on LIKE (not unlike) — matches IG/Twitter behavior
+    // where the audible feedback fires on the positive action.
+    if (!liked) playLikeBlip();
 
     // Optimistic update
     const prevLiked = liked;
@@ -3404,16 +8048,43 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap 
 
   const timeAgoShort = formatTimeAgoShort(post.approvedAt || post.createdAt);
 
+  // If the user picked "Hide post" from the 3-dot menu (and there's no
+  // parent callback to remove from the list), short-circuit the render
+  // so the card disappears in place.
+  if (localHidden) return null;
+
   return (
     <div style={S.postCard}>
-      {/* Top row: avatar | handle · time | location chip | menu */}
+      {/* "Reposted by X" banner — only renders when this feed entry is a
+          repost (server stamps repostedBy on the entry). Tapping the
+          handle opens that user's profile. Matches IG's small grey
+          line that sits above the original post card. */}
+      {post.repostedBy && (
+        <div style={S.repostBanner}>
+          {/* Repost icon, smaller — visual cue this entry was rebroadcast. */}
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#8a8a8a" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+            <polyline points="17 1 21 5 17 9" />
+            <path d="M3 11V9a4 4 0 0 1 4-4h14" />
+            <polyline points="7 23 3 19 7 15" />
+            <path d="M21 13v2a4 4 0 0 1-4 4H3" />
+          </svg>
+          <span style={S.repostBannerText}>
+            Reposted by <span style={S.repostBannerHandle}>{post.repostedBy}</span>
+          </span>
+        </div>
+      )}
+      {/* Top row: avatar | handle · time | follow | menu */}
       <div style={S.postHeader}>
         <button onClick={onHandleTap} style={S.postAvatarBtn} aria-label={`${post.handle} profile`}>
-          {/* Skull placeholder avatar — until users can upload their own.
-              Wrapped in a circular div with a thin neon-purple ring so
-              the eXposure identity reads on the otherwise IG-neutral
-              card. Same icon for everyone for now. */}
-          <img src={exposureIconUrl} alt="" style={S.postAvatarImg} />
+          {/* Author avatar — server denormalizes post.avatarUrl. Falls
+              back to the default exposure icon if the user hasn't picked
+              a library/upload avatar yet. Wrapped in the same circular
+              ring styling as before. */}
+          <img
+            src={resolveAvatarUrl(post.avatarUrl) || exposureIconUrl}
+            alt=""
+            style={S.postAvatarImg}
+          />
         </button>
         <div style={S.postHeaderTextCol}>
           <div style={S.postHeaderLine1}>
@@ -3429,12 +8100,208 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap 
             </button>
           )}
         </div>
-        <button style={S.postMenuBtn} aria-label="More" disabled>⋯</button>
+        {/* IG-style inline Follow button — hides on own posts. The
+            button toggles between "Follow" (filled white pill) and
+            "Following" (outlined gray pill). Sits between the handle
+            column and the 3-dot menu. */}
+        {!isOwn && currentHandle && (
+          <button
+            onClick={onToggleFollow}
+            disabled={followBusy}
+            style={isFollowing ? S.postFollowBtnFollowing : S.postFollowBtn}
+            aria-label={isFollowing ? `Unfollow ${post.handle}` : `Follow ${post.handle}`}
+          >
+            {isFollowing ? 'Following' : 'Follow'}
+          </button>
+        )}
+        <button
+          onClick={() => setMenuOpen(true)}
+          style={S.postMenuBtn}
+          aria-label="More options"
+        >⋯</button>
       </div>
 
-      {/* Photo — edge-to-edge with slightly rounded corners (per request).
-          objectFit cover keeps aspect ratio without letterboxing. */}
-      <img src={post.photoUrl} alt="" style={S.postPhoto} />
+      {/* Photo(s) — single-photo posts render one image edge-to-edge;
+          multi-photo posts (v1.12 carousels) render a horizontal snap-
+          scroll strip with page dots underneath. Tap any photo to open
+          the full-aspect lightbox viewer with pinch-zoom and pan.
+          We use CSS scroll-snap so the gesture feels native — no JS
+          touch handling, no jank. */}
+      {(() => {
+        const photos = (post.photoUrls && post.photoUrls.length > 0)
+          ? post.photoUrls
+          : [post.photoUrl];
+        // Parallel array of media types. Defaults to all 'photo' for
+        // backwards-compat with pre-v1.13 posts that don't carry it.
+        const types = (post.mediaTypes && post.mediaTypes.length === photos.length)
+          ? post.mediaTypes
+          : photos.map(() => 'photo');
+        const isCarousel = photos.length > 1;
+
+        // Renders a single slot. Photo = <img>; video = <video> with
+        // autoplay-muted. v1.16: instead of looping forever, count plays
+        // via onEnded and stop after 3. Saves battery + cuts the
+        // annoying "video that won't stop" UX when scrolled past.
+        const renderSlot = (url: string, type: string, i: number) => {
+          if (type === 'video') {
+            return (
+              <video
+                key={i}
+                src={url}
+                style={S.postPhoto}
+                // Always mounts muted. User can tap the native mute
+                // button on the controls to hear audio for that ONE
+                // video. As soon as it scrolls out of view it pauses
+                // AND re-mutes (see IntersectionObserver below) so
+                // (a) the next video in view doesn't have lingering
+                // audio carry-over, and (b) coming back to this video
+                // starts silent again. Simpler than IG's remember-mute
+                // model and avoids audio-blast on app reopen.
+                muted
+                autoPlay
+                playsInline
+                controls
+                preload="metadata"
+                // v1.17: pause when scrolled out of view (≥75% off
+                // screen). On exit we also force .muted = true so the
+                // next time this video comes back into view, or any
+                // other video the user scrolls to, it starts silent.
+                // Returning to view auto-resumes unless we hit the
+                // 3-play cap.
+                ref={(el) => {
+                  if (!el) return;
+                  if (el.dataset.viewObs === '1') return;
+                  el.dataset.viewObs = '1';
+                  if (typeof IntersectionObserver === 'undefined') return;
+                  const io = new IntersectionObserver(
+                    (entries) => {
+                      for (const ent of entries) {
+                        const v = ent.target as HTMLVideoElement;
+                        if (ent.isIntersecting) {
+                          const n = parseInt(v.dataset.playCount || '0', 10);
+                          if (n < 3 && v.paused) {
+                            v.play().catch(() => { /* autoplay may block — silent */ });
+                          }
+                        } else {
+                          // Leaving the viewport: pause + reset to muted.
+                          if (!v.paused) v.pause();
+                          v.muted = true;
+                        }
+                      }
+                    },
+                    { threshold: 0.25 }
+                  );
+                  io.observe(el);
+                }}
+                // data attribute tracks how many full plays we've seen.
+                // onEnded fires per playthrough; we manually re-trigger
+                // play() up to 3 times, then stop and leave the video
+                // paused on its last frame.
+                onPlay={(e) => {
+                  const el = e.currentTarget as HTMLVideoElement;
+                  if (!el.dataset.playCount) el.dataset.playCount = '0';
+                }}
+                onEnded={(e) => {
+                  const el = e.currentTarget as HTMLVideoElement;
+                  const n = parseInt(el.dataset.playCount || '0', 10) + 1;
+                  el.dataset.playCount = String(n);
+                  if (n < 3) {
+                    el.currentTime = 0;
+                    el.play().catch(() => { /* silent — autoplay may be blocked */ });
+                  }
+                  // else: leave paused on final frame.
+                }}
+              />
+            );
+          }
+          return <img key={i} src={url} alt="" style={S.postPhoto} draggable={false} />;
+        };
+
+        if (!isCarousel) {
+          const type = types[0] || 'photo';
+          if (type === 'video') {
+            // Single video — render directly, no wrapping button.
+            return (
+              <div style={{ width: '100%', display: 'block' }}>
+                {renderSlot(photos[0], 'video', 0)}
+              </div>
+            );
+          }
+          return (
+            <button
+              type="button"
+              onClick={() => setLightboxOpen(true)}
+              aria-label="View photo fullscreen"
+              style={{
+                padding: 0,
+                margin: 0,
+                border: 'none',
+                background: 'transparent',
+                cursor: 'pointer',
+                display: 'block',
+                width: '100%',
+              }}
+            >
+              {renderSlot(photos[0], 'photo', 0)}
+            </button>
+          );
+        }
+        return (
+          <div style={S.postCarouselWrap}>
+            <div
+              style={S.postCarouselScroller}
+              onTouchStart={(e) => e.stopPropagation()}
+              onTouchMove={(e) => e.stopPropagation()}
+              onTouchEnd={(e) => e.stopPropagation()}
+              onScroll={(e) => {
+                const el = e.currentTarget;
+                const w = el.clientWidth;
+                if (w > 0) {
+                  const idx = Math.round(el.scrollLeft / w);
+                  if (idx !== carouselIndex) setCarouselIndex(idx);
+                }
+              }}
+            >
+              {photos.map((url, i) => {
+                const type = types[i] || 'photo';
+                if (type === 'video') {
+                  return (
+                    <div key={i} style={S.postCarouselSlide}>
+                      {renderSlot(url, 'video', i)}
+                    </div>
+                  );
+                }
+                return (
+                  <button
+                    key={i}
+                    type="button"
+                    onClick={() => setLightboxOpen(true)}
+                    aria-label={`View photo ${i + 1} of ${photos.length} fullscreen`}
+                    style={S.postCarouselSlide}
+                  >
+                    {renderSlot(url, 'photo', i)}
+                  </button>
+                );
+              })}
+            </div>
+            {/* Page dots */}
+            <div style={S.postCarouselDots}>
+              {photos.map((_, i) => (
+                <span
+                  key={i}
+                  style={{
+                    ...S.postCarouselDot,
+                    ...(i === carouselIndex ? S.postCarouselDotActive : null),
+                  }}
+                />
+              ))}
+            </div>
+            <div style={S.postCarouselBadge}>
+              {carouselIndex + 1}/{photos.length}
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Actions row — Instagram-style line icons: heart, comment (disabled
           for now, real comments later), share. All outlined SVGs at equal
@@ -3456,14 +8323,68 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap 
           )}
         </button>
         <button
-          style={{ ...S.postIconBtn, opacity: 0.4 }}
-          aria-label="Comment (coming soon)"
-          disabled
+          onClick={() => setCommentsOpen(true)}
+          style={S.postIconBtn}
+          aria-label="View comments"
         >
-          {/* Comment bubble — disabled placeholder until comments ship */}
+          {/* Comment bubble — taps open the IG-style sheet. */}
           <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#F0EBE0" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
             <path d="M21 11.5a8.38 8.38 0 0 1-8.5 8.5 8.5 8.5 0 0 1-3.8-.9L3 21l1.9-5.7A8.38 8.38 0 0 1 4 11.5 8.5 8.5 0 0 1 12.5 3a8.38 8.38 0 0 1 8.5 8.5z" />
           </svg>
+          {commentCount > 0 && (
+            <span style={S.postIconBtnCount}>{commentCount}</span>
+          )}
+        </button>
+        <button
+          onClick={async () => {
+            if (!currentHandle || !deviceId) {
+              showToast('Sign in to repost', 'error');
+              return;
+            }
+            if (repostBusy) return;
+            // Optimistic toggle so the icon flips instantly. Roll back
+            // if the server rejects.
+            const prev = reposted;
+            const prevCount = repostCount;
+            setReposted(!prev);
+            setRepostCount(prev ? Math.max(0, prevCount - 1) : prevCount + 1);
+            setRepostBusy(true);
+            const result = await apiToggleRepost({
+              postId: post.id, handle: currentHandle, deviceId,
+            });
+            setRepostBusy(false);
+            if (!result.ok) {
+              // Rollback. Show specific message if the server explained why
+              // (e.g. can't repost your own post).
+              setReposted(prev);
+              setRepostCount(prevCount);
+              showToast(result.reason || 'Repost failed', 'error');
+              return;
+            }
+            // Sync to server's authoritative state.
+            if (typeof result.reposted === 'boolean') setReposted(result.reposted);
+            if (typeof result.count === 'number') setRepostCount(result.count);
+            showToast(result.reposted ? 'Reposted' : 'Removed from your reposts', 'success');
+          }}
+          style={S.postIconBtn}
+          aria-label={reposted ? 'Remove repost' : 'Repost'}
+        >
+          {/* Repost icon — two arrows forming a cycle, IG-style. Fills
+              green when reposted for the same visual feedback as the heart. */}
+          <svg
+            width="26" height="26" viewBox="0 0 24 24"
+            fill="none"
+            stroke={reposted ? '#3DDB85' : '#F0EBE0'}
+            strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"
+          >
+            <polyline points="17 1 21 5 17 9" />
+            <path d="M3 11V9a4 4 0 0 1 4-4h14" />
+            <polyline points="7 23 3 19 7 15" />
+            <path d="M21 13v2a4 4 0 0 1-4 4H3" />
+          </svg>
+          {repostCount > 0 && (
+            <span style={S.postIconBtnCount}>{repostCount}</span>
+          )}
         </button>
         <button
           onClick={async () => {
@@ -3508,14 +8429,1213 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap 
         </div>
       )}
 
-      {/* Caption — handle in bold inline with caption text, like IG */}
+      {/* Caption — handle in bold inline with caption text, like IG.
+          Tapping the handle goes to profile; tapping a hashtag goes to
+          that tag's view; tapping plain caption text opens the comment
+          sheet. CaptionWithTags renders the body and stops propagation
+          on tag taps so plain-text taps still bubble. */}
       <div style={S.postCaptionLine}>
         <button onClick={onHandleTap} style={S.postCaptionHandle}>{post.handle}</button>
-        <span style={S.postCaptionText}> {post.caption}</span>
+        <span
+          onClick={() => setCommentsOpen(true)}
+          style={S.postCaptionText}
+        >
+          {' '}
+          <CaptionWithTags
+            text={post.caption}
+            onTagTap={(tag) => onHashtagTap && onHashtagTap(tag)}
+          />
+        </span>
+      </div>
+
+      {/* "View all N comments" link, IG-style — appears below the
+          caption when there's at least one comment. Tapping opens the
+          same sheet as the comment-icon button. */}
+      {commentCount > 0 && (
+        <button onClick={() => setCommentsOpen(true)} style={S.postViewCommentsBtn}>
+          View {commentCount === 1 ? '1 comment' : `all ${commentCount} comments`}
+        </button>
+      )}
+
+      {/* IG-style inline preview rows — show the latest 1-2 top-level
+          comments under the caption. Each row is tappable and opens
+          the comment sheet just like the View-all button. Server sends
+          newest-first; we reverse for display so the older of the two
+          appears above the newer (more natural reading order — same as
+          IG's chronological top-of-thread preview). */}
+      {(post.latestComments && post.latestComments.length > 0) && (
+        <div style={S.postLatestComments}>
+          {[...post.latestComments].reverse().map((c) => (
+            <button
+              key={c.id}
+              type="button"
+              onClick={() => setCommentsOpen(true)}
+              style={S.postLatestCommentRow}
+            >
+              <span style={S.postLatestCommentHandle}>{c.handle}</span>
+              <span style={S.postLatestCommentBody}> {c.body}</span>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* IG-style bottom-sheet comments. Rendered conditionally so the
+          DOM stays small until the user actually taps. The sheet itself
+          portals to body so it overlays everything. */}
+      {commentsOpen && (
+        <CommentSheet
+          post={post}
+          currentHandle={currentHandle}
+          deviceId={deviceId}
+          onClose={() => setCommentsOpen(false)}
+          onCountChange={(n) => setCommentCount(n)}
+        />
+      )}
+
+      {/* 3-dot action sheet — IG-style. About this account is always
+          available; Hide is always available. Block + Report are
+          surfaced only for other people's posts. Delete is surfaced
+          only for the viewer's own posts. */}
+      {menuOpen && (
+        <ActionSheet
+          onClose={() => setMenuOpen(false)}
+          actions={[
+            {
+              label: 'About this account',
+              onClick: () => onHandleTap(),
+            },
+            {
+              label: 'Hide post',
+              onClick: async () => {
+                await hidePost(post.id);
+                if (onPostRemoved) {
+                  onPostRemoved(post.id);
+                } else {
+                  setLocalHidden(true);
+                }
+                showToast('Post hidden', 'success');
+              },
+            },
+            ...(isOwn ? [
+              {
+                label: 'Delete post',
+                onClick: () => setDeleteConfirmOpen(true),
+                destructive: true,
+              },
+            ] : [
+              {
+                label: 'Report post',
+                onClick: () => {
+                  if (!currentHandle || !deviceId) {
+                    showToast('Claim a handle to report', 'error');
+                    return;
+                  }
+                  setReportOpen(true);
+                },
+                destructive: true,
+              },
+              {
+                label: `Block @${post.handle}`,
+                onClick: async () => {
+                  if (!currentHandle || !deviceId) {
+                    showToast('Claim a handle to block', 'error');
+                    return;
+                  }
+                  const result = await apiBlock({
+                    blocker: currentHandle,
+                    blocked: post.handle,
+                    deviceId,
+                  });
+                  if (result.ok) {
+                    invalidateHiddenSet();
+                    showToast(`Blocked @${post.handle}`, 'success');
+                  } else {
+                    showToast(result.reason || 'Block failed', 'error');
+                  }
+                },
+                destructive: true,
+              },
+            ]),
+          ]}
+        />
+      )}
+
+      {/* Delete confirmation modal — only own posts. Two-step so a
+          stray tap doesn't nuke a post. */}
+      {deleteConfirmOpen && currentHandle && deviceId && (
+        <ConfirmDeletePostModal
+          onCancel={() => setDeleteConfirmOpen(false)}
+          onConfirm={async () => {
+            setDeleteConfirmOpen(false);
+            const r = await apiDeleteMyPost({
+              postId: post.id,
+              handle: currentHandle,
+              deviceId,
+            });
+            if (r.ok) {
+              if (onPostRemoved) {
+                onPostRemoved(post.id);
+              } else {
+                setLocalHidden(true);
+              }
+              showToast('Post deleted', 'success');
+            } else {
+              showToast(r.reason || 'Delete failed', 'error');
+            }
+          }}
+        />
+      )}
+
+      {/* Report modal — only renders when user picks Report from the
+          action sheet. apiReport already handles dedupe server-side. */}
+      {reportOpen && currentHandle && deviceId && (
+        <ReportModal
+          targetType="post"
+          targetId={post.id}
+          handle={currentHandle}
+          deviceId={deviceId}
+          onClose={() => setReportOpen(false)}
+          onReported={() => {
+            setReportOpen(false);
+            showToast('Thanks — report sent', 'success');
+          }}
+        />
+      )}
+
+      {/* Full-screen photo viewer — opens when user taps the post photo.
+          Pinch-zoom, pan when zoomed, double-tap zoom, swipe-down dismiss. */}
+      {lightboxOpen && (
+        <PhotoLightbox
+          imageUrl={post.photoUrl}
+          onClose={() => setLightboxOpen(false)}
+        />
+      )}
+    </div>
+  );
+}
+
+// ---------- SocialPollCard ----------
+// Renders a poll inline in the DreadFeed alongside SocialPostCards. The
+// card has two visual states:
+//   - Pre-vote (no userVote, not expired): question + 4 tappable options,
+//     no results visible. Tapping an option submits the vote and the
+//     card flips to the results state.
+//   - Post-vote / expired: question + 4 horizontal bars showing percent
+//     of total, with the user's pick highlighted. Tapping a different
+//     option (if not expired) changes the vote.
+// Mirrors the SocialPostCard outer chrome (header with avatar + handle)
+// so the two card types feel like the same feed surface.
+function SocialPollCard({ poll, currentHandle, deviceId, onHandleTap }: {
+  poll: PollEntry;
+  currentHandle: string | null;
+  deviceId: string | null;
+  onHandleTap: () => void;
+}) {
+  // Local optimistic state — vote updates flip the card immediately
+  // without waiting for a feed refetch.
+  const [userVote, setUserVote] = useState<number | null>(poll.userVote);
+  const [tallies, setTallies] = useState<number[] | null>(poll.tallies);
+  const [totalVotes, setTotalVotes] = useState<number | null>(poll.totalVotes);
+  const [voting, setVoting] = useState(false);
+
+  const expired = poll.expired;
+  const showResults = expired || userVote !== null;
+  const canVote = !expired && !!currentHandle && !!deviceId && !voting;
+
+  // ---- Time-remaining label ("3d left" / "Ends in 4h" / "Closed") ----
+  // Computed once on mount; polls don't tick in real time — staleness
+  // by a few minutes is fine for a feed card.
+  const timeLabel = (() => {
+    if (expired) return 'Poll closed';
+    const ms = new Date(poll.expiresAt).getTime() - Date.now();
+    if (ms <= 0) return 'Poll closed';
+    const days = Math.floor(ms / (24 * 60 * 60 * 1000));
+    if (days >= 1) return `${days}d left`;
+    const hours = Math.floor(ms / (60 * 60 * 1000));
+    if (hours >= 1) return `${hours}h left`;
+    const mins = Math.floor(ms / (60 * 1000));
+    return `${Math.max(1, mins)}m left`;
+  })();
+
+  const onPick = async (idx: number) => {
+    if (!canVote) {
+      if (!currentHandle) {
+        showToast('Claim a handle first to vote', 'error');
+      }
+      return;
+    }
+    if (idx === userVote) return;        // tapping current pick = no-op
+    playPop();
+    setVoting(true);
+    const result = await apiVoteOnPoll({
+      pollId: poll.id,
+      handle: currentHandle!,
+      deviceId: deviceId!,
+      optionIndex: idx,
+    });
+    setVoting(false);
+    if (result.ok) {
+      setUserVote(typeof result.userVote === 'number' ? result.userVote : idx);
+      if (Array.isArray(result.tallies)) setTallies(result.tallies);
+      if (typeof result.totalVotes === 'number') setTotalVotes(result.totalVotes);
+    } else {
+      showToast(`Vote failed: ${result.reason || 'unknown'}`, 'error');
+    }
+  };
+
+  // Percent for the bar, gracefully handling 0 total.
+  const pct = (idx: number) => {
+    if (!tallies || !totalVotes) return 0;
+    if (totalVotes === 0) return 0;
+    return Math.round((tallies[idx] / totalVotes) * 100);
+  };
+
+  return (
+    <div style={S.pollCard}>
+      {/* Card header — handle + time-remaining badge. Tapping the handle
+          navigates to the user's profile (same as post cards). */}
+      <div style={S.pollCardHeader}>
+        <button
+          onClick={onHandleTap}
+          style={S.pollCardHandleBtn}
+          className="sinister-icon-btn"
+        >
+          @{poll.handle}
+        </button>
+        <div style={S.pollCardBadge}>📊 Poll · {timeLabel}</div>
+      </div>
+
+      {/* Question — system font, white, generous line-height. */}
+      <div style={S.pollCardQuestion}>{poll.question}</div>
+
+      {/* Options. Two visual modes: pre-vote (plain pill buttons) or
+          results (horizontal-bar fills inside each option, percent label
+          on the right, viewer's pick highlighted with a red accent). */}
+      <div style={S.pollCardOptions}>
+        {poll.options.map((opt, idx) => {
+          const isPicked = userVote === idx;
+          if (!showResults) {
+            return (
+              <button
+                key={idx}
+                onClick={() => onPick(idx)}
+                disabled={!canVote}
+                style={S.pollOptionBtn}
+                className="sinister-icon-btn"
+              >
+                {opt}
+              </button>
+            );
+          }
+          const p = pct(idx);
+          return (
+            <button
+              key={idx}
+              onClick={() => onPick(idx)}
+              disabled={!canVote}
+              style={{
+                ...S.pollOptionResult,
+                ...(isPicked ? S.pollOptionResultPicked : {}),
+              }}
+              className="sinister-icon-btn"
+            >
+              {/* Fill bar — width is the percentage. Sits behind the label. */}
+              <div
+                style={{
+                  ...S.pollOptionFill,
+                  width: `${p}%`,
+                  ...(isPicked ? S.pollOptionFillPicked : {}),
+                }}
+              />
+              <div style={S.pollOptionLabel}>{opt}{isPicked ? ' ✓' : ''}</div>
+              <div style={S.pollOptionPct}>{p}%</div>
+            </button>
+          );
+        })}
+      </div>
+
+      {/* Footer — total vote count when visible, or a CTA prompt when
+          results are hidden. Plus expiry note for closed polls. */}
+      <div style={S.pollCardFooter}>
+        {showResults ? (
+          <>
+            <span>{totalVotes ?? 0} vote{(totalVotes ?? 0) === 1 ? '' : 's'}</span>
+            {!expired && userVote !== null && (
+              <span style={{ opacity: 0.6, marginLeft: 8 }}>· Tap to change your vote</span>
+            )}
+            {expired && (
+              <span style={{ opacity: 0.6, marginLeft: 8 }}>· Final results</span>
+            )}
+          </>
+        ) : (
+          <span style={{ opacity: 0.6 }}>Vote to see results</span>
+        )}
       </div>
     </div>
   );
 }
+
+// ---------- PollComposerSheet ----------
+// Full-screen sheet that lets a user create a poll. Reached from the
+// DreadFeed ➕ tab's type-chooser. Layout matches ExposurePostSheet's
+// header chrome (✕ Cancel | "New poll" | "Share") so the two composer
+// flows feel like the same surface.
+//
+// Fields:
+//   - 1 question (3-200 chars)
+//   - 4 options (1-80 chars each, all required)
+// Share button enables only when all five fields pass length checks.
+function PollComposerSheet({ handle, deviceId, onClose, onPosted }: {
+  handle: string | null;
+  deviceId: string | null;
+  onClose: () => void;
+  onPosted: () => void;
+}) {
+  const [question, setQuestion] = useState('');
+  // Always 4 options. We use an array of strings indexed 0..3 so render
+  // can map cleanly. Mirrors the server's OPTIONS_COUNT = 4 hard rule.
+  const [options, setOptions] = useState<string[]>(['', '', '', '']);
+  const [submitting, setSubmitting] = useState(false);
+
+  const qTrim = question.trim();
+  const optsTrim = options.map((o) => o.trim());
+  // Mirror server validation: question 3-200, each option 1-80.
+  const qValid = qTrim.length >= 3 && qTrim.length <= 200;
+  const optsValid = optsTrim.every((o) => o.length >= 1 && o.length <= 80);
+  const canShare = qValid && optsValid && !submitting && !!handle && !!deviceId;
+
+  const updateOption = (idx: number, value: string) => {
+    setOptions((prev) => prev.map((o, i) => (i === idx ? value : o)));
+  };
+
+  const onShare = async () => {
+    if (!canShare) return;
+    setSubmitting(true);
+    const result = await apiCreatePoll({
+      handle: handle!,
+      deviceId: deviceId!,
+      question: qTrim,
+      options: optsTrim,
+    });
+    setSubmitting(false);
+    if (result.ok) {
+      playPostShared();
+      onPosted();
+    } else {
+      showToast(`Poll failed: ${result.reason || 'unknown error'}`, 'error');
+    }
+  };
+
+  // No handle? Match the ExposurePostSheet fallback screen.
+  if (!handle || !deviceId) {
+    return createPortal(
+      <div style={S.igComposerScreen}>
+        <div style={S.igComposerHeader}>
+          <button onClick={onClose} style={S.igComposerHeaderBtn} aria-label="Close">✕</button>
+          <div style={S.igComposerHeaderTitle}>New poll</div>
+          <div style={{ width: 40 }} />
+        </div>
+        <div style={{ padding: '40px 24px', textAlign: 'center', color: '#BBB', fontSize: 15, fontFamily: 'system-ui, -apple-system, sans-serif' }}>
+          Claim a handle to post a poll.
+        </div>
+      </div>,
+      document.body
+    );
+  }
+
+  return createPortal(
+    <div style={S.igComposerScreen}>
+      <div style={S.igComposerHeader}>
+        <button onClick={onClose} style={S.igComposerHeaderBtn} aria-label="Cancel">✕</button>
+        <div style={S.igComposerHeaderTitle}>New poll</div>
+        <button
+          onClick={onShare}
+          disabled={!canShare}
+          style={{
+            ...S.igComposerHeaderBtn,
+            color: canShare ? '#0095F6' : '#0095F655',
+            fontWeight: 700,
+            fontSize: 15,
+            width: 'auto',
+            paddingLeft: 8,
+            paddingRight: 8,
+          }}
+          aria-label="Share poll"
+        >
+          {submitting ? '…' : 'Share'}
+        </button>
+      </div>
+
+      <div style={S.pollComposerBody}>
+        {/* Question field. textarea so users can write longer questions
+            comfortably; visually monospaced character counter on the
+            right of the label so they can see how close they are to the
+            200-char ceiling. */}
+        <div style={S.pollComposerLabelRow}>
+          <span style={S.pollComposerLabel}>Question</span>
+          <span style={S.pollComposerCount}>{qTrim.length}/200</span>
+        </div>
+        <textarea
+          value={question}
+          onChange={(e) => setQuestion(e.target.value.slice(0, 200))}
+          placeholder="Ask the Dread Directory…"
+          style={S.pollComposerQuestion}
+          rows={2}
+        />
+
+        <div style={{ ...S.pollComposerLabelRow, marginTop: 18 }}>
+          <span style={S.pollComposerLabel}>Options</span>
+          <span style={S.pollComposerCount}>4 required</span>
+        </div>
+        {options.map((opt, idx) => (
+          <div key={idx} style={S.pollComposerOptionRow}>
+            <span style={S.pollComposerOptionNum}>{idx + 1}</span>
+            <input
+              type="text"
+              value={opt}
+              onChange={(e) => updateOption(idx, e.target.value.slice(0, 80))}
+              placeholder={`Option ${idx + 1}`}
+              style={S.pollComposerOptionInput}
+            />
+          </div>
+        ))}
+
+        <div style={S.pollComposerHint}>
+          Polls run for 7 days. Voters can change their pick until then.
+        </div>
+      </div>
+    </div>,
+    document.body
+  );
+}
+
+// ---------- ChoosePostTypeSheet ----------
+// Tiny bottom sheet that appears when the user taps ➕ on DreadFeed.
+// Two options: "Photo" → opens ExposurePostSheet, or "Poll" → opens
+// PollComposerSheet. Matches the dark IG-style modal aesthetic.
+function ChoosePostTypeSheet({ onPickPhoto, onPickPoll, onCancel }: {
+  onPickPhoto: () => void;
+  onPickPoll: () => void;
+  onCancel: () => void;
+}) {
+  return createPortal(
+    <div style={S.pollChooserBackdrop} onClick={onCancel}>
+      <div style={S.pollChooserCard} onClick={(e) => e.stopPropagation()}>
+        <div style={S.pollChooserTitle}>What are you posting?</div>
+        <button onClick={onPickPhoto} style={S.pollChooserBtn} className="sinister-icon-btn">
+          <span style={S.pollChooserBtnIcon}>📷</span>
+          <span style={S.pollChooserBtnLabel}>Photo / Video</span>
+        </button>
+        <button onClick={onPickPoll} style={S.pollChooserBtn} className="sinister-icon-btn">
+          <span style={S.pollChooserBtnIcon}>📊</span>
+          <span style={S.pollChooserBtnLabel}>Poll</span>
+        </button>
+        <button onClick={onCancel} style={S.pollChooserCancel} className="sinister-icon-btn">
+          Cancel
+        </button>
+      </div>
+    </div>,
+    document.body
+  );
+}
+
+// ---------- ConfirmDeletePostModal ----------
+// Two-step confirm before nuking your own post. Shown when the user
+// picks "Delete post" from the 3-dot menu on their own post card.
+function ConfirmDeletePostModal({ onCancel, onConfirm }: {
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  return createPortal(
+    <div style={S.confirmBackdrop} onClick={onCancel}>
+      <div style={S.confirmCard} onClick={(e) => e.stopPropagation()}>
+        <div style={S.confirmTitle}>Delete this post?</div>
+        <div style={S.confirmBody}>
+          The photo, caption, and all likes will be permanently removed.
+          This can't be undone.
+        </div>
+        <div style={S.confirmActions}>
+          <button onClick={onCancel} style={S.confirmCancelBtn}>Cancel</button>
+          <button onClick={onConfirm} style={S.confirmDeleteBtn}>Delete</button>
+        </div>
+      </div>
+    </div>,
+    document.body
+  );
+}
+
+// ---------- Comment Sheet ----------
+// IG-style bottom sheet that slides up over the post when the user taps
+// the comment icon. Renders a scrollable list of comments (oldest first),
+// an emoji quick-react row, and an input field at the bottom. Slides
+// down on backdrop tap, drag handle pull-down, or X button.
+//
+// Visual style: black/white/grey, IG-neutral — NOT the app's purple/red
+// horror palette. Drew specifically asked for IG visual parity here so
+// the sheet feels familiar to users coming from Instagram. The only
+// horror-app touch is the skull avatar, which we reuse from elsewhere
+// since per-handle avatars don't exist yet.
+function CommentSheet({ post, currentHandle, deviceId, onClose, onCountChange }: {
+  post: SocialPost;
+  currentHandle: string | null;
+  deviceId: string | null;
+  onClose: () => void;
+  // Called after every successful add/delete so the parent's cached
+  // count badge stays in sync without a full feed reload.
+  onCountChange: (n: number) => void;
+}) {
+  const [comments, setComments] = useState<SocialComment[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [draft, setDraft] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  // Track per-comment like state in a Map keyed by comment id. Server
+  // syncs on sheet open via apiCommentLikeStatus, then toggleLike below
+  // optimistically updates and reverts on failure.
+  const [commentLikes, setCommentLikes] = useState<Map<string, { liked: boolean; count: number }>>(new Map());
+  // Drag-to-dismiss tracking. When the user touches the drag handle and
+  // pulls down, we translate the sheet to follow their finger. Release
+  // past the threshold = dismiss; release before = snap back.
+  const [dragY, setDragY] = useState(0);
+  const dragStartYRef = useRef<number | null>(null);
+  // Track entrance animation. Sheet starts at translateY(100%) and
+  // animates to translateY(0) on mount via a CSS transition + a
+  // requestAnimationFrame state flip.
+  const [mounted, setMounted] = useState(false);
+  // Track exit animation. When the user taps backdrop / X / drags past
+  // threshold, we flip `closing` true → CSS transitions back down → on
+  // transitionend we call onClose to actually unmount.
+  const [closing, setClosing] = useState(false);
+  // 3-dot menu state for a single comment row. Holds the id of the
+  // comment whose action sheet is open (null = closed). Report modal
+  // tracks the target comment separately so the sheet can close before
+  // the report modal opens.
+  const [menuCommentId, setMenuCommentId] = useState<string | null>(null);
+  const [reportComment, setReportComment] = useState<SocialComment | null>(null);
+  // Reply state. When non-null, the composer shows a "Replying to @X"
+  // pill and the next submit sends parentId pointing at this comment.
+  // We always store the ROOT top-level comment id here (the server
+  // would flatten it anyway), so even if the user taps Reply on a reply,
+  // the next message threads correctly under the original parent.
+  const [replyingTo, setReplyingTo] = useState<{ parentId: string; handle: string } | null>(null);
+  // Set of top-level comment ids whose replies are currently expanded.
+  // IG default: replies are hidden behind a "View N replies" toggle.
+  // Tapping toggles inclusion in this set.
+  const [expandedReplies, setExpandedReplies] = useState<Set<string>>(new Set());
+
+  // Mount transition — set `mounted` true on next frame so the
+  // translateY(100%) initial style gets a chance to commit before the
+  // browser sees the transition target of translateY(0).
+  useEffect(() => {
+    const id = requestAnimationFrame(() => setMounted(true));
+    return () => cancelAnimationFrame(id);
+  }, []);
+
+  // Lock body scroll while the sheet is open. Without this, even with
+  // overscrollBehavior:contain on the list, the underlying feed can
+  // scroll if the user starts a drag outside the list (e.g. on the
+  // composer or the emoji row). Locking the body prevents bleed-through
+  // completely.
+  //
+  // iOS quirk: simply setting overflow:hidden visually pins the page
+  // but can reset window.scrollY to 0 when restored. To prevent the
+  // user being jumped back to the top of the feed after closing the
+  // sheet, we snapshot the current scrollY, lock the body with a
+  // negative top + fixed positioning (the IG approach), then restore
+  // both styles AND scroll position on unmount. This is the only
+  // reliable way on iOS Safari WebViews.
+  useEffect(() => {
+    const scrollY = window.scrollY;
+    const prevOverflow = document.body.style.overflow;
+    const prevPosition = document.body.style.position;
+    const prevTop = document.body.style.top;
+    const prevWidth = document.body.style.width;
+    document.body.style.position = 'fixed';
+    document.body.style.top = `-${scrollY}px`;
+    document.body.style.width = '100%';
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.body.style.position = prevPosition;
+      document.body.style.top = prevTop;
+      document.body.style.width = prevWidth;
+      document.body.style.overflow = prevOverflow;
+      // Restore the scroll position the user was at when they opened
+      // the sheet. Without this, iOS visually jumps to the top.
+      window.scrollTo(0, scrollY);
+    };
+  }, []);
+
+  // Suppress the global swipe-back gesture while the sheet is open.
+  // The emoji quick-react row, the reply font picker, and the comment
+  // list itself all generate horizontal-ish swipes that the global
+  // swipe-back handler would otherwise catch and pop the user out of
+  // DreadFeed entirely. Reference-counted via the same helpers the post
+  // editor uses.
+  useEffect(() => {
+    beginSuppressSwipeBack();
+    return () => { endSuppressSwipeBack(); };
+  }, []);
+
+  // Track whether the scrollable comment list is at the very top. The
+  // drag-to-dismiss handler only kicks in when scrollTop is 0; otherwise
+  // a downward drag is just normal scrolling. IG works exactly this way.
+  const listScrollRef = useRef<HTMLDivElement | null>(null);
+  const isListAtTopRef = useRef(true);
+  const onListScroll = (e: React.UIEvent<HTMLDivElement>) => {
+    isListAtTopRef.current = (e.currentTarget.scrollTop || 0) <= 0;
+  };
+
+  // Touch handlers for drag-to-dismiss. v1.11 expanded these from the
+  // top handle area to the whole panel — the user can grab anywhere
+  // inside the sheet and pull down. But we only ACTUALLY start a drag
+  // if either (a) the inner comment list is scrolled to the very top
+  // (so we're not stealing a scroll-up gesture), OR (b) the touch
+  // landed somewhere that's not the scrollable list itself (like the
+  // emoji row or composer). Combining those two rules gives the IG
+  // feel: scroll comments normally, OR drag anywhere else to dismiss.
+  const dragLandedOnListRef = useRef(false);
+  const onTouchStartHandle = (e: React.TouchEvent) => {
+    if (e.touches.length !== 1) return;
+    dragStartYRef.current = e.touches[0].clientY;
+    // Did the touch land on (or inside) the scrollable list? If so we
+    // gate on isListAtTop. If not, we always allow the drag.
+    const target = e.target as HTMLElement;
+    const list = listScrollRef.current;
+    dragLandedOnListRef.current = !!(list && (list === target || list.contains(target)));
+  };
+  const onTouchMoveHandle = (e: React.TouchEvent) => {
+    if (dragStartYRef.current === null || e.touches.length !== 1) return;
+    const dy = e.touches[0].clientY - dragStartYRef.current;
+    // Only drag downward (positive dy). Negative just gets ignored.
+    if (dy <= 0) return;
+    // If the touch started inside the comment list and that list is
+    // not at scroll-top, this is a normal scroll gesture — leave it
+    // alone, don't translate the sheet.
+    if (dragLandedOnListRef.current && !isListAtTopRef.current) return;
+    setDragY(dy);
+  };
+  const onTouchEndHandle = () => {
+    const dy = dragY;
+    dragStartYRef.current = null;
+    dragLandedOnListRef.current = false;
+    setDragY(0);
+    if (dy > 120) {
+      // Past dismiss threshold — animate close.
+      animateClose();
+    }
+  };
+
+  // Initial load — fetch comments and seed the parent's count.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      // Fetch comments + hidden set in parallel, then filter out any
+      // comments authored by handles the viewer has blocked. Comments
+      // by blocked users never appear in the sheet at all.
+      const [list, hidden] = await Promise.all([
+        apiFetchComments(post.id),
+        getHiddenSet(currentHandle),
+      ]);
+      if (cancelled) return;
+      const visible = list.filter((c) => !hidden.has((c.handle || '').toLowerCase()));
+      setComments(visible);
+      setLoading(false);
+      // Count reported to parent reflects visible-to-viewer count, not
+      // server total. That matches IG behavior (blocked content is
+      // invisible everywhere) and keeps the badge accurate to UX.
+      onCountChange(visible.length);
+
+      // Fetch like status for each comment in parallel. Skip silently
+      // if there's no handle (anonymous viewer).
+      if (currentHandle && visible.length > 0) {
+        const results = await Promise.all(
+          visible.map((c) => apiCommentLikeStatus({ commentId: c.id, handle: currentHandle }))
+        );
+        if (cancelled) return;
+        const map = new Map<string, { liked: boolean; count: number }>();
+        visible.forEach((c, i) => {
+          map.set(c.id, { liked: results[i].liked, count: results[i].count });
+        });
+        setCommentLikes(map);
+      } else {
+        // No handle — seed counts from the comment records themselves.
+        const map = new Map<string, { liked: boolean; count: number }>();
+        list.forEach((c) => map.set(c.id, { liked: false, count: c.likeCount || 0 }));
+        setCommentLikes(map);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [post.id, currentHandle]);
+
+  // Animated close — flip `closing`, wait for transition, then unmount.
+  const animateClose = () => {
+    if (closing) return;
+    setClosing(true);
+    setTimeout(() => onClose(), 260); // matches CSS transition duration
+  };
+
+  // Send a new comment to the server. Optimistically prepends to the
+  // local list, rolls back on failure.
+  const submit = async () => {
+    const body = draft.trim();
+    if (!body || !currentHandle || !deviceId || submitting) return;
+    setSubmitting(true);
+    const tempId = `temp_${Date.now()}`;
+    // If we're in reply mode, capture the parentId so it lands on both
+    // the optimistic row and the server request. Clearing replyingTo
+    // happens after we read it, so a re-render mid-submit doesn't drop
+    // the link.
+    const parentIdForThisSubmit = replyingTo ? replyingTo.parentId : null;
+    const optimistic: SocialComment = {
+      id: tempId,
+      postId: post.id,
+      parentId: parentIdForThisSubmit,
+      handle: currentHandle,
+      body,
+      createdAt: new Date().toISOString(),
+      likeCount: 0,
+    };
+    setComments((prev) => [...prev, optimistic]);
+    setCommentLikes((prev) => {
+      const next = new Map(prev);
+      next.set(tempId, { liked: false, count: 0 });
+      return next;
+    });
+    setDraft('');
+    // If this was a reply, auto-expand the parent so the user sees their
+    // own reply appear in context instead of being hidden behind the
+    // "View N replies" toggle.
+    if (parentIdForThisSubmit) {
+      setExpandedReplies((prev) => {
+        const next = new Set(prev);
+        next.add(parentIdForThisSubmit);
+        return next;
+      });
+    }
+    setReplyingTo(null);
+
+    const result = await apiCreateComment({
+      postId: post.id,
+      handle: currentHandle,
+      deviceId,
+      body,
+      parentId: parentIdForThisSubmit,
+    });
+    setSubmitting(false);
+
+    if (!result.ok || !result.comment) {
+      // Roll back optimistic insert.
+      setComments((prev) => prev.filter((c) => c.id !== tempId));
+      setCommentLikes((prev) => {
+        const next = new Map(prev);
+        next.delete(tempId);
+        return next;
+      });
+      showToast(`Comment failed: ${result.reason || 'unknown'}`, 'error');
+      setDraft(body); // restore the user's text so they don't retype
+      return;
+    }
+
+    // Swap the temp comment for the server's real one (real id, etc).
+    const real = result.comment;
+    setComments((prev) => prev.map((c) => (c.id === tempId ? real : c)));
+    setCommentLikes((prev) => {
+      const next = new Map(prev);
+      next.delete(tempId);
+      next.set(real.id, { liked: false, count: 0 });
+      return next;
+    });
+    onCountChange(comments.length + 1);
+    playCommentSent();
+  };
+
+  // Toggle a heart on a single comment.
+  const toggleCommentLike = async (commentId: string) => {
+    if (!currentHandle || !deviceId) {
+      showToast('Claim a handle to like comments', 'error');
+      return;
+    }
+    const current = commentLikes.get(commentId);
+    const prevLiked = !!current?.liked;
+    const prevCount = current?.count || 0;
+    // Sound on LIKE only, not unlike.
+    if (!prevLiked) playLikeBlip();
+    // Optimistic
+    setCommentLikes((prev) => {
+      const next = new Map(prev);
+      next.set(commentId, { liked: !prevLiked, count: prevCount + (prevLiked ? -1 : 1) });
+      return next;
+    });
+    const result = await apiToggleCommentLike({ commentId, handle: currentHandle, deviceId });
+    if (!result.ok) {
+      // Revert
+      setCommentLikes((prev) => {
+        const next = new Map(prev);
+        next.set(commentId, { liked: prevLiked, count: prevCount });
+        return next;
+      });
+      showToast(result.reason || 'Like failed', 'error');
+    } else if (typeof result.count === 'number') {
+      setCommentLikes((prev) => {
+        const next = new Map(prev);
+        next.set(commentId, { liked: !!result.liked, count: result.count });
+        return next;
+      });
+    }
+  };
+
+  // Quick emoji row above the input. Tapping inserts the emoji into the
+  // draft at the cursor position (or end if no cursor — simpler). v1.11
+  // expanded from 8 generic emojis (hearts/smileys) to a 20-emoji horror
+  // set that fits the app's tone. The row is horizontally scrollable in
+  // the render so we can keep adding without the row wrapping.
+  const QUICK_EMOJIS = ['💀', '👻', '👁️', '🩸', '🕯️', '🪦', '🦇', '🕷️', '🕸️', '🧛', '🧟', '🔪', '⚰️', '🎃', '🌙', '🖤', '🩻', '🧠', '🦴', '🛸'];
+  const insertEmoji = (emoji: string) => setDraft((prev) => prev + emoji);
+
+  // Body of the sheet. Combines backdrop + sliding panel. The backdrop
+  // catches taps outside the panel for dismiss.
+  const isAuthor = (handle: string) => handle.toLowerCase() === post.handle.toLowerCase();
+
+  // Build the inline transform — start at 100% off-screen, slide in, then
+  // track drag if user is pulling down, then animate to 100% on close.
+  const translateY = closing
+    ? '100%'
+    : mounted
+      ? `${dragY}px`
+      : '100%';
+
+  return createPortal(
+    <div style={S.commentSheetOverlay}>
+      {/* Backdrop — tap dismisses */}
+      <div
+        style={S.commentSheetBackdrop}
+        onClick={animateClose}
+      />
+      {/* Sliding panel — touch handlers attached at panel level so the
+          user can drag anywhere inside the sheet (not just the top
+          handle) to dismiss. The handlers themselves gate on whether
+          the touch landed on the scrollable comment list AND whether
+          that list is currently at scrollTop=0; otherwise it's just a
+          normal scroll gesture. */}
+      <div
+        style={{
+          ...S.commentSheetPanel,
+          transform: `translateY(${translateY})`,
+          transition: dragStartYRef.current === null ? 'transform 0.26s cubic-bezier(0.32, 0.72, 0, 1)' : 'none',
+        }}
+        onTouchStart={onTouchStartHandle}
+        onTouchMove={onTouchMoveHandle}
+        onTouchEnd={onTouchEndHandle}
+      >
+        {/* Drag handle area — visual indicator only now. The touch
+            handlers live on the panel above, not here. */}
+        <div style={S.commentSheetHandleArea}>
+          <div style={S.commentSheetHandlePill} />
+        </div>
+
+        {/* Header — title centered, share icon on right (placeholder, no
+            handler yet — present for visual parity with IG) */}
+        <div style={S.commentSheetHeader}>
+          <div style={{ width: 40 }} />
+          <div style={S.commentSheetTitle}>Comments</div>
+          <button onClick={animateClose} style={S.commentSheetCloseBtn} aria-label="Close">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <line x1="22" y1="2" x2="11" y2="13" />
+              <polygon points="22 2 15 22 11 13 2 9 22 2" />
+            </svg>
+          </button>
+        </div>
+
+        {/* Scrollable comment list. ref + onScroll feed the drag-dismiss
+            logic so we can tell whether a downward drag here should
+            dismiss the sheet or just be normal scrolling. */}
+        <div
+          ref={listScrollRef}
+          onScroll={onListScroll}
+          style={S.commentSheetList}
+        >
+          {loading ? (
+            <div style={S.commentSheetEmpty}>Loading…</div>
+          ) : comments.length === 0 ? (
+            <div style={S.commentSheetEmpty}>
+              No comments yet.
+              <br />
+              <span style={{ opacity: 0.6, fontSize: 13 }}>Be the first to comment.</span>
+            </div>
+          ) : (() => {
+            // Split into top-level vs replies. We keep both in stable
+            // chronological order (oldest-first) since the server already
+            // sorts that way; we just group replies under their parent.
+            // Comments with a parentId that doesn't match any top-level
+            // comment in the visible set (e.g. parent was hidden by a
+            // block) fall through to render as top-level so they're not
+            // lost.
+            const visibleIds = new Set(comments.map((c) => c.id));
+            const topLevel: SocialComment[] = [];
+            const repliesByParent = new Map<string, SocialComment[]>();
+            for (const c of comments) {
+              if (c.parentId && visibleIds.has(c.parentId)) {
+                const arr = repliesByParent.get(c.parentId) || [];
+                arr.push(c);
+                repliesByParent.set(c.parentId, arr);
+              } else {
+                topLevel.push(c);
+              }
+            }
+
+            const renderCommentRow = (c: SocialComment, isReply: boolean) => {
+              const likeState = commentLikes.get(c.id) || { liked: false, count: c.likeCount || 0 };
+              const isOwnComment = !!currentHandle && currentHandle.toLowerCase() === (c.handle || '').toLowerCase();
+              return (
+                <div
+                  key={c.id}
+                  style={{
+                    ...S.commentRow,
+                    // Indent replies. paddingLeft on the row pushes the avatar
+                    // and everything else right, IG-style nested look.
+                    ...(isReply ? { paddingLeft: 56 } : null),
+                  }}
+                >
+                  <img src={exposureIconUrl} alt="" style={isReply ? S.commentAvatarReply : S.commentAvatar} />
+                  <div style={S.commentBodyCol}>
+                    <div style={S.commentMetaLine}>
+                      <span style={S.commentHandle}>{c.handle}</span>
+                      <span style={S.commentTime}>{formatTimeAgoShort(c.createdAt)}</span>
+                      {isAuthor(c.handle) && (
+                        <span style={S.commentAuthorBadge}>Author</span>
+                      )}
+                    </div>
+                    <div style={S.commentBodyText}>{c.body}</div>
+                    {/* Reply link — visible on every comment (top-level OR
+                        reply). Replies-to-replies are flattened by the
+                        server, but the UX of replying to a specific person
+                        in a thread still feels natural. We prefill the
+                        composer with @handle to give the new comment
+                        social context. */}
+                    {!!currentHandle && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          // For replies, we want the threading to attach
+                          // to the same ROOT as the comment being replied
+                          // to. parentId on a reply already points at
+                          // root; on a top-level it's null, so use the
+                          // comment's own id.
+                          const rootId = c.parentId || c.id;
+                          setReplyingTo({ parentId: rootId, handle: c.handle });
+                          // Prefill draft with @handle if not already
+                          // there, leaving a trailing space so the user
+                          // can start typing immediately.
+                          setDraft((prev) => {
+                            const tag = `@${c.handle} `;
+                            return prev.includes(tag) ? prev : tag;
+                          });
+                        }}
+                        style={S.commentReplyBtn}
+                      >Reply</button>
+                    )}
+                  </div>
+                  <button
+                    onClick={() => toggleCommentLike(c.id)}
+                    style={S.commentLikeBtn}
+                    aria-label={likeState.liked ? 'Unlike comment' : 'Like comment'}
+                  >
+                    {likeState.liked ? (
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="#FF3B5C" stroke="#FF3B5C" strokeWidth="1.8" strokeLinejoin="round">
+                        <path d="M12 21s-7.5-4.6-9.5-9.5C1 7.5 4 4 7.5 4c2 0 3.4 1 4.5 2.5C13.1 5 14.5 4 16.5 4 20 4 23 7.5 21.5 11.5 19.5 16.4 12 21 12 21Z" />
+                      </svg>
+                    ) : (
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#888888" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M12 21s-7.5-4.6-9.5-9.5C1 7.5 4 4 7.5 4c2 0 3.4 1 4.5 2.5C13.1 5 14.5 4 16.5 4 20 4 23 7.5 21.5 11.5 19.5 16.4 12 21 12 21Z" />
+                      </svg>
+                    )}
+                    {likeState.count > 0 && (
+                      <span style={S.commentLikeCount}>{likeState.count}</span>
+                    )}
+                  </button>
+                  {!isOwnComment && (
+                    <button
+                      onClick={() => setMenuCommentId(c.id)}
+                      style={S.commentMenuBtn}
+                      aria-label="More options"
+                    >⋯</button>
+                  )}
+                </div>
+              );
+            };
+
+            return topLevel.map((c) => {
+              const replies = repliesByParent.get(c.id) || [];
+              const isExpanded = expandedReplies.has(c.id);
+              return (
+                <div key={c.id}>
+                  {renderCommentRow(c, false)}
+                  {replies.length > 0 && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setExpandedReplies((prev) => {
+                            const next = new Set(prev);
+                            if (next.has(c.id)) next.delete(c.id);
+                            else next.add(c.id);
+                            return next;
+                          });
+                        }}
+                        style={S.commentRepliesToggle}
+                      >
+                        <span style={S.commentRepliesToggleLine} />
+                        {isExpanded
+                          ? `Hide replies`
+                          : `View ${replies.length} ${replies.length === 1 ? 'reply' : 'replies'}`}
+                      </button>
+                      {isExpanded && replies.map((r) => renderCommentRow(r, true))}
+                    </>
+                  )}
+                </div>
+              );
+            });
+          })()}
+        </div>
+
+        {/* Emoji quick-react row */}
+        <div style={S.commentSheetEmojiRow}>
+          {QUICK_EMOJIS.map((emoji) => (
+            <button
+              key={emoji}
+              onClick={() => insertEmoji(emoji)}
+              style={S.commentSheetEmojiBtn}
+            >
+              {emoji}
+            </button>
+          ))}
+        </div>
+
+        {/* "Replying to @X" pill — shown only when replyingTo is set.
+            Tapping the X clears the reply state and the @prefix from
+            the draft, returning the composer to top-level mode. */}
+        {replyingTo && (
+          <div style={S.commentReplyPill}>
+            <span style={S.commentReplyPillText}>Replying to <span style={S.commentReplyPillHandle}>@{replyingTo.handle}</span></span>
+            <button
+              type="button"
+              onClick={() => {
+                setReplyingTo(null);
+                // Strip the @handle prefix if it's still at the start of
+                // the draft. Leave any text the user typed after it.
+                setDraft((prev) => {
+                  const tag = `@${replyingTo.handle} `;
+                  return prev.startsWith(tag) ? prev.slice(tag.length) : prev;
+                });
+              }}
+              style={S.commentReplyPillClose}
+              aria-label="Cancel reply"
+            >✕</button>
+          </div>
+        )}
+
+        {/* Composer row — avatar + input + Post button */}
+        <div style={S.commentSheetComposer}>
+          <img src={exposureIconUrl} alt="" style={S.commentSheetComposerAvatar} />
+          <input
+            type="text"
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            placeholder={currentHandle ? (replyingTo ? `Reply to ${replyingTo.handle}...` : `Add a comment for ${post.handle}...`) : 'Claim a handle to comment'}
+            disabled={!currentHandle || submitting}
+            maxLength={500}
+            style={S.commentSheetComposerInput}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                submit();
+              }
+            }}
+          />
+          {draft.trim().length > 0 && (
+            <button
+              onClick={submit}
+              disabled={submitting}
+              style={S.commentSheetComposerPostBtn}
+            >
+              {submitting ? '...' : (replyingTo ? 'Reply' : 'Post')}
+            </button>
+          )}
+        </div>
+
+        {/* 3-dot action sheet for a comment row. Open state holds the
+            comment id; the matching comment is looked up below to feed
+            the Block/Report actions with the right handle/target. */}
+        {menuCommentId && (() => {
+          const target = comments.find((c) => c.id === menuCommentId);
+          if (!target) return null;
+          return (
+            <ActionSheet
+              onClose={() => setMenuCommentId(null)}
+              actions={[
+                {
+                  label: 'Report comment',
+                  onClick: () => {
+                    if (!currentHandle || !deviceId) {
+                      showToast('Claim a handle to report', 'error');
+                      return;
+                    }
+                    setReportComment(target);
+                  },
+                  destructive: true,
+                },
+                {
+                  label: `Block @${target.handle}`,
+                  onClick: async () => {
+                    if (!currentHandle || !deviceId) {
+                      showToast('Claim a handle to block', 'error');
+                      return;
+                    }
+                    const result = await apiBlock({
+                      blocker: currentHandle,
+                      blocked: target.handle,
+                      deviceId,
+                    });
+                    if (result.ok) {
+                      invalidateHiddenSet();
+                      // Immediately remove blocked user's comments from
+                      // the visible list so the sheet reflects the action.
+                      setComments((prev) =>
+                        prev.filter((c) => (c.handle || '').toLowerCase() !== target.handle.toLowerCase())
+                      );
+                      showToast(`Blocked @${target.handle}`, 'success');
+                    } else {
+                      showToast(result.reason || 'Block failed', 'error');
+                    }
+                  },
+                  destructive: true,
+                },
+              ]}
+            />
+          );
+        })()}
+
+        {/* Comment Report modal — opens when user picks Report from the
+            action sheet for a non-own comment. */}
+        {reportComment && currentHandle && deviceId && (
+          <ReportModal
+            targetType="comment"
+            targetId={reportComment.id}
+            handle={currentHandle}
+            deviceId={deviceId}
+            onClose={() => setReportComment(null)}
+            onReported={() => {
+              setReportComment(null);
+              showToast('Thanks — report sent', 'success');
+            }}
+          />
+        )}
+      </div>
+    </div>,
+    document.body
+  );
+}
+
 
 // Instagram-style compact relative-time formatter. "5m" / "3h" / "1d" /
 // "2w". No "ago" suffix, no spelling out — just unit-letter pairs.
@@ -3558,11 +9678,63 @@ function formatTimeAgo(iso: string): string {
 // Profile, Post Detail, and other-user profiles). Sticky black bar with
 // the eXposure brand on top and a short tagline below — keeps the
 // app's identity visible no matter where you've drilled in.
-function ExposureBrandHeader() {
+// DreadFeed brand header with optional notification bell on the right.
+// Bell shows a red dot when unreadCount > 0. Tap routes to NotificationsView.
+function ExposureBrandHeader({ unreadCount, dmUnreadCount, onTapBell, onTapInbox }: {
+  unreadCount?: number;
+  dmUnreadCount?: number;
+  onTapBell?: () => void;
+  onTapInbox?: () => void;
+} = {}) {
   return (
     <div style={S.exposureBrandHeader}>
-      <div style={S.exposureBrandTitle}>eXposure</div>
-      <div style={S.exposureBrandTagline}>Photos from the most haunted places</div>
+      <div style={S.exposureBrandTitleRow}>
+        <div
+          style={S.exposureBrandTitle}
+          className="sinister-glitch"
+          data-text="DreadFeed"
+        >
+          DreadFeed
+        </div>
+      </div>
+      {/* Right side icons: bell (notifications) + airplane (DMs). The
+          airplane (v1.15) sits to the left of the bell. Both render only
+          if their on-tap handler is provided. */}
+      {onTapInbox && (
+        <button
+          onClick={onTapInbox}
+          style={S.exposureInboxBtn}
+          aria-label={dmUnreadCount && dmUnreadCount > 0 ? `Messages (${dmUnreadCount} unread)` : 'Messages'}
+        >
+          {/* IG-style paper-airplane glyph */}
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+            <line x1="22" y1="2" x2="11" y2="13" />
+            <polygon points="22 2 15 22 11 13 2 9 22 2" />
+          </svg>
+          {!!dmUnreadCount && dmUnreadCount > 0 && (
+            <span style={S.exposureBellBadge}>
+              {dmUnreadCount > 99 ? '99+' : String(dmUnreadCount)}
+            </span>
+          )}
+        </button>
+      )}
+      {onTapBell && (
+        <button
+          onClick={onTapBell}
+          style={S.exposureBellBtn}
+          aria-label={unreadCount && unreadCount > 0 ? `Notifications (${unreadCount} unread)` : 'Notifications'}
+        >
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9" />
+            <path d="M13.73 21a2 2 0 0 1-3.46 0" />
+          </svg>
+          {!!unreadCount && unreadCount > 0 && (
+            <span style={S.exposureBellBadge}>
+              {unreadCount > 99 ? '99+' : String(unreadCount)}
+            </span>
+          )}
+        </button>
+      )}
     </div>
   );
 }
@@ -3574,31 +9746,490 @@ function ExposureBrandHeader() {
 //
 // Layout (top to bottom):
 //   1. Header bar — @handle centered, neon purple in Jolly Lodger
-//   2. Profile row — large avatar on left, Posts/Visits counts on right
-//   3. Bio line (currently just a placeholder — no bio field yet)
-//   4. Action row — "View Badges" button (and a Share button placeholder)
-//   5. Tab strip — single grid icon for now (active)
-//   6. 3-column square grid of approved post thumbnails
-//   7. Tap a thumbnail → opens single-post detail view
+// ---- CaptionWithTags (v1.14) ----
+// Splits a caption string into plain text + tappable hashtag spans. Used
+// in feed cards and post-detail captions. The regex matches the same
+// shape the server extracts: # followed by 2-30 word chars, at start or
+// preceded by whitespace. Render-only — does not mutate the caption.
+function CaptionWithTags({
+  text,
+  onTagTap,
+  baseStyle,
+  tagStyle,
+}: {
+  text: string;
+  onTagTap?: (tag: string) => void;
+  baseStyle?: React.CSSProperties;
+  tagStyle?: React.CSSProperties;
+}) {
+  // Tokenize. Walk the string; every match becomes a tag span, every gap
+  // becomes a text span. Preserve whitespace by including the leading
+  // separator char inside the text span (split-at-match approach).
+  const re = /(^|\s)#([A-Za-z0-9_]{2,30})/g;
+  const parts: Array<{ kind: 'text'; value: string } | { kind: 'tag'; value: string }> = [];
+  let lastIdx = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const matchStart = m.index;
+    const sep = m[1];           // leading whitespace or empty
+    const tag = m[2];
+    const textBefore = text.slice(lastIdx, matchStart) + sep;
+    if (textBefore) parts.push({ kind: 'text', value: textBefore });
+    parts.push({ kind: 'tag', value: tag });
+    lastIdx = matchStart + m[0].length;
+  }
+  if (lastIdx < text.length) parts.push({ kind: 'text', value: text.slice(lastIdx) });
+
+  // No hashtags — render plain text in one span. Avoids a wrapper.
+  if (parts.length === 0 || parts.every((p) => p.kind === 'text')) {
+    return <span style={baseStyle}>{text}</span>;
+  }
+
+  return (
+    <span style={baseStyle}>
+      {parts.map((p, i) => {
+        if (p.kind === 'text') return <span key={i}>{p.value}</span>;
+        return (
+          <button
+            key={i}
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              if (onTagTap) onTagTap(p.value);
+            }}
+            style={{
+              background: 'none',
+              border: 'none',
+              padding: 0,
+              margin: 0,
+              color: '#3FA9FF',
+              cursor: 'pointer',
+              font: 'inherit',
+              ...tagStyle,
+            }}
+          >
+            #{p.value}
+          </button>
+        );
+      })}
+    </span>
+  );
+}
+
+// ---- HashtagView (v1.14) ----
+// Dedicated screen shown when the user taps a hashtag anywhere in the
+// app (feed caption, post detail caption, etc). Loads /posts/hashtag/:tag
+// and renders the IG-style 3-column thumbnail grid. Tap a thumbnail to
+// open the post in the standard post detail view.
+function HashtagView({
+  tag,
+  onSelectPost,
+  onBack,
+}: {
+  tag: string;
+  onSelectPost: (postId: string, postList?: string[], preloadedPosts?: SocialPost[]) => void;
+  onBack: () => void;
+}) {
+  const [posts, setPosts] = useState<SocialPost[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    apiFetchPostsByHashtag(tag).then((p) => {
+      if (cancelled) return;
+      setPosts(p);
+      setLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [tag]);
+
+  return (
+    <div style={S.hashtagViewWrap}>
+      {/* Header — back arrow + #tag title + count */}
+      <div style={S.hashtagHeader}>
+        <button
+          type="button"
+          onClick={onBack}
+          style={S.hashtagBackBtn}
+          aria-label="Back"
+        >
+          ←
+        </button>
+        <div style={S.hashtagHeaderText}>
+          <div style={S.hashtagHeaderTitle}>#{tag}</div>
+          <div style={S.hashtagHeaderSub}>
+            {loading ? 'Loading…' : `${posts.length} ${posts.length === 1 ? 'post' : 'posts'}`}
+          </div>
+        </div>
+      </div>
+
+      {/* Grid — same 3-column shape as profile grid */}
+      {!loading && posts.length === 0 ? (
+        <div style={S.hashtagEmpty}>
+          No posts yet for #{tag}.
+        </div>
+      ) : (
+        <div style={S.profileGrid}>
+          {posts.map((p) => {
+            const firstType =
+              (Array.isArray((p as any).mediaTypes) && (p as any).mediaTypes[0]) ||
+              (/\.(mp4|mov)(\?|$)/i.test(p.photoUrl) ? 'video' : 'photo');
+            const isVideo = firstType === 'video';
+            return (
+              <button
+                key={p.id}
+                onClick={() => onSelectPost(p.id, posts.map((x) => x.id), posts)}
+                style={S.profileGridCell}
+                aria-label={`Open post: ${p.caption.slice(0, 40)}`}
+              >
+                {isVideo ? (
+                  <>
+                    <video
+                      src={`${p.photoUrl}#t=0.1`}
+                      style={S.profileGridImg}
+                      preload="metadata"
+                      muted
+                      playsInline
+                      onLoadedMetadata={(e) => {
+                        try { e.currentTarget.currentTime = 0.1; } catch { /* silent */ }
+                      }}
+                    />
+                    <div style={S.profileGridVideoBadge} aria-hidden="true">
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="#ffffff">
+                        <path d="M8 5v14l11-7z" />
+                      </svg>
+                    </div>
+                  </>
+                ) : (
+                  <img src={p.photoUrl} alt="" style={S.profileGridImg} loading="lazy" />
+                )}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---- DMInboxView (v1.15) ----
+// IG-style inbox screen. Lists every conversation the current user has,
+// newest activity first. Tap a row → opens DMThreadView. Polls inbox
+// every 8 seconds while open so new messages show up without manual
+// refresh. (Polling, not WebSockets — keeps the server stateless.)
+function DMInboxView({
+  currentHandle,
+  deviceId,
+  onSelectThread,
+  onBack,
+}: {
+  currentHandle: string;
+  deviceId: string;
+  onSelectThread: (convId: string, otherHandle: string) => void;
+  onBack: () => void;
+}) {
+  const [conversations, setConversations] = useState<DMConversation[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      const list = await apiFetchInbox(currentHandle);
+      if (cancelled) return;
+      setConversations(list);
+      setLoading(false);
+    };
+    load();
+    const id = window.setInterval(load, 8000);
+    return () => { cancelled = true; window.clearInterval(id); };
+  }, [currentHandle]);
+
+  return (
+    <div style={S.hashtagViewWrap}>
+      <div style={S.hashtagHeader}>
+        <button type="button" onClick={onBack} style={S.hashtagBackBtn} aria-label="Back">←</button>
+        <div style={S.hashtagHeaderText}>
+          <div style={S.hashtagHeaderTitle}>Messages</div>
+          <div style={S.hashtagHeaderSub}>
+            {loading ? 'Loading…' : `${conversations.length} ${conversations.length === 1 ? 'conversation' : 'conversations'}`}
+          </div>
+        </div>
+      </div>
+
+      {!loading && conversations.length === 0 ? (
+        <div style={S.hashtagEmpty}>
+          No messages yet. Go to someone's profile and tap Message to start a conversation.
+        </div>
+      ) : (
+        <div style={S.dmInboxList}>
+          {conversations.map((c) => (
+            <button
+              key={c.id}
+              type="button"
+              onClick={() => onSelectThread(c.id, c.otherHandle)}
+              style={S.dmInboxRow}
+            >
+              <div style={S.dmInboxAvatar}>
+                {c.otherHandle.slice(0, 1).toUpperCase()}
+              </div>
+              <div style={S.dmInboxBody}>
+                <div style={S.dmInboxHandle}>{c.otherHandle}</div>
+                <div style={{
+                  ...S.dmInboxPreview,
+                  ...(c.unread > 0 ? S.dmInboxPreviewUnread : null),
+                }}>
+                  {c.lastMessageBy && c.lastMessageBy.toLowerCase() === currentHandle.toLowerCase()
+                    ? `You: ${c.lastMessageText || ''}`
+                    : (c.lastMessageText || 'No messages yet')}
+                </div>
+              </div>
+              {c.unread > 0 && (
+                <div style={S.dmInboxBadge}>{c.unread}</div>
+              )}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---- DMThreadView (v1.15) ----
+// 1:1 conversation view — message bubbles + composer at the bottom.
+// Polls every 4 seconds while open to pick up new incoming messages.
+// Sending appends locally (optimistic) and re-fetches on confirm.
+function DMThreadView({
+  conversationId,
+  otherHandle: initialOtherHandle,
+  currentHandle,
+  deviceId,
+  onBack,
+}: {
+  conversationId: string;
+  otherHandle: string;
+  currentHandle: string;
+  deviceId: string;
+  onBack: () => void;
+}) {
+  const [messages, setMessages] = useState<DMMessage[]>([]);
+  const [otherHandle, setOtherHandle] = useState(initialOtherHandle);
+  const [loading, setLoading] = useState(true);
+  const [draft, setDraft] = useState('');
+  const [sending, setSending] = useState(false);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  // v1.16: track the last server-side message ID we've seen so the
+  // polling effect can detect freshly-arrived incoming messages and
+  // play a receive sound. Initial fetch should NOT chime — only deltas
+  // after the first load do.
+  const lastSeenIdRef = useRef<string | null>(null);
+  const firstLoadDoneRef = useRef(false);
+
+  // Initial load + polling.
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      const r = await apiFetchThread(conversationId, currentHandle);
+      if (cancelled) return;
+      // Detect new incoming messages from the OTHER party since last
+      // poll. We only chime for messages whose ID we hadn't seen before
+      // AND that aren't from us. Skip the very first load so opening
+      // a thread doesn't chime for backlog.
+      if (firstLoadDoneRef.current) {
+        const latest = r.messages.length > 0 ? r.messages[r.messages.length - 1] : null;
+        if (latest
+          && latest.id !== lastSeenIdRef.current
+          && latest.from.toLowerCase() !== currentHandle.toLowerCase()
+          && !latest.id.startsWith('local_')) {
+          playBell();
+        }
+      }
+      if (r.messages.length > 0) {
+        lastSeenIdRef.current = r.messages[r.messages.length - 1].id;
+      }
+      firstLoadDoneRef.current = true;
+      setMessages(r.messages);
+      if (r.otherHandle) setOtherHandle(r.otherHandle);
+      setLoading(false);
+    };
+    load();
+    const id = window.setInterval(load, 4000);
+    return () => { cancelled = true; window.clearInterval(id); };
+  }, [conversationId, currentHandle]);
+
+  // Auto-scroll to bottom when messages change.
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [messages.length]);
+
+  const canSend = draft.trim().length > 0 && draft.trim().length <= 2000 && !sending;
+
+  const onSend = async () => {
+    if (!canSend) return;
+    const body = draft.trim();
+    setSending(true);
+    // v1.16: play send sound immediately on tap, mirrors comment-send
+    // behavior. Optimistic UI = instant audio + instant visual append.
+    playCommentSent();
+    // Optimistic append — gives instant feedback. We don't generate a
+    // proper ID; server will return the real one on the next poll.
+    setMessages((prev) => [...prev, {
+      id: `local_${Date.now()}`,
+      from: currentHandle.toLowerCase(),
+      body,
+      createdAt: new Date().toISOString(),
+    }]);
+    setDraft('');
+    const result = await apiSendDM({ handle: currentHandle, deviceId, toHandle: otherHandle, body });
+    setSending(false);
+    if (!result.ok) {
+      // Roll back the optimistic append on failure.
+      setMessages((prev) => prev.filter((m) => !m.id.startsWith('local_')));
+      showToast(`Send failed: ${result.reason || 'unknown error'}`, 'error');
+    }
+    // Otherwise the next 4s poll picks up the real message and replaces
+    // the local one (it'll dedupe naturally because server messages have
+    // real IDs).
+  };
+
+  return (
+    <div style={S.dmThreadWrap}>
+      <div style={S.hashtagHeader}>
+        <button type="button" onClick={onBack} style={S.hashtagBackBtn} aria-label="Back">←</button>
+        <div style={S.hashtagHeaderText}>
+          <div style={S.hashtagHeaderTitle}>{otherHandle}</div>
+        </div>
+      </div>
+
+      <div ref={scrollRef} style={S.dmThreadScroll}>
+        {loading ? (
+          <div style={S.hashtagEmpty}>Loading…</div>
+        ) : messages.length === 0 ? (
+          <div style={S.hashtagEmpty}>
+            No messages yet. Say hi!
+          </div>
+        ) : (
+          messages.map((m) => {
+            const isOwn = m.from.toLowerCase() === currentHandle.toLowerCase();
+            return (
+              <div
+                key={m.id}
+                style={{
+                  ...S.dmBubbleRow,
+                  justifyContent: isOwn ? 'flex-end' : 'flex-start',
+                }}
+              >
+                <div style={{
+                  ...S.dmBubble,
+                  ...(isOwn ? S.dmBubbleOwn : S.dmBubbleOther),
+                }}>
+                  {m.body}
+                </div>
+              </div>
+            );
+          })
+        )}
+      </div>
+
+      <div style={S.dmComposer}>
+        <textarea
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          placeholder="Message..."
+          maxLength={2000}
+          rows={1}
+          style={S.dmComposerInput}
+          disabled={sending}
+          // Stop touch propagation so horizontal scroll/drag doesn't
+          // trigger swipe-back while the user is in the textarea.
+          onTouchStart={(e) => e.stopPropagation()}
+        />
+        <button
+          type="button"
+          onClick={onSend}
+          disabled={!canSend}
+          style={{
+            ...S.dmComposerSend,
+            opacity: canSend ? 1 : 0.4,
+          }}
+        >
+          Send
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ---- UserProfileView ----
+// Profile screen for a single handle. Shows:
+//   1. Header — large avatar on left, Posts/Visits counts on right
+//   2. Bio line
+//   3. Action row — "View Badges" button (and a Share button placeholder)
+//   4. Tab strip — single grid icon for now (active)
+//   5. 3-column square grid of approved post thumbnails
+//   6. Tap a thumbnail → opens single-post detail view
 //
 // Data sources:
 //   - GET /badges/:handle for visit count
-//   - GET /posts/handle/:handle for the grid (new server endpoint —
-//     replaces the old "fetch full feed and filter client-side" trick)
-function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSelectSite, onSelectBadges, onSelectPost, onBack, embedded }: {
+//   - GET /posts/handle/:handle for the grid
+function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSelectSite, onSelectBadges, onSelectPost, onSelectHandle, onSelectDMThread, onSelectExposureTab, onSelectSettings, onBack, embedded }: {
   profileHandle: string;
   currentHandle: string | null;
   deviceId: string | null;
   sites: SinisterSite[];
   onSelectSite: (site: SinisterSite) => void;
   onSelectBadges: (handle: string) => void;
-  onSelectPost: (postId: string, postList?: string[]) => void;
+  onSelectPost: (postId: string, postList?: string[], preloadedPosts?: SocialPost[]) => void;
+  // Tapping a handle inside the followers/following list sheet — routes
+  // to that handle's profile. Required so the sheet doesn't just close
+  // with no nav.
+  onSelectHandle: (handle: string) => void;
+  // v1.15: open a DM thread with a specific handle. Called by the
+  // Message button on other users' profiles. Optional because the
+  // embedded profile in your own DreadFeed Profile tab doesn't surface
+  // a Message button (you can't DM yourself).
+  onSelectDMThread?: (conversationId: string, otherHandle: string) => void;
+  // Optional — only passed when this view is dispatched as a standalone
+  // route (e.g. tapped @handle from a feed card). Embedded inside the
+  // DreadFeed profile tab, the parent SocialView handles tab nav itself.
+  onSelectExposureTab?: (tab: 'feed' | 'search' | 'post' | 'profile') => void;
+  // Optional — opens the Settings screen from a gear icon shown only on
+  // the current user's own profile. Plumbed through SocialView when
+  // embedded; not used on standalone profile views.
+  onSelectSettings?: () => void;
   onBack: () => void;
   embedded?: boolean;
 }) {
   const [stats, setStats] = useState<{ visitCount: number; submitCount: number; badgeCount: number } | null>(null);
   const [posts, setPosts] = useState<SocialPost[]>([]);
   const [loading, setLoading] = useState(true);
+  // The profile's current avatar URL (raw server form — 'library:xxx',
+  // full https URL, or null). Resolved via resolveAvatarUrl() at render
+  // time. Fetched on mount and refreshed when the user (if it's their
+  // own profile) picks a new avatar from the picker.
+  const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
+  // Display name / bio / link — IG-style profile fields. Fetched on
+  // mount alongside the avatar via /handles/profile/:handle. Editable
+  // on own profile via EditProfileModal.
+  const [displayName, setDisplayName] = useState<string>('');
+  const [bio, setBio] = useState<string>('');
+  const [link, setLink] = useState<string>('');
+  const [editProfileOpen, setEditProfileOpen] = useState(false);
+  // Follow status: follower count, following count, and whether the
+  // current user follows the profile being viewed. Loaded from
+  // /follows/status/:target on mount.
+  const [followStatus, setFollowStatus] = useState<FollowStatus>({ followedByYou: false, followerCount: 0, followingCount: 0 });
+  const [followBusy, setFollowBusy] = useState(false);
+  // Which handle-list sheet (if any) is open. null when closed.
+  const [listSheet, setListSheet] = useState<'followers' | 'following' | null>(null);
+  // Block state — derived from the viewer's hidden set on mount.
+  // Toggling flips immediately and persists via apiBlock / apiUnblock.
+  const [isBlocked, setIsBlocked] = useState(false);
+  const [blockBusy, setBlockBusy] = useState(false);
+  // Avatar picker visibility. Only relevant on your own profile.
+  const [avatarPickerOpen, setAvatarPickerOpen] = useState(false);
 
   const isMe = !!currentHandle && currentHandle.toLowerCase() === profileHandle.toLowerCase();
 
@@ -3606,10 +10237,14 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
     let cancelled = false;
     (async () => {
       setLoading(true);
-      // Fetch badge stats + this handle's posts in parallel.
-      const [badgeData, handlePosts] = await Promise.all([
+      // Fetch badge stats + posts + follow status + hidden set + profile
+      // (which carries displayName, bio, link, avatarUrl) in parallel.
+      const [badgeData, handlePosts, fStatus, hidden, profile] = await Promise.all([
         apiGetBadges(profileHandle),
         apiFetchPostsByHandle(profileHandle),
+        apiFollowStatus({ target: profileHandle, handle: currentHandle }),
+        getHiddenSet(currentHandle),
+        apiGetProfile(profileHandle),
       ]);
       if (cancelled) return;
       setStats({
@@ -3618,16 +10253,80 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
         badgeCount: badgeData.badges.length,
       });
       setPosts(handlePosts);
+      setFollowStatus(fStatus);
+      setIsBlocked(hidden.has(profileHandle.toLowerCase()));
+      if (profile) {
+        setAvatarUrl(profile.avatarUrl);
+        setDisplayName(profile.displayName || '');
+        setBio(profile.bio || '');
+        setLink(profile.link || '');
+      }
       setLoading(false);
     })();
     return () => { cancelled = true; };
-  }, [profileHandle]);
+  }, [profileHandle, currentHandle]);
+
+  // Toggle block — flips state, calls the appropriate API, invalidates
+  // the hidden-set cache so feeds reflect immediately. If a viewer
+  // blocks someone they're currently following, the follow row stays
+  // server-side (server doesn't auto-unfollow on block); the block
+  // alone is enough to hide their content.
+  const toggleBlock = async () => {
+    if (isMe || !currentHandle || !deviceId || blockBusy) return;
+    setBlockBusy(true);
+    const result = isBlocked
+      ? await apiUnblock({ blocker: currentHandle, blocked: profileHandle, deviceId })
+      : await apiBlock({ blocker: currentHandle, blocked: profileHandle, deviceId });
+    if (result.ok) {
+      invalidateHiddenSet();
+      setIsBlocked(!isBlocked);
+      showToast(isBlocked ? `Unblocked @${profileHandle}` : `Blocked @${profileHandle}`, 'success');
+    } else {
+      showToast(result.reason || 'Action failed', 'error');
+    }
+    setBlockBusy(false);
+  };
+
+  // Toggle follow on the profile being viewed. Optimistic update — the
+  // button flips immediately, counts adjust, and we revert if the
+  // server rejects.
+  const toggleFollow = async () => {
+    if (isMe) return;
+    if (!currentHandle || !deviceId) {
+      showToast('Claim a handle to follow people', 'error');
+      return;
+    }
+    if (followBusy) return;
+    setFollowBusy(true);
+
+    const prev = followStatus;
+    // Optimistic: flip the local state.
+    setFollowStatus({
+      followedByYou: !prev.followedByYou,
+      followerCount: prev.followerCount + (prev.followedByYou ? -1 : 1),
+      followingCount: prev.followingCount,
+    });
+
+    const result = prev.followedByYou
+      ? await apiUnfollow({ follower: currentHandle, target: profileHandle, deviceId })
+      : await apiFollow({ follower: currentHandle, target: profileHandle, deviceId });
+
+    if (!result.ok) {
+      // Revert
+      setFollowStatus(prev);
+      showToast(result.reason || 'Could not update follow', 'error');
+    } else if (!prev.followedByYou) {
+      // Newly followed — same audible feedback as a like, IG-style.
+      playLikeBlip();
+    }
+    setFollowBusy(false);
+  };
 
   // Mark variables as intentionally unused — they're part of the
   // standard profile prop bag but this layout doesn't surface them.
   // (sites is used indirectly via onSelectSite; deviceId is reserved
   // for future actions like "Edit profile" or following.)
-  void sites; void onSelectSite; void deviceId;
+  void sites; void onSelectSite; void onSelectBadges; void stats;
 
   return (
     <div style={embedded ? { paddingBottom: 80 } : S.socialViewWrap}>
@@ -3635,76 +10334,193 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
           eXposure tab, SocialView already renders it above. */}
       {!embedded && <ExposureBrandHeader />}
 
-      {/* ---- IG-style profile row: big avatar + stats ---- */}
+      {/* Settings gear — only shown on YOUR OWN profile and only when
+          this view is embedded in the DreadFeed Profile tab (settings
+          isn't reachable from a standalone profile view because that
+          flow is for viewing others). */}
+      {isMe && embedded && onSelectSettings && (
+        <div style={S.profileSettingsBar}>
+          <button
+            onClick={onSelectSettings}
+            style={S.profileSettingsBtn}
+            aria-label="Settings"
+          >
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="12" cy="12" r="3" />
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
+            </svg>
+          </button>
+        </div>
+      )}
+
+      {/* ---- IG-style profile row: big avatar + stats ----
+          Avatar is wrapped in profileAvatarWrap (no overflow clipping)
+          so the +badge can poke outside the circle. The actual clipped
+          circle is profileAvatarCircle inside. Badge sits as a sibling
+          of the circle so it's not clipped. */}
       <div style={S.profileTopRow}>
         <div style={S.profileAvatarWrap}>
-          <img src={exposureIconUrl} alt="" style={S.profileAvatarImg} />
+          {isMe ? (
+            <button
+              onClick={() => setAvatarPickerOpen(true)}
+              style={S.profileAvatarEditBtn}
+              aria-label="Change avatar"
+            >
+              <div style={S.profileAvatarCircle}>
+                <img
+                  src={resolveAvatarUrl(avatarUrl) || exposureIconUrl}
+                  alt=""
+                  style={S.profileAvatarImg}
+                />
+              </div>
+              <span style={S.profileAvatarEditBadge}>＋</span>
+            </button>
+          ) : (
+            <div style={S.profileAvatarCircle}>
+              <img
+                src={resolveAvatarUrl(avatarUrl) || exposureIconUrl}
+                alt=""
+                style={S.profileAvatarImg}
+              />
+            </div>
+          )}
         </div>
         <div style={S.profileStatsCluster}>
+          {/* Posts count — not tappable; shows the count of approved
+              posts for this handle. */}
           <div style={S.profileStatItem}>
             <div style={S.profileStatNum}>{posts.length}</div>
             <div style={S.profileStatLabel}>Posts</div>
           </div>
-          <div style={S.profileStatItem}>
-            <div style={S.profileStatNum}>{stats?.visitCount ?? '—'}</div>
-            <div style={S.profileStatLabel}>Visits</div>
-          </div>
+          {/* Followers — tappable, opens the follower list sheet. */}
           <button
-            onClick={() => { playSubDrop(); onSelectBadges(profileHandle); }}
+            onClick={() => setListSheet('followers')}
             style={{ ...S.profileStatItem, cursor: 'pointer', background: 'transparent', border: 'none' }}
-            aria-label="View badges"
+            aria-label="View followers"
           >
-            <div style={{ ...S.profileStatNum, color: '#BF40FF' }}>
-              {stats?.badgeCount ?? '—'}
-            </div>
-            <div style={{ ...S.profileStatLabel, color: '#BF40FF' }}>Badges</div>
+            <div style={S.profileStatNum}>{followStatus.followerCount}</div>
+            <div style={S.profileStatLabel}>Followers</div>
+          </button>
+          {/* Following — tappable, opens the following list sheet. */}
+          <button
+            onClick={() => setListSheet('following')}
+            style={{ ...S.profileStatItem, cursor: 'pointer', background: 'transparent', border: 'none' }}
+            aria-label="View following"
+          >
+            <div style={S.profileStatNum}>{followStatus.followingCount}</div>
+            <div style={S.profileStatLabel}>Following</div>
           </button>
         </div>
       </div>
 
       {/* ---- Display name / bio (placeholder until handles get bios) ---- */}
+      {/* ---- Display name / bio / link block ---- */}
       <div style={S.profileBioWrap}>
-        <div style={S.profileDisplayName}>{profileHandle}</div>
-        {/* Future: bio text goes here. Empty for now. */}
+        {/* Display name — falls back to the handle if not set. Always
+            renders so the layout doesn't jump when an empty profile
+            saves its first display name. */}
+        <div style={S.profileDisplayName}>{displayName || profileHandle}</div>
+        {/* Bio — only renders if present. Multi-line, preserves
+            newlines via whitespace: pre-wrap. */}
+        {bio && <div style={S.profileBio}>{bio}</div>}
+        {/* Link — only renders if present. Opens externally. */}
+        {link && (
+          <a
+            href={link}
+            target="_blank"
+            rel="noopener noreferrer"
+            style={S.profileLink}
+          >
+            {link.replace(/^https?:\/\/(www\.)?/, '')}
+          </a>
+        )}
       </div>
 
       {/* ---- Action button row (IG-style) ---- */}
+      {/* For your own profile: Edit profile + Share Profile side by side.
+          For someone else's: Follow / Following toggle + Share Profile + Block. */}
       <div style={S.profileActionsRow}>
         {isMe ? (
-          <>
-            <button
-              onClick={() => { playSubDrop(); onSelectBadges(profileHandle); }}
-              style={S.profileActionBtn}
-            >
-              View Badges
-            </button>
-            <button
-              onClick={() => {
-                // Lightweight share: copy a "view my profile" line. No
-                // deep-link scheme yet, so just put the handle on the
-                // clipboard. Good enough as a v1 — wire to a proper share
-                // sheet once profile URLs exist.
-                try {
-                  navigator.clipboard.writeText(`@${profileHandle} on The Dread Directory`);
-                  showToast('Copied to clipboard', 'success');
-                } catch {
-                  showToast('Could not copy', 'error');
-                }
-              }}
-              style={S.profileActionBtn}
-            >
-              Share Profile
-            </button>
-          </>
-        ) : (
           <button
-            onClick={() => { playSubDrop(); onSelectBadges(profileHandle); }}
+            onClick={() => setEditProfileOpen(true)}
             style={{ ...S.profileActionBtn, flex: 1 }}
           >
-            View Badges
+            Edit profile
+          </button>
+        ) : (
+          <button
+            onClick={toggleFollow}
+            disabled={followBusy}
+            style={followStatus.followedByYou ? S.profileFollowingBtn : S.profileFollowBtn}
+          >
+            {followStatus.followedByYou ? 'Following' : 'Follow'}
+          </button>
+        )}
+        {/* Message button (v1.15) — only on other people's profiles when
+            you have a handle and the viewer hasn't blocked them. Opens a
+            DM thread with this user; if no conversation exists yet, the
+            thread view shows an empty state until the first message is
+            sent. */}
+        {!isMe && currentHandle && deviceId && onSelectDMThread && !isBlocked && (
+          <button
+            onClick={() => {
+              const convId = dmConversationId(currentHandle, profileHandle);
+              onSelectDMThread(convId, profileHandle);
+            }}
+            style={{ ...S.profileActionBtn, flex: 1 }}
+          >
+            Message
+          </button>
+        )}
+        <button
+          onClick={() => {
+            // Lightweight share: copy a "view my profile" line. No
+            // deep-link scheme yet, so just put the handle on the
+            // clipboard. Good enough as a v1 — wire to a proper share
+            // sheet once profile URLs exist.
+            try {
+              navigator.clipboard.writeText(`@${profileHandle} on The Dread Directory`);
+              showToast('Copied to clipboard', 'success');
+            } catch {
+              showToast('Could not copy', 'error');
+            }
+          }}
+          style={{ ...S.profileActionBtn, flex: 1 }}
+        >
+          Share Profile
+        </button>
+        {/* Block / Unblock — only on other people's profiles. Visually
+            de-emphasized vs Follow so it doesn't dominate the row; this
+            is a destructive control most users never touch. */}
+        {!isMe && currentHandle && deviceId && (
+          <button
+            onClick={toggleBlock}
+            disabled={blockBusy}
+            style={S.profileBlockBtn}
+            aria-label={isBlocked ? 'Unblock user' : 'Block user'}
+          >
+            {isBlocked ? 'Unblock' : 'Block'}
           </button>
         )}
       </div>
+
+      {/* Followers / Following list sheet — opens when a stat is tapped.
+          Tapping a row routes to that handle's profile via onSelectHandle. */}
+      {listSheet && (
+        <HandleListSheet
+          mode={listSheet}
+          forHandle={profileHandle}
+          currentHandle={currentHandle}
+          onClose={() => setListSheet(null)}
+          onSelectHandle={(h) => {
+            setListSheet(null);
+            // Don't re-navigate if the user tapped themselves.
+            if (h.toLowerCase() === profileHandle.toLowerCase()) return;
+            onSelectHandle(h);
+          }}
+        />
+      )}
+
 
       {/* ---- Tab strip (only grid for now, but kept for IG familiarity) ---- */}
       <div style={S.profileTabStrip}>
@@ -3725,23 +10541,294 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
         <div style={S.socialEmpty}>Loading…</div>
       ) : posts.length === 0 ? (
         <div style={S.socialEmpty}>
-          {isMe ? 'You haven\u2019t posted to eXposure yet.' : 'No posts yet.'}
+          {isMe ? 'You haven\u2019t posted to DreadFeed yet.' : 'No posts yet.'}
           <br />
           <span style={{ opacity: 0.7, fontSize: 13 }}>
-            {isMe ? 'Visit a site and tap "Post to eXposure" to share.' : 'Check back later.'}
+            {isMe ? 'Visit a site and tap "Post to DreadFeed" to share.' : 'Check back later.'}
           </span>
         </div>
       ) : (
         <div style={S.profileGrid}>
-          {posts.map((p) => (
-            <button
-              key={p.id}
-              onClick={() => onSelectPost(p.id, posts.map((x) => x.id))}
-              style={S.profileGridCell}
-              aria-label={`Open post: ${p.caption.slice(0, 40)}`}
-            >
-              <img src={p.photoUrl} alt="" style={S.profileGridImg} loading="lazy" />
-            </button>
+          {posts.map((p) => {
+            // Detect video posts. Server sends mediaTypes parallel to
+            // photoUrls; if not present (pre-v1.13 posts), default to
+            // photo. We also sniff the URL extension as a fallback for
+            // posts whose mediaTypes got dropped somewhere along the
+            // way. For the grid we only care about the FIRST slot —
+            // carousels show their cover here.
+            const firstType =
+              (Array.isArray((p as any).mediaTypes) && (p as any).mediaTypes[0]) ||
+              (/\.(mp4|mov)(\?|$)/i.test(p.photoUrl) ? 'video' : 'photo');
+            const isVideo = firstType === 'video';
+            return (
+              <button
+                key={p.id}
+                onClick={() => onSelectPost(p.id, posts.map((x) => x.id), posts)}
+                style={S.profileGridCell}
+                aria-label={`Open post: ${p.caption.slice(0, 40)}`}
+              >
+                {isVideo ? (
+                  // Static first-frame thumbnail. preload="metadata"
+                  // tells the browser to fetch just enough bytes for
+                  // the poster frame, NOT the whole video. No autoplay,
+                  // no controls — this is a grid thumbnail, not a
+                  // player. Tap goes to the full post view where it
+                  // plays properly.
+                  <>
+                    <video
+                      // Append #t=0.1 to the URL — iOS Safari treats this
+                      // as a media fragment "seek to 0.1s on load" and
+                      // renders that frame as the poster. Without this,
+                      // mobile Safari shows a black frame until the user
+                      // presses play (which we don't want here — it's a
+                      // grid thumbnail, never played in place).
+                      src={`${p.photoUrl}#t=0.1`}
+                      style={S.profileGridImg}
+                      preload="metadata"
+                      muted
+                      playsInline
+                      // Belt-and-suspenders: if the hash trick is ignored
+                      // for any reason, force a tiny seek once metadata
+                      // is available. Either path renders the first
+                      // frame.
+                      onLoadedMetadata={(e) => {
+                        try { e.currentTarget.currentTime = 0.1; } catch { /* silent */ }
+                      }}
+                    />
+                    {/* ▶ overlay in the corner so users see it's a video */}
+                    <div style={S.profileGridVideoBadge} aria-hidden="true">
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="#ffffff">
+                        <path d="M8 5v14l11-7z" />
+                      </svg>
+                    </div>
+                  </>
+                ) : (
+                  <img src={p.photoUrl} alt="" style={S.profileGridImg} loading="lazy" />
+                )}
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Render the DreadFeed bottom bar only when this view is dispatched
+          standalone (e.g. tapped @handle from a feed card). When embedded
+          inside the DreadFeed Profile tab, SocialView already renders the
+          bar so doubling it up would stack two bars. */}
+      {!embedded && onSelectExposureTab && (
+        <ExposureBottomBar
+          active="profile"
+          onSelect={(tab) => {
+            if (tab === 'post') {
+              // Post composer requires SocialView's GPS + nearest-site
+              // logic; route to feed instead.
+              onSelectExposureTab('feed');
+              return;
+            }
+            onSelectExposureTab(tab);
+          }}
+        />
+      )}
+
+      {/* Avatar picker — only mounted when the user (on their own
+          profile) tapped the edit badge. Library tab + Upload tab.
+          On successful change, the picker calls onChanged with the
+          new server-form URL so the profile updates without a refetch. */}
+      {avatarPickerOpen && isMe && currentHandle && deviceId && (
+        <AvatarPickerModal
+          handle={currentHandle}
+          deviceId={deviceId}
+          currentAvatarUrl={avatarUrl}
+          onClose={() => setAvatarPickerOpen(false)}
+          onChanged={(newUrl) => {
+            setAvatarUrl(newUrl);
+            setAvatarPickerOpen(false);
+            showToast('Avatar updated', 'success');
+          }}
+        />
+      )}
+
+      {/* Edit profile modal — only mounted when the user taps Edit profile
+          on their own profile. Saves displayName/bio/link; on success
+          the local state updates immediately so the view reflects the
+          change without a refetch. */}
+      {editProfileOpen && isMe && currentHandle && deviceId && (
+        <EditProfileModal
+          handle={currentHandle}
+          deviceId={deviceId}
+          initialDisplayName={displayName}
+          initialBio={bio}
+          initialLink={link}
+          onClose={() => setEditProfileOpen(false)}
+          onSaved={(p) => {
+            setDisplayName(p.displayName);
+            setBio(p.bio);
+            setLink(p.link);
+            setEditProfileOpen(false);
+            showToast('Profile updated', 'success');
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+
+// ---------- Avatar Picker Modal ----------
+// Upload-only avatar picker. User taps "Choose photo", picks an image
+// from their camera roll, server resizes to 256x256 JPEG + strips EXIF
+// + stores in R2. "Reset to default" reverts to the placeholder.
+//
+// Calls onChanged(newServerUrl) on success — caller updates its avatar
+// state without a refetch. Server URLs come back as full https://...
+// (custom upload) or null (default).
+function AvatarPickerModal({ handle, deviceId, currentAvatarUrl, onClose, onChanged }: {
+  handle: string;
+  deviceId: string;
+  currentAvatarUrl: string | null;
+  onClose: () => void;
+  onChanged: (newUrl: string | null) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  const hasCustom = !!(currentAvatarUrl && currentAvatarUrl.startsWith('http'));
+
+  const onFilePicked = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files && e.target.files[0];
+    // Reset the input so picking the same file twice in a row still fires.
+    if (fileInputRef.current) fileInputRef.current.value = '';
+    if (!file) return;
+    if (busy) return;
+    setBusy(true);
+    setErr(null);
+    const r = await apiUploadAvatar({ handle, deviceId, photo: file });
+    setBusy(false);
+    if (!r.ok) {
+      setErr(r.reason || 'Upload failed.');
+      return;
+    }
+    onChanged(r.avatarUrl ?? null);
+  };
+
+  const onRemove = async () => {
+    if (busy) return;
+    setBusy(true);
+    setErr(null);
+    const r = await apiRemoveAvatar({ handle, deviceId });
+    setBusy(false);
+    if (!r.ok) {
+      setErr(r.reason || 'Failed to remove avatar.');
+      return;
+    }
+    onChanged(null);
+  };
+
+  return createPortal(
+    <div style={S.avatarPickerBackdrop} onClick={onClose}>
+      <div style={S.avatarPickerSheet} onClick={(e) => e.stopPropagation()}>
+        <div style={S.avatarPickerHeader}>
+          <button onClick={onClose} style={S.avatarPickerCancelBtn}>Cancel</button>
+          <div style={S.avatarPickerTitle}>Change avatar</div>
+          <div style={{ width: 60 }} />
+        </div>
+
+        {err && <div style={S.avatarPickerErr}>{err}</div>}
+
+        <div style={S.avatarPickerUploadPane}>
+          <div style={S.avatarPickerUploadHint}>
+            Pick a photo from your camera roll. We'll resize and crop it
+            to a square. Avatars are public — don't upload anything you
+            don't want others to see.
+          </div>
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            disabled={busy}
+            style={S.avatarPickerUploadBtn}
+          >{busy ? 'Uploading…' : 'Choose photo'}</button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            onChange={onFilePicked}
+            style={{ display: 'none' }}
+          />
+        </div>
+
+        {hasCustom && (
+          <button
+            onClick={onRemove}
+            disabled={busy}
+            style={S.avatarPickerRemoveBtn}
+          >Reset to default</button>
+        )}
+      </div>
+    </div>,
+    document.body
+  );
+}
+
+// ---------- NotificationsView ----------
+// Standalone screen showing all of the user's likes/follows/comments
+// notifications, newest first. Tapping a row routes to the relevant
+// destination (post for likes/comments, profile for follows).
+// Mark-read is called on mount so the bell badge clears.
+function NotificationsView({ handle, deviceId, onSelectHandle, onSelectPost, onBack }: {
+  handle: string;
+  deviceId: string;
+  onSelectHandle: (handle: string) => void;
+  onSelectPost: (postId: string) => void;
+  onBack: () => void;
+}) {
+  const [items, setItems] = useState<NotificationItem[] | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      const resp = await apiFetchNotifications(handle);
+      if (cancelled) return;
+      setItems(resp ? resp.notifications : []);
+      setLoading(false);
+      // Mark all as read in the background so the bell clears next poll.
+      apiMarkNotificationsRead({ handle, deviceId }).catch(() => { /* silent */ });
+    })();
+    return () => { cancelled = true; };
+  }, [handle, deviceId]);
+
+  return (
+    <div style={S.notifWrap}>
+      <div style={S.notifHeader}>
+        <button onClick={onBack} style={S.notifBackBtn} aria-label="Back">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <polyline points="15 18 9 12 15 6" />
+          </svg>
+        </button>
+        <div style={S.notifHeaderTitle}>Notifications</div>
+        <div style={{ width: 40 }} />
+      </div>
+
+      {loading ? (
+        <div style={S.notifEmpty}>Loading…</div>
+      ) : !items || items.length === 0 ? (
+        <div style={S.notifEmpty}>
+          <div style={{ fontSize: 32, marginBottom: 8 }}>🔕</div>
+          <div>No notifications yet.</div>
+          <div style={{ fontSize: 12, opacity: 0.6, marginTop: 6 }}>
+            You'll see likes, follows, and comments here.
+          </div>
+        </div>
+      ) : (
+        <div style={S.notifList}>
+          {items.map((n) => (
+            <NotificationRow
+              key={n.id}
+              item={n}
+              onSelectHandle={onSelectHandle}
+              onSelectPost={onSelectPost}
+            />
           ))}
         </div>
       )}
@@ -3749,59 +10836,349 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
   );
 }
 
-
-// ---------- Single Post Detail ----------
-// Opened when the user taps a thumbnail in a profile grid. Renders the
-// existing SocialPostCard so likes, the site chip, the handle tap and
-// time stamp all behave exactly like the feed.
-//
-// IG-style vertical navigation: when the caller passes the surrounding
-// postList (the full list of post IDs in the profile grid), the user
-// can swipe up to advance to the next post and down to return to the
-// previous one. Swipe-right still triggers the standard back gesture
-// and returns to the profile (or wherever the navigation came from).
-//
-// Why fetch by id instead of just passing the post object through view
-// state? Because views can be entered from a fresh app start (e.g. push
-// notification deep link in the future), and even from the same session
-// the cached count may be stale. One small request keeps the data
-// authoritative without slowing tap-to-open noticeably.
-function PostDetailView({ postId, postList, currentHandle, deviceId, sites, onSelectSite, onSelectHandle, onNavigatePost, onBack }: {
-  postId: string;
-  postList?: string[];
-  currentHandle: string | null;
-  deviceId: string | null;
-  sites: SinisterSite[];
-  onSelectSite: (site: SinisterSite) => void;
+function NotificationRow({ item, onSelectHandle, onSelectPost }: {
+  item: NotificationItem;
   onSelectHandle: (handle: string) => void;
-  onNavigatePost: (postId: string, postList?: string[]) => void;
-  onBack: () => void;
+  onSelectPost: (postId: string) => void;
 }) {
-  const [post, setPost] = useState<SocialPost | null>(null);
+  // Tapping the row routes contextually: likes/comments → the post,
+  // follows → the actor's profile. Avatar is always tappable to actor.
+  const onRowTap = () => {
+    if ((item.type === 'liked_post' || item.type === 'commented') && item.postId) {
+      onSelectPost(item.postId);
+    } else {
+      onSelectHandle(item.actor);
+    }
+  };
+
+  const verb = item.type === 'liked_post'
+    ? 'liked your post'
+    : item.type === 'commented'
+      ? `commented: ${item.commentSnippet || ''}`
+      : 'started following you';
+
+  return (
+    <button
+      onClick={onRowTap}
+      style={{ ...S.notifRow, ...(item.unread ? S.notifRowUnread : {}) }}
+    >
+      <button
+        onClick={(e) => { e.stopPropagation(); onSelectHandle(item.actor); }}
+        style={S.notifAvatarBtn}
+        aria-label={`${item.actor} profile`}
+      >
+        <img
+          src={resolveAvatarUrl(item.actorAvatarUrl) || exposureIconUrl}
+          alt=""
+          style={S.notifAvatarImg}
+        />
+      </button>
+      <div style={S.notifBodyCol}>
+        <div style={S.notifBodyText}>
+          <span style={S.notifActorName}>{item.actor}</span>
+          <span style={S.notifVerb}> {verb}</span>
+        </div>
+        <div style={S.notifTime}>{formatTimeAgoShort(item.createdAt)}</div>
+      </div>
+      {item.postThumbUrl && (
+        <img src={item.postThumbUrl} alt="" style={S.notifThumb} />
+      )}
+    </button>
+  );
+}
+
+// ---------- Edit Profile Modal ----------
+// Three editable fields: display name, bio, link. Each maps 1:1 to
+// the server's /handles/profile/update endpoint. Cancel discards
+// unsaved changes; Save validates client-side then submits. Server
+// also validates — client validation is just for fast feedback.
+function EditProfileModal({ handle, deviceId, initialDisplayName, initialBio, initialLink, onClose, onSaved }: {
+  handle: string;
+  deviceId: string;
+  initialDisplayName: string;
+  initialBio: string;
+  initialLink: string;
+  onClose: () => void;
+  onSaved: (p: { displayName: string; bio: string; link: string }) => void;
+}) {
+  const DISPLAY_NAME_MAX = 30;
+  const BIO_MAX = 150;
+
+  const [displayName, setDisplayName] = useState(initialDisplayName);
+  const [bio, setBio] = useState(initialBio);
+  const [link, setLink] = useState(initialLink);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const onSave = async () => {
+    if (busy) return;
+    setBusy(true);
+    setErr(null);
+    const r = await apiUpdateProfile({
+      handle,
+      deviceId,
+      displayName,
+      bio,
+      link,
+    });
+    setBusy(false);
+    if (!r.ok || !r.profile) {
+      setErr(r.reason || 'Save failed.');
+      return;
+    }
+    onSaved({
+      displayName: r.profile.displayName,
+      bio: r.profile.bio,
+      link: r.profile.link,
+    });
+  };
+
+  return createPortal(
+    <div style={S.editProfileBackdrop} onClick={onClose}>
+      <div style={S.editProfileSheet} onClick={(e) => e.stopPropagation()}>
+        <div style={S.editProfileHeader}>
+          <button onClick={onClose} style={S.editProfileCancelBtn}>Cancel</button>
+          <div style={S.editProfileTitle}>Edit profile</div>
+          <button onClick={onSave} disabled={busy} style={S.editProfileSaveBtn}>
+            {busy ? 'Saving…' : 'Save'}
+          </button>
+        </div>
+
+        {err && <div style={S.editProfileErr}>{err}</div>}
+
+        <div style={S.editProfileBody}>
+          <div style={S.editProfileFieldLabel}>Display name</div>
+          <input
+            type="text"
+            value={displayName}
+            onChange={(e) => setDisplayName(e.target.value.slice(0, DISPLAY_NAME_MAX))}
+            placeholder="Your name"
+            style={S.editProfileInput}
+            maxLength={DISPLAY_NAME_MAX}
+          />
+          <div style={S.editProfileCounter}>{displayName.length} / {DISPLAY_NAME_MAX}</div>
+
+          <div style={S.editProfileFieldLabel}>Bio</div>
+          <textarea
+            value={bio}
+            onChange={(e) => setBio(e.target.value.slice(0, BIO_MAX))}
+            placeholder="Tell people about yourself"
+            style={S.editProfileTextarea}
+            rows={4}
+            maxLength={BIO_MAX}
+          />
+          <div style={S.editProfileCounter}>{bio.length} / {BIO_MAX}</div>
+
+          <div style={S.editProfileFieldLabel}>Link</div>
+          <input
+            type="url"
+            value={link}
+            onChange={(e) => setLink(e.target.value)}
+            placeholder="youtube.com/@yourchannel"
+            style={S.editProfileInput}
+            autoCapitalize="none"
+            autoCorrect="off"
+            spellCheck={false}
+          />
+          <div style={S.editProfileHint}>
+            We'll add https:// if you leave it off.
+          </div>
+        </div>
+      </div>
+    </div>,
+    document.body
+  );
+}
+
+// ---------- Handle List Sheet ----------
+// IG-style bottom sheet showing a list of handles (followers or
+// following). Same slide-up animation + dismiss patterns as the
+// CommentSheet. Tapping a handle row currently just closes the sheet
+// — full @handle navigation from inside the sheet would need extra
+// plumbing to thread `setView` down here, deferred for now.
+function HandleListSheet({ mode, forHandle, currentHandle, onClose, onSelectHandle }: {
+  mode: 'followers' | 'following';
+  forHandle: string;
+  currentHandle: string | null;
+  onClose: () => void;
+  onSelectHandle: (handle: string) => void;
+}) {
+  const [list, setList] = useState<HandleEntry[]>([]);
   const [loading, setLoading] = useState(true);
+  const [mounted, setMounted] = useState(false);
+  const [closing, setClosing] = useState(false);
+  const [dragY, setDragY] = useState(0);
+  const dragStartYRef = useRef<number | null>(null);
 
-  // Index of the current post within the supplied list. -1 if no list
-  // (e.g. deep-linked) or if the post id isn't found. The swipe handler
-  // uses this to know which direction is available.
-  const currentIdx = useMemo(() => {
-    if (!postList || postList.length === 0) return -1;
-    return postList.indexOf(postId);
-  }, [postList, postId]);
+  void currentHandle; // reserved for future "Follow back" indicators
 
-  const hasPrev = currentIdx > 0;
-  const hasNext = currentIdx >= 0 && postList ? currentIdx < postList.length - 1 : false;
+  useEffect(() => {
+    const id = requestAnimationFrame(() => setMounted(true));
+    return () => cancelAnimationFrame(id);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
       setLoading(true);
-      const p = await apiFetchPost(postId);
+      const data = mode === 'followers'
+        ? await apiFollowers(forHandle)
+        : await apiFollowing(forHandle);
       if (cancelled) return;
-      setPost(p);
+      setList(data);
       setLoading(false);
     })();
     return () => { cancelled = true; };
-  }, [postId]);
+  }, [mode, forHandle]);
+
+  const animateClose = () => {
+    if (closing) return;
+    setClosing(true);
+    setTimeout(() => onClose(), 260);
+  };
+
+  const onTouchStartHandle = (e: React.TouchEvent) => {
+    if (e.touches.length !== 1) return;
+    dragStartYRef.current = e.touches[0].clientY;
+  };
+  const onTouchMoveHandle = (e: React.TouchEvent) => {
+    if (dragStartYRef.current === null || e.touches.length !== 1) return;
+    const dy = e.touches[0].clientY - dragStartYRef.current;
+    if (dy > 0) setDragY(dy);
+  };
+  const onTouchEndHandle = () => {
+    const dy = dragY;
+    dragStartYRef.current = null;
+    setDragY(0);
+    if (dy > 120) animateClose();
+  };
+
+  const translateY = closing ? '100%' : mounted ? `${dragY}px` : '100%';
+  const title = mode === 'followers' ? 'Followers' : 'Following';
+
+  return createPortal(
+    <div style={S.commentSheetOverlay}>
+      <div style={S.commentSheetBackdrop} onClick={animateClose} />
+      <div
+        style={{
+          ...S.commentSheetPanel,
+          transform: `translateY(${translateY})`,
+          transition: dragStartYRef.current === null ? 'transform 0.26s cubic-bezier(0.32, 0.72, 0, 1)' : 'none',
+        }}
+      >
+        <div
+          style={S.commentSheetHandleArea}
+          onTouchStart={onTouchStartHandle}
+          onTouchMove={onTouchMoveHandle}
+          onTouchEnd={onTouchEndHandle}
+        >
+          <div style={S.commentSheetHandlePill} />
+        </div>
+        <div style={S.commentSheetHeader}>
+          <div style={{ width: 40 }} />
+          <div style={S.commentSheetTitle}>{title}</div>
+          <div style={{ width: 40 }} />
+        </div>
+        <div style={S.commentSheetList}>
+          {loading ? (
+            <div style={S.commentSheetEmpty}>Loading…</div>
+          ) : list.length === 0 ? (
+            <div style={S.commentSheetEmpty}>
+              {mode === 'followers' ? 'No followers yet.' : 'Not following anyone yet.'}
+            </div>
+          ) : (
+            list.map((entry) => (
+              <button
+                key={entry.handle}
+                onClick={() => onSelectHandle(entry.handle)}
+                style={S.handleListRow}
+              >
+                <img src={exposureIconUrl} alt="" style={S.commentAvatar} />
+                <div style={S.commentBodyCol}>
+                  <div style={S.commentHandle}>{entry.handle}</div>
+                </div>
+              </button>
+            ))
+          )}
+        </div>
+      </div>
+    </div>,
+    document.body
+  );
+}
+
+// ---------- Single Post Detail ----------
+// Opened when the user taps a thumbnail in a profile grid. Renders all
+// of the profile's posts as a native vertical scrollable feed, scrolled
+// to the tapped post on mount. Up/down navigation is just native scroll
+// — same smooth momentum scrolling as the eXposure feed. Swipe-right
+// pops back to the profile via the standard back gesture.
+//
+// Why a feed instead of a single card with snap-swipe handlers?
+//   The previous implementation tried to detect vertical swipes and
+//   navigate between posts by re-mounting the view. That worked but felt
+//   "snappy" — discrete jumps instead of the continuous scroll users
+//   expect from IG. A native scrollable feed gets momentum, inertia, and
+//   rubber-banding for free, and matches the eXposure feed sub-tab.
+//
+// Preloaded posts arrive from the caller (UserProfileView already has
+// them). Falls back to fetching when no preload is available (e.g. deep
+// link in the future).
+function PostDetailView({ postId, postList, preloadedPosts, currentHandle, deviceId, sites, onSelectSite, onSelectHandle, onSelectHashtag, onSelectExposureTab, onBack }: {
+  postId: string;
+  postList?: string[];
+  preloadedPosts?: SocialPost[];
+  currentHandle: string | null;
+  deviceId: string | null;
+  sites: SinisterSite[];
+  onSelectSite: (site: SinisterSite) => void;
+  onSelectHandle: (handle: string) => void;
+  onSelectHashtag: (tag: string) => void;
+  onSelectExposureTab: (tab: 'feed' | 'search' | 'post' | 'profile') => void;
+  onBack: () => void;
+}) {
+  // If the caller preloaded the post objects, use them directly — no
+  // network round-trip needed. Otherwise fall back to fetching just the
+  // target post by id.
+  const [posts, setPosts] = useState<SocialPost[]>(preloadedPosts || []);
+  const [loading, setLoading] = useState(!preloadedPosts || preloadedPosts.length === 0);
+
+  // Refs keyed by post id so we can scroll the right card into view on
+  // mount. data-postid attribute is the lookup mechanism — simpler than
+  // managing a Map of refs.
+  const containerRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (preloadedPosts && preloadedPosts.length > 0) return;
+    // No preload — fetch just the one post.
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      const p = await apiFetchPost(postId);
+      if (cancelled) return;
+      setPosts(p ? [p] : []);
+      setLoading(false);
+    })();
+    return () => { cancelled = true; };
+  }, [postId, preloadedPosts]);
+
+  // After the feed renders, scroll the target post's card into view.
+  // 'auto' (not 'smooth') because we want it to land instantly — the
+  // user tapped a thumbnail and expects to see that post, not watch it
+  // scroll to itself.
+  useEffect(() => {
+    if (loading || posts.length === 0) return;
+    // Wait one paint so layout is settled before measuring.
+    const id = requestAnimationFrame(() => {
+      const root = containerRef.current;
+      if (!root) return;
+      const target = root.querySelector(`[data-postid="${postId}"]`) as HTMLElement | null;
+      if (target) {
+        target.scrollIntoView({ block: 'start', behavior: 'auto' });
+      }
+    });
+    return () => cancelAnimationFrame(id);
+  }, [loading, posts, postId]);
 
   const siteById = useMemo(() => {
     const m = new Map<string, SinisterSite>();
@@ -3809,74 +11186,30 @@ function PostDetailView({ postId, postList, currentHandle, deviceId, sites, onSe
     return m;
   }, [sites]);
 
-  void onBack; // back is handled by the swipe-right gesture wrapper
-
-  // ---- IG-style vertical swipe between posts ----
-  // Touch handler attached to the content wrapper. We only commit a
-  // navigation when:
-  //   - the gesture is unambiguously vertical (|dy| > |dx| by a margin)
-  //   - the gesture exceeds either a distance threshold or a flick
-  //     velocity threshold
-  //   - and a neighbor exists in the requested direction
-  // The horizontal-axis check matters because the parent app installs a
-  // global swipe-back gesture; if we don't ignore horizontal moves, we'd
-  // race the back gesture. The parent's handler aborts when it sees a
-  // vertical drag, so the two handlers cooperate cleanly.
-  const _swipeStart = useRef<{ x: number; y: number; t: number } | null>(null);
-  const SWIPE_DIST_PX = 80;       // commit if dragged this far
-  const SWIPE_VELOCITY = 0.45;    // …or this fast (px/ms)
-  const onTouchStart = (e: React.TouchEvent) => {
-    if (e.touches.length !== 1) return;
-    const t = e.touches[0];
-    _swipeStart.current = { x: t.clientX, y: t.clientY, t: Date.now() };
-  };
-  const onTouchEnd = (e: React.TouchEvent) => {
-    const start = _swipeStart.current;
-    _swipeStart.current = null;
-    if (!start) return;
-    if (!postList || postList.length <= 1) return;
-    const ch = e.changedTouches[0];
-    if (!ch) return;
-    const dx = ch.clientX - start.x;
-    const dy = ch.clientY - start.y;
-    const dt = Math.max(1, Date.now() - start.t);
-    // Vertical lock: require dy to dominate dx by ~1.4x so a roughly
-    // diagonal swipe-right (the back gesture) doesn't also trigger
-    // post navigation.
-    if (Math.abs(dy) < Math.abs(dx) * 1.4) return;
-    const velocity = Math.abs(dy) / dt;
-    if (Math.abs(dy) < SWIPE_DIST_PX && velocity < SWIPE_VELOCITY) return;
-    if (dy < 0 && hasNext && postList) {
-      // Swipe up → next post
-      const nextId = postList[currentIdx + 1];
-      if (nextId) onNavigatePost(nextId, postList);
-    } else if (dy > 0 && hasPrev && postList) {
-      // Swipe down → previous post
-      const prevId = postList[currentIdx - 1];
-      if (prevId) onNavigatePost(prevId, postList);
+  // Ensure we only render posts that are part of postList (if provided)
+  // and in postList's order. Defensive — preloadedPosts SHOULD already
+  // match, but this guarantees ordering and filters out anything weird.
+  const orderedPosts = useMemo(() => {
+    if (!postList || postList.length === 0) return posts;
+    const byId = new Map<string, SocialPost>();
+    for (const p of posts) byId.set(p.id, p);
+    const out: SocialPost[] = [];
+    for (const id of postList) {
+      const p = byId.get(id);
+      if (p) out.push(p);
     }
-  };
+    return out.length > 0 ? out : posts;
+  }, [postList, posts]);
+
+  void onBack; // swipe-right gesture handles back
 
   return (
-    <div
-      style={S.socialViewWrap}
-      onTouchStart={onTouchStart}
-      onTouchEnd={onTouchEnd}
-    >
+    <div style={S.socialViewWrap} ref={containerRef}>
       <ExposureBrandHeader />
-
-      {/* Position indicator — shows "3 / 12" when navigating within a
-          profile's grid so the user has IG-style orientation. Hidden
-          when there's no list (deep-link case). */}
-      {postList && postList.length > 1 && currentIdx >= 0 && (
-        <div style={S.postDetailIndicator}>
-          {currentIdx + 1} / {postList.length}
-        </div>
-      )}
 
       {loading ? (
         <div style={S.socialEmpty}>Loading…</div>
-      ) : !post ? (
+      ) : orderedPosts.length === 0 ? (
         <div style={S.socialEmpty}>
           Post not found.
           <br />
@@ -3885,29 +11218,45 @@ function PostDetailView({ postId, postList, currentHandle, deviceId, sites, onSe
           </span>
         </div>
       ) : (
-        <div style={S.socialFeed}>
-          <SocialPostCard
-            post={post}
-            currentHandle={currentHandle}
-            deviceId={deviceId}
-            onSiteTap={() => {
-              const s = siteById.get(post.siteId);
-              if (s) onSelectSite(s);
-            }}
-            onHandleTap={() => onSelectHandle(post.handle)}
-          />
-
-          {/* Hints — only render when a neighbor exists. Subtle text
-              chips below the card telling the user they can keep
-              swiping. Disappear once they've used the gesture. */}
-          {(hasNext || hasPrev) && (
-            <div style={S.postDetailHintRow}>
-              {hasPrev && <span style={S.postDetailHint}>↓ Swipe down for previous</span>}
-              {hasNext && <span style={S.postDetailHint}>↑ Swipe up for next</span>}
+        <div style={{ ...S.socialFeed, paddingBottom: 80 }}>
+          {orderedPosts.map((p) => (
+            <div key={p.id} data-postid={p.id}>
+              <SocialPostCard
+                post={p}
+                currentHandle={currentHandle}
+                deviceId={deviceId}
+                onSiteTap={() => {
+                  const s = siteById.get(p.siteId);
+                  if (s) onSelectSite(s);
+                }}
+                onHandleTap={() => onSelectHandle(p.handle)}
+                onHashtagTap={(tag) => onSelectHashtag(tag)}
+              />
             </div>
-          )}
+          ))}
         </div>
       )}
+
+      {/* Reuse the eXposure bottom bar so navigation feels continuous
+          while viewing a post. Tapping any tab returns to the eXposure
+          tab; the parent dispatcher sets the sub-tab memory first so we
+          land on the right sub-screen rather than flickering through
+          'feed'. The Post tab dispatches as 'feed' since there's no
+          composer accessible from outside SocialView — it would need
+          GPS + nearest-site logic to open. */}
+      <ExposureBottomBar
+        active="profile"
+        onSelect={(tab) => {
+          if (tab === 'post') {
+            // Post-composer isn't reachable from this view (it requires
+            // SocialView's GPS + nearest-site logic). Route to feed
+            // instead — user can hit Post again from there.
+            onSelectExposureTab('feed');
+            return;
+          }
+          onSelectExposureTab(tab);
+        }}
+      />
     </div>
   );
 }
@@ -4306,8 +11655,6 @@ function ListView({ sites, currentLocation, onSelectSite, onBack }: {
   // Counts only matching sites — searching "virginia" with one VA cult site
   // would show "Cults • 1" alongside "Hauntings • N" rather than the full
   // catalog count.
-  // Uses VISIBLE_CATEGORIES so hidden categories don't show up. True
-  // Crime's count includes serial killer sites via categoriesForKey().
   const categoryRows = useMemo(() => {
     const rows: { cat: typeof CATEGORIES[number]; count: number }[] = [];
     for (const cat of VISIBLE_CATEGORIES) {
@@ -4336,9 +11683,11 @@ function ListView({ sites, currentLocation, onSelectSite, onBack }: {
   // Level 3: list of sites for the chosen category + state.
   const siteRows = useMemo(() => {
     if (level.kind !== 'sites') return [];
-    const allowed = new Set<CategoryKey>(categoriesForKey(level.category));
     return sites
-      .filter(s => allowed.has(s.category as CategoryKey) && s.state === level.state && siteMatches(s))
+      .filter(s => {
+        const allowed = new Set<CategoryKey>(categoriesForKey(level.category));
+        return allowed.has(s.category as CategoryKey) && s.state === level.state && siteMatches(s);
+      })
       .sort((a, b) => a.title.localeCompare(b.title));
   }, [sites, q, level]);
 
@@ -4396,7 +11745,7 @@ function ListView({ sites, currentLocation, onSelectSite, onBack }: {
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Search by title, state, or category…"
-            style={S.searchInput}
+            style={S.localeSearchInput}
           />
           {query && (
             <button
@@ -4429,15 +11778,14 @@ function ListView({ sites, currentLocation, onSelectSite, onBack }: {
           ) : (
             <div style={S.listSitesWrap}>
               {categoryRows.map(({ cat, count }) => {
-                const color = CATEGORY_COLOR[cat.key];
                 return (
                   <button
                     key={cat.key}
-                    style={{ ...S.listCategoryRow, borderColor: `${color}55`, boxShadow: `0 0 10px ${color}22, inset 0 0 6px ${color}11` }}
+                    style={S.listCategoryRow}
                     onClick={() => { playSubDrop(); setLevel({ kind: 'states', category: cat.key }); }}
                   >
-                    <span style={{ ...S.listRowDot, background: color, boxShadow: `0 0 6px ${color}` }} />
-                    <span style={{ ...S.listRowTitle, color, textShadow: `0 0 8px ${color}88` }}>{cat.label}</span>
+                    <span style={S.listRowDot} />
+                    <span style={S.listRowTitle}>{cat.label}</span>
                     <span style={S.listRowCount}>{count} {count === 1 ? 'location' : 'locations'}</span>
                     <span style={S.listChevron}>›</span>
                   </button>
@@ -4456,14 +11804,13 @@ function ListView({ sites, currentLocation, onSelectSite, onBack }: {
           ) : (
             <div style={S.listSitesWrap}>
               {(() => {
-                const color = CATEGORY_COLOR[level.category];
                 return stateRows.map(({ state, count }) => (
                   <button
                     key={state}
                     style={S.listRow}
                     onClick={() => { playSubDrop(); setLevel({ kind: 'sites', category: level.category, state }); }}
                   >
-                    <span style={{ ...S.listRowDot, background: color, boxShadow: `0 0 6px ${color}` }} />
+                    <span style={S.listRowDot} />
                     <span style={S.listRowTitle}>{state}</span>
                     <span style={S.listRowCount}>{count} {count === 1 ? 'location' : 'locations'}</span>
                     <span style={S.listChevron}>›</span>
@@ -4487,14 +11834,13 @@ function ListView({ sites, currentLocation, onSelectSite, onBack }: {
           ) : (
             <div style={S.listSitesWrap}>
               {(() => {
-                const color = CATEGORY_COLOR[level.category];
                 return siteRows.map((site) => (
                   <button
                     key={site.id}
                     style={S.listRow}
                     onClick={() => { playSubDrop(); onSelectSite(site); }}
                   >
-                    <span style={{ ...S.listRowDot, background: color, boxShadow: `0 0 6px ${color}` }} />
+                    <span style={S.listRowDot} />
                     <span style={S.listRowTitle}>{site.title}</span>
                     <span style={S.listChevron}>›</span>
                   </button>
@@ -4602,7 +11948,7 @@ function HomeView({ sites, onSelectCategory, onSelectSite, onSubmit, onAbout, on
   void onSubmit; void onLeaders;
   const counts: Record<string, number> = {};
   for (const s of sites) counts[s.category] = (counts[s.category] || 0) + 1;
-  // Use VISIBLE_CATEGORIES so hidden categories (cults, serial killers,
+  // Use VISIBLE_CATEGORIES so hidden categories (UFO, serial killers,
   // grave sites) don't appear in the home filmstrip. Data stays intact;
   // we're only filtering the home grid display.
   const ordered = [...VISIBLE_CATEGORIES].sort((a, b) => a.gridIndex - b.gridIndex);
@@ -5231,43 +12577,125 @@ function AboutView({ onBack }: { onBack: () => void }) {
 
       <div style={S.aboutBody}>
         <p style={S.aboutPara}>
-          <b>Sinister Locations</b> is a field guide to the macabre — historic crimes, hauntings, horror film locations,
-          cults, serial killers, and unsettling history hiding all around you.
+          <b>The Dread Directory</b> is a field guide to the macabre — historic crimes, hauntings, horror
+          film locations, UFO sightings, serial killers, and unsettling history hiding all around you.
         </p>
 
-        <div style={S.aboutSectionHeader}>What This App Does</div>
+        <div style={S.aboutSectionHeader}>What this app does</div>
 
         <p style={S.aboutPara}>
-          <b>Notifies you when you're near sinister sites.</b> The app runs in the background and pings you when
-          you come within range of a haunting, crime scene, or other macabre location — even when the app is closed.
-          Set location access to "Always" for this to work.
+          <b>Notifies you when you're near a Dread Location.</b> The app runs in the background and pings
+          you when you come within range of a haunting, crime scene, or other macabre location — even when
+          the app is closed. Set location access to "Always" for this to work.
         </p>
         <p style={S.aboutPara}>
-          <b>Tells the story behind every location.</b> Each site has its full history, exact coordinates, and
-          turn-by-turn directions in your maps app.
+          <b>Tells the story behind every location.</b> Each site has its full history, exact coordinates,
+          and turn-by-turn directions in your maps app.
         </p>
         <p style={S.aboutPara}>
-          <b>Lets you claim visits.</b> Stand within 100 feet of any site and tap "I'm Here" to log your visit.
-          Visits earn you badges and rank you on the Dread Leaders board.
+          <b>Lets you add your own locations.</b> Found a Dread Location we don't have? Submit it while
+          you're physically on-site — the app verifies your GPS and requires an on-site photo.
         </p>
         <p style={S.aboutPara}>
-          <b>Lets you add your own locations.</b> Found a sinister spot we don't have? Tap Submit a Location while
-          you're physically on-site — the app verifies your GPS and requires an on-site photo. Approved entries
-          are credited to your handle permanently.
+          <b>DreadFeed.</b> An in-app social feed for posting horror photos, captioning your visits,
+          commenting, and reacting to other users' posts.
+        </p>
+
+        <div style={S.aboutSectionHeader}>Getting started</div>
+
+        <p style={S.aboutPara}>
+          <b>1. Just open the app.</b> No account needed to browse Dread Locations, see the map, or read
+          DreadFeed. Jump in and look around.
         </p>
         <p style={S.aboutPara}>
-          <b>Tracks your achievements.</b> Earn tiered badges for submissions and visits. Unlock special badges
-          for milestones like visiting all six categories or reaching new states.
+          <b>2. Grant location access.</b> Choose "Allow While Using App" the first time you open the map.
+          For background notifications when you're near a Dread Location, go to iOS Settings → The Dread
+          Directory → Location → and switch to "Always".
+        </p>
+        <p style={S.aboutPara}>
+          <b>3. Allow notifications.</b> This lets the app ping you when you walk within range of a site,
+          even if the app is closed.
+        </p>
+        <p style={S.aboutPara}>
+          <b>4. Claim a handle when you're ready to participate.</b> To post to DreadFeed, comment, submit
+          a new Dread Location, or like other people's posts, you'll need a handle. Tap any of those
+          actions and the app will walk you through Sign in with Apple — it takes one tap.
+        </p>
+
+        <div style={S.aboutSectionHeader}>Browsing Dread Locations</div>
+
+        <p style={S.aboutPara}>
+          <b>The List.</b> Tap the list icon on the home screen to browse by category — True Crime,
+          Hauntings, Film Locations, UFO Sightings, Serial Killers, and Grave Sites. Drill into a category,
+          then a state, then a site to see its full lore.
+        </p>
+        <p style={S.aboutPara}>
+          <b>The Map.</b> Tap the map icon on a category screen to see all sites in that category around
+          you. Pinch to zoom, tap any pin for a quick preview, tap "View Details" for the full story.
+        </p>
+        <p style={S.aboutPara}>
+          <b>Directions.</b> On any site's detail page, tap Directions to open Apple Maps with turn-by-turn
+          routing to that exact spot.
+        </p>
+
+        <div style={S.aboutSectionHeader}>Submitting a new site</div>
+
+        <p style={S.aboutPara}>
+          <b>Be physically on-site.</b> Submission requires GPS verification within 100 meters of the
+          location you're claiming. This keeps the directory honest.
+        </p>
+        <p style={S.aboutPara}>
+          <b>Tap Submit.</b> From the home screen, tap the submit option. The app opens the camera,
+          captures your current GPS, and walks you through naming the site, picking a category, writing
+          its lore, and adding a verification photo.
+        </p>
+        <p style={S.aboutPara}>
+          <b>Wait for approval.</b> Every submission goes to admin review for moderation. Once approved,
+          your site appears in the directory permanently — credited to your handle.
+        </p>
+
+        <div style={S.aboutSectionHeader}>Using DreadFeed</div>
+
+        <p style={S.aboutPara}>
+          <b>The feed.</b> Tap the DreadFeed icon on the home screen to see a chronological feed of horror
+          photos posted by other users. Tap a photo to see it full-size with its caption.
+        </p>
+        <p style={S.aboutPara}>
+          <b>Posting from a site.</b> On any site's detail page (after you've physically been there), tap
+          "Post to DreadFeed" to attach a photo and caption to that location. These posts are GPS-verified
+          and admin-moderated.
+        </p>
+        <p style={S.aboutPara}>
+          <b>Freeform posts.</b> Tap the ➕ icon on the DreadFeed tab to post any horror photo with a
+          caption — no location required. Add stickers, text, filters, and frames in the in-app editor.
+        </p>
+        <p style={S.aboutPara}>
+          <b>Comments and replies.</b> Tap the comment icon under any post to read the thread. Tap Reply
+          under a comment to thread your response. Comments support 20 horror emojis from the quick row.
+        </p>
+        <p style={S.aboutPara}>
+          <b>Reporting and blocking.</b> Tap the ⋯ on any post or comment to report content that violates
+          the rules or block the user who posted it. Blocked users' content disappears across the whole
+          app for you.
+        </p>
+
+        <div style={S.aboutSectionHeader}>Account &amp; privacy</div>
+
+        <p style={S.aboutPara}>
+          <b>What we store.</b> Your handle, the sites you've submitted, the posts you've made, your
+          comments, your likes, and the device that owns your handle. That's it. No email, no real name,
+          no contacts.
+        </p>
+        <p style={S.aboutPara}>
+          <b>Delete everything.</b> From the home screen, go to Account → Delete account. This permanently
+          removes your handle, all your posts, all your comments, every site you submitted, and every
+          like you cast. It cannot be undone.
         </p>
 
         <div style={S.aboutSectionHeader}>About</div>
 
         <p style={S.aboutPara}>
           Part of the Sinister family — alongside Sinister Trivia and the Sinister Vids YouTube channel.
-        </p>
-        <p style={S.aboutPara}>
-          User submissions require an on-site photo and GPS verification. Approved entries are credited to the submitter
-          permanently.
         </p>
 
         <div style={{ marginTop: 24 }}>
@@ -5332,7 +12760,7 @@ const CATEGORY_PIN_GLYPH: Record<CategoryKey, string> = {
   haunting:   '👻',
   killer:     '💀',
   crime:      '🔪',
-  cult:       '🕯',
+  ufo:        '🛸',
   film:       '🎬',
   historical: '🪦',
 };
@@ -5406,6 +12834,13 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
   const userAnnotationRef = useRef<any>(null);
   const siteAnnotationsRef = useRef<any[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
+  // State flag that flips true once the MapKit map object exists on
+  // mapRef. Several effects that touch the map need to re-run after
+  // it's ready — without a state flag, they'd race the async map
+  // creation and bail with `if (!map) return`, then never fire again
+  // because their actual data deps haven't changed. This is the root
+  // cause of the "pins don't appear until I touch the radius" bug.
+  const [mapReady, setMapReady] = useState(false);
   const [livePos, setLivePos] = useState<{ lat: number; lng: number } | null>(currentLocation);
   // Currently-tapped pin's site + distance. When non-null, a slide-up
   // preview card renders over the bottom of the map. Tapping the map
@@ -5430,9 +12865,34 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
 
   // The effective search center is the drop-pin if one is set, otherwise
   // the user's real location.
+  //
+  // CRITICAL: this memo must be stable against GPS jitter. livePos updates
+  // every few seconds even when the user is stationary (the underlying
+  // Geolocation watcher emits a fresh object on each fix). If we memoized
+  // on the object identity of livePos, every tick would invalidate
+  // `effectiveCenter`, then `nearbySites`, then the annotation rebuild
+  // effect — causing pins to be removed and re-added several times per
+  // second. MapKit's cluster engine sees the churn as "many new
+  // annotations" each cycle and visibly thrashes between expanded
+  // individual pins and the collapsed cluster circle. That's the
+  // "flickering pin glitch" the user sees on the Hauntings map.
+  //
+  // Fix: read lat/lng primitives, round to ~10m precision, and only emit
+  // a new effectiveCenter when those rounded values actually change.
+  // Pinned mode is exact (no rounding) because dragging needs precision.
+  const livePosLatRounded = livePos ? Math.round(livePos.lat * 10000) / 10000 : null;
+  const livePosLngRounded = livePos ? Math.round(livePos.lng * 10000) / 10000 : null;
   const effectiveCenter = useMemo(
-    () => pinCenter || livePos,
-    [pinCenter, livePos],
+    () => {
+      if (pinCenter) return pinCenter;
+      if (livePosLatRounded === null || livePosLngRounded === null) return null;
+      return { lat: livePosLatRounded, lng: livePosLngRounded };
+    },
+    // Depend on the ROUNDED primitives, not the livePos object. A GPS
+    // tick that doesn't move the rounded coords keeps the same memoized
+    // reference, which keeps nearbySites stable, which keeps the
+    // annotation rebuild effect from firing in a loop.
+    [pinCenter, livePosLatRounded, livePosLngRounded],
   );
 
   // Compute nearby sites with the current radius and effective center.
@@ -5504,6 +12964,9 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
           });
         };
         mapRef.current = map;
+        // Flip the state flag so dependent effects (annotation rebuild,
+        // initial center, etc.) re-run now that the map is real.
+        setMapReady(true);
       })
       .catch((err) => {
         if (cancelled) return;
@@ -5573,9 +13036,14 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
     // Tapping a Reset button or the dot itself clears pinCenter and snaps
     // it back to the real location.
     if (userAnnotationRef.current) {
-      // Only sync to livePos when we're NOT in dragged mode — otherwise
-      // we'd yank the dot back to the user's real location every GPS update.
-      if (!pinCenter) {
+      // Only sync to livePos when we're NOT in dragged mode AND not
+      // currently mid-drag. If pinCenter is null the user either
+      // hasn't dragged at all (sync OK), OR they're partway through
+      // a drag where pinCenter hasn't been committed yet (sync NOT
+      // OK — we'd snap the dot out from under the finger). The
+      // dragInProgressRef flag, set by the drag-start listener below,
+      // is what tells us about that second case.
+      if (!pinCenter && !dragInProgressRef.current) {
         userAnnotationRef.current.coordinate = new mk.Coordinate(livePos.lat, livePos.lng);
       }
     } else {
@@ -5594,40 +13062,63 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
       map.addAnnotation(dot);
       userAnnotationRef.current = dot;
     }
-  }, [livePos, pinCenter]);
+  }, [livePos, pinCenter, mapReady]);
 
   // Drag-end handler — when the user releases the dragged dot, capture
   // the new coordinate as pinCenter. MapKit's drag-end fires on the
   // annotation, not the map, so we attach it once after the dot exists.
   // We use a layout effect tied to a sentinel so it re-binds if the dot
   // is ever recreated.
+  //
+  // CRITICAL: we ALSO bind drag-start. While a drag is in progress,
+  // GPS updates keep arriving and the effects above/below would happily
+  // overwrite dot.coordinate with livePos, yanking the dot back to the
+  // user's real location mid-drag. The dragInProgressRef flag lets those
+  // effects skip the sync while the finger is down.
   const dragHandlerBoundRef = useRef(false);
+  const dragInProgressRef = useRef(false);
   useEffect(() => {
     const map = mapRef.current;
     const mk = (window as any).mapkit;
     const dot = userAnnotationRef.current;
     if (!map || !mk || !dot || dragHandlerBoundRef.current) return;
+    const onDragStart = () => {
+      dragInProgressRef.current = true;
+    };
     const onDragEnd = () => {
+      dragInProgressRef.current = false;
       const c = dot.coordinate;
       if (!c) return;
       playPop();
       setPinCenter({ lat: c.latitude, lng: c.longitude });
       setSelectedSite(null);
     };
-    try { dot.addEventListener('drag-end', onDragEnd); dragHandlerBoundRef.current = true; } catch { /* silent */ }
+    try {
+      dot.addEventListener('drag-start', onDragStart);
+      dot.addEventListener('drag-end', onDragEnd);
+      dragHandlerBoundRef.current = true;
+    } catch { /* silent */ }
     return () => {
-      try { dot.removeEventListener('drag-end', onDragEnd); } catch { /* silent */ }
+      try {
+        dot.removeEventListener('drag-start', onDragStart);
+        dot.removeEventListener('drag-end', onDragEnd);
+      } catch { /* silent */ }
       dragHandlerBoundRef.current = false;
+      dragInProgressRef.current = false;
     };
-  }, [livePos]); // re-evaluate after first livePos arrives (when dot gets created)
+  }, [livePos, mapReady]); // re-evaluate after first livePos arrives (when dot gets created)
 
   // Recolor the user dot to reflect dragged vs. at-real-location state.
   // Red = you've dragged it to search a different area. Blue = at your
   // real GPS location. Also moves the dot to pinCenter when dragged.
+  // Skipped entirely while a drag is in progress — the dot's coordinate
+  // is being controlled by the user's finger right now; touching it
+  // from here would snap it out from under them.
   useEffect(() => {
     const mk = (window as any).mapkit;
     const dot = userAnnotationRef.current;
     if (!mk || !dot) return;
+    if (dragInProgressRef.current) return;
     if (pinCenter) {
       dot.coordinate = new mk.Coordinate(pinCenter.lat, pinCenter.lng);
       dot.color = '#d92a2a';
@@ -5637,7 +13128,7 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
       dot.color = '#2a8aff';
       dot.title = 'Drag me to search elsewhere';
     }
-  }, [pinCenter, livePos]);
+  }, [pinCenter, livePos, mapReady]);
 
   // Re-zoom the visible region only when the USER changes something —
   // a radius chip tap, or a drag-end on the user dot (which updates
@@ -5802,7 +13293,7 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
       try { map.removeEventListener('select', onSelect); } catch { /* silent */ }
       try { map.removeEventListener('single-tap', onMapTap); } catch { /* silent */ }
     };
-  }, [nearbySites, pinCenter]);
+  }, [nearbySites, pinCenter, mapReady]);
 
   // Directions helper — same geo: scheme + Google Maps web fallback that
   // DetailView's Get Directions button uses. Lets the slide-up card route
@@ -6257,7 +13748,7 @@ function CategoryView({ label, color, sites, currentLocation, onSelectSite, onSu
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder="Search by name, city, or keyword..."
-                style={S.searchInput}
+                style={S.localeSearchInput}
               />
               {query && (
                 <button
@@ -6396,13 +13887,38 @@ function DetailView({ site, currentLocation, handle, deviceId, alreadyVisited, o
   const [claiming, setClaiming] = useState(false);
   const [claimError, setClaimError] = useState<string | null>(null);
 
+  // ---- Guestbook state ----
+  // Guestbook is loaded once on mount and refetched whenever a new signing
+  // succeeds. List is ordered with rank 1 (the Keeper) first.
+  const [guestbook, setGuestbook] = useState<GuestbookSignature[]>([]);
+  const [guestbookLoaded, setGuestbookLoaded] = useState(false);
+  // Modal state: when the user taps "Sign the Guestbook" we open a small
+  // composer for an optional 30-char inscription. The Sign button on the
+  // modal triggers the actual API call.
+  const [signModalOpen, setSignModalOpen] = useState(false);
+  const [inscriptionDraft, setInscriptionDraft] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    apiGetGuestbook(site.id).then((sigs) => {
+      if (!cancelled) {
+        setGuestbook(sigs);
+        setGuestbookLoaded(true);
+      }
+    });
+    return () => { cancelled = true; };
+  }, [site.id]);
+
   // Sync local visited flag if parent's set updates (e.g. new visits loaded
   // from server while this view is mounted).
   useEffect(() => {
     if (alreadyVisited) setVisited(true);
   }, [alreadyVisited]);
 
-  const handleClaimVisit = async () => {
+  // Open the inscription modal. Triggered by the "Sign the Guestbook"
+  // button. Pre-checks GPS/handle so the user finds out about problems
+  // before composing.
+  const openSignModal = () => {
     if (!handle) {
       setClaimError('Claim a handle first (try Submit a Location)');
       return;
@@ -6415,6 +13931,18 @@ function DetailView({ site, currentLocation, handle, deviceId, alreadyVisited, o
       setClaimError('No GPS fix yet — try again in a moment');
       return;
     }
+    setClaimError(null);
+    setInscriptionDraft('');
+    setSignModalOpen(true);
+  };
+
+  // Actually sign the guestbook. Called from inside the modal once the
+  // user confirms. Uses inscriptionDraft (possibly empty string).
+  const handleClaimVisit = async () => {
+    if (!handle || !deviceId || !currentLocation) {
+      setSignModalOpen(false);
+      return;
+    }
     setClaiming(true);
     setClaimError(null);
     playBell();
@@ -6424,18 +13952,24 @@ function DetailView({ site, currentLocation, handle, deviceId, alreadyVisited, o
       siteId: site.id,
       lat: currentLocation.lat,
       lng: currentLocation.lng,
+      inscription: inscriptionDraft.trim(),
     });
     setClaiming(false);
+    setSignModalOpen(false);
     if (result.ok) {
       setVisited(true);
       onVisited(site.id);
-      // Soft confirmation toast — reinforces the badge system by hinting
-      // at progression. Idempotent claims (already visited) get a gentler
-      // message that doesn't pretend they earned anything new.
+      // Refresh the guestbook list so the new signature shows up.
+      apiGetGuestbook(site.id).then((sigs) => setGuestbook(sigs));
       if (result.alreadyClaimed) {
-        showToast(`Already visited ${site.title}`, 'default');
+        showToast(`Already signed ${site.title}`, 'default');
+      } else if (result.isKeeper) {
+        // Keeper status — first signer ever at this site.
+        showToast(`🗝️ You are the Keeper of ${site.title}`, 'success');
+      } else if (typeof result.signingRank === 'number') {
+        showToast(`✓ Signed the guestbook at ${site.title} (#${result.signingRank})`, 'success');
       } else {
-        showToast(`✓ Visited ${site.title} — +1 toward your next badge`, 'success');
+        showToast(`✓ Signed the guestbook at ${site.title}`, 'success');
       }
       return;
     }
@@ -6448,7 +13982,7 @@ function DetailView({ site, currentLocation, handle, deviceId, alreadyVisited, o
     } else if (fail.code === 'network') {
       setClaimError('Network error — check your connection and try again.');
     } else {
-      setClaimError(fail.message || 'Could not claim visit');
+      setClaimError(fail.message || 'Could not sign the guestbook');
     }
   };
   const handleDirections = () => {
@@ -6557,11 +14091,11 @@ function DetailView({ site, currentLocation, handle, deviceId, alreadyVisited, o
                 marginBottom: 12,
               }}
             >
-              ✓ You've Been Here
+              ✓ You've Signed the Guestbook
             </div>
           ) : inRange ? (
             <button
-              onClick={handleClaimVisit}
+              onClick={openSignModal}
               disabled={claiming}
               style={{
                 ...S.directionsButton,
@@ -6574,7 +14108,7 @@ function DetailView({ site, currentLocation, handle, deviceId, alreadyVisited, o
                 opacity: claiming ? 0.7 : 1,
               }}
             >
-              {claiming ? 'Claiming…' : "I'm Here — Claim Visit"}
+              {claiming ? 'Signing…' : "I'm Here — Sign the Guestbook"}
             </button>
           ) : (
             <div
@@ -6589,7 +14123,7 @@ function DetailView({ site, currentLocation, handle, deviceId, alreadyVisited, o
                 fontSize: 18,
               }}
             >
-              {distM != null ? 'Get within 100m to claim location' : 'Locating…'}
+              {distM != null ? 'Get within 100m to sign the guestbook' : 'Locating…'}
             </div>
           )
         )}
@@ -6598,6 +14132,104 @@ function DetailView({ site, currentLocation, handle, deviceId, alreadyVisited, o
             {claimError}
           </div>
         )}
+
+        {/* ---- Guestbook section ----
+            Displays signatures left at this site, with the Keeper (rank 1)
+            pinned at the top. Visible to everyone viewing DetailView, even
+            if they haven't signed it themselves — the point is for sites
+            to feel inhabited and visited. Empty sites show the "be the
+            first" prompt to invite the first visitor to claim the site. */}
+        <div style={{ marginTop: 24, marginBottom: 12 }}>
+          <div style={{
+            fontSize: 14,
+            fontFamily: 'system-ui, -apple-system, sans-serif',
+            color: '#888',
+            letterSpacing: 2,
+            textTransform: 'uppercase',
+            textAlign: 'center',
+            marginBottom: 10,
+          }}>
+            ⸻ Guestbook ⸻
+          </div>
+          {!guestbookLoaded ? (
+            <div style={{ color: '#666', fontSize: 13, textAlign: 'center', padding: '10px 0' }}>
+              Reading the guestbook…
+            </div>
+          ) : guestbook.length === 0 ? (
+            <div style={{
+              border: '1px dashed #2a2a2a',
+              borderRadius: 8,
+              padding: '14px 16px',
+              textAlign: 'center',
+              color: '#888',
+              fontSize: 13,
+              fontStyle: 'italic',
+              fontFamily: 'Georgia, serif',
+            }}>
+              This site is unclaimed.<br />Be the first to sign.
+            </div>
+          ) : (
+            <div style={{
+              border: '1px solid #1f1f1f',
+              borderRadius: 8,
+              padding: '8px 0',
+              backgroundColor: '#0a0a0a',
+              maxHeight: 280,
+              overflowY: 'auto',
+            }}>
+              {guestbook.map((sig, idx) => {
+                const isKeeper = sig.signingRank === 1;
+                const dateStr = sig.signedAt ? new Date(sig.signedAt).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }) : '';
+                return (
+                  <div
+                    key={`${sig.handle}-${idx}`}
+                    style={{
+                      padding: '8px 14px',
+                      borderBottom: idx < guestbook.length - 1 ? '1px solid #1a1a1a' : 'none',
+                      display: 'flex',
+                      alignItems: 'baseline',
+                      gap: 8,
+                      backgroundColor: isKeeper ? '#15100a' : 'transparent',
+                    }}
+                  >
+                    <div style={{ fontSize: 14, flexShrink: 0, width: 22, textAlign: 'center' }}>
+                      {isKeeper ? '🗝️' : <span style={{ color: '#555', fontSize: 11 }}>#{sig.signingRank ?? '?'}</span>}
+                    </div>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{
+                        fontFamily: 'Georgia, serif',
+                        fontSize: 14,
+                        color: isKeeper ? '#e0c98a' : '#c0c0c0',
+                        fontWeight: isKeeper ? 600 : 400,
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                      }}>
+                        {sig.handle}
+                        {isKeeper && <span style={{ fontSize: 10, marginLeft: 8, color: '#a89060', letterSpacing: 1, textTransform: 'uppercase' }}>Keeper</span>}
+                      </div>
+                      {sig.inscription && (
+                        <div style={{
+                          fontFamily: 'Georgia, serif',
+                          fontSize: 12,
+                          fontStyle: 'italic',
+                          color: '#888',
+                          marginTop: 2,
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap',
+                        }}>
+                          “{sig.inscription}”
+                        </div>
+                      )}
+                    </div>
+                    <div style={{ fontSize: 10, color: '#555', flexShrink: 0 }}>{dateStr}</div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
 
         {/* Add Photo (Social post) button.
             Shown when:
@@ -6640,6 +14272,137 @@ function DetailView({ site, currentLocation, handle, deviceId, alreadyVisited, o
         </button>
         <div style={S.imageCredit}>Photo: {site.imageCredit}</div>
       </div>
+
+      {/* ---- Sign the Guestbook modal ----
+          Overlay that lets the user compose an optional 30-char inscription
+          before signing. Tap Skip to sign without one. Tap Sign to commit. */}
+      {signModalOpen && (
+        <div
+          onClick={() => { if (!claiming) setSignModalOpen(false); }}
+          style={{
+            position: 'fixed',
+            inset: 0,
+            backgroundColor: 'rgba(0, 0, 0, 0.82)',
+            zIndex: 9999,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: 20,
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              backgroundColor: '#0c0c0c',
+              border: `1px solid ${SUBMIT_RED}55`,
+              borderRadius: 14,
+              padding: '22px 22px 18px',
+              maxWidth: 360,
+              width: '100%',
+              boxShadow: `0 0 40px ${SUBMIT_RED}33`,
+              fontFamily: 'system-ui, -apple-system, sans-serif',
+            }}
+          >
+            <div style={{
+              fontFamily: 'Georgia, serif',
+              fontSize: 22,
+              color: WHITE,
+              textAlign: 'center',
+              marginBottom: 6,
+              letterSpacing: 1,
+            }}>
+              Sign the Guestbook
+            </div>
+            <div style={{
+              fontSize: 13,
+              color: '#888',
+              textAlign: 'center',
+              marginBottom: 18,
+              fontStyle: 'italic',
+              fontFamily: 'Georgia, serif',
+            }}>
+              {site.title}
+            </div>
+            <div style={{ fontSize: 12, color: '#999', marginBottom: 8 }}>
+              Leave a mark (optional, up to 30 chars):
+            </div>
+            <input
+              type="text"
+              value={inscriptionDraft}
+              onChange={(e) => {
+                const v = e.target.value;
+                if (v.length <= 30) setInscriptionDraft(v);
+              }}
+              placeholder="Here lies…"
+              maxLength={30}
+              disabled={claiming}
+              style={{
+                width: '100%',
+                boxSizing: 'border-box',
+                backgroundColor: '#1a1a1a',
+                border: '1px solid #333',
+                borderRadius: 6,
+                padding: '10px 12px',
+                color: WHITE,
+                fontSize: 15,
+                fontFamily: 'Georgia, serif',
+                fontStyle: 'italic',
+                marginBottom: 6,
+                outline: 'none',
+              }}
+            />
+            <div style={{
+              fontSize: 11,
+              color: '#666',
+              textAlign: 'right',
+              marginBottom: 18,
+            }}>
+              {inscriptionDraft.length}/30
+            </div>
+            <div style={{ display: 'flex', gap: 10 }}>
+              <button
+                onClick={() => { if (!claiming) setSignModalOpen(false); }}
+                disabled={claiming}
+                style={{
+                  flex: 1,
+                  padding: '12px 0',
+                  backgroundColor: 'transparent',
+                  border: '1px solid #2a2a2a',
+                  borderRadius: 8,
+                  color: '#888',
+                  fontSize: 14,
+                  fontFamily: 'system-ui, -apple-system, sans-serif',
+                  cursor: 'pointer',
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleClaimVisit}
+                disabled={claiming}
+                style={{
+                  flex: 2,
+                  padding: '12px 0',
+                  backgroundColor: claiming ? '#3a0a0a' : '#5a0000',
+                  border: `1px solid ${SUBMIT_RED}`,
+                  borderRadius: 8,
+                  color: WHITE,
+                  fontSize: 14,
+                  fontWeight: 600,
+                  fontFamily: 'system-ui, -apple-system, sans-serif',
+                  textShadow: `0 0 8px ${SUBMIT_RED}`,
+                  boxShadow: `0 0 14px ${SUBMIT_RED}55`,
+                  cursor: claiming ? 'wait' : 'pointer',
+                  letterSpacing: 1,
+                  textTransform: 'uppercase',
+                }}
+              >
+                {claiming ? 'Signing…' : (inscriptionDraft.trim() ? 'Sign' : 'Sign Anonymously')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -6713,6 +14476,8 @@ function AddPhotoButton({ site, handle, deviceId, currentLocation, onPosted }: {
       return;
     }
 
+    playPostShared();
+
     // Optional external share. We pass the photo as a File so iOS picks
     // image-friendly destinations (Instagram, Messages photo share, etc).
     if (alsoShare && typeof navigator !== 'undefined' && (navigator as any).share) {
@@ -6754,7 +14519,7 @@ function AddPhotoButton({ site, handle, deviceId, currentLocation, onPosted }: {
         onClick={() => fileRef.current?.click()}
         style={S.addPhotoBtn}
       >
-        📷 Post to eXposure
+        📷 Post to DreadFeed
       </button>
 
       {/* Composer modal — appears after the user captures a photo. */}
@@ -6778,7 +14543,7 @@ function AddPhotoButton({ site, handle, deviceId, currentLocation, onPosted }: {
                 type="checkbox"
                 checked={alsoShare}
                 onChange={(e) => setAlsoShare(e.target.checked)}
-                style={{ accentColor: '#BF40FF', width: 16, height: 16 }}
+                style={{ accentColor: '#FFFFFF', width: 16, height: 16 }}
               />
               Also share to Messages / Instagram / X
             </label>
@@ -6809,16 +14574,27 @@ function AddPhotoButton({ site, handle, deviceId, currentLocation, onPosted }: {
 
 // ---------- Inline handle claim UI for SubmitView ----------
 // If the user has a server-claimed handle, just shows it read-only. If not,
-// shows a small text input with live availability check + Claim button.
-// Once claimed, the parent's onClaimed() fires, App's `handle` state updates,
-// and on next render the field flips to the read-only display.
-function HandleField({ deviceId, handle, submitter, setSubmitter, onClaimed }: {
+// shows a CTA pointing them at the DreadFeed claim screen — that's the
+// canonical signup path now (Apple Sign In or email-verified handle). We
+// don't allow handle creation here anymore because it bypassed email
+// recovery, leaving users stranded on reinstall.
+function HandleField({ deviceId, handle, submitter, setSubmitter, onClaimed, onGoToClaim }: {
   deviceId: string | null;
   handle: string | null;
   submitter: string;
   setSubmitter: (v: string) => void;
   onClaimed: (h: string) => void;
+  // Optional — parent SubmitView passes a callback that navigates to the
+  // DreadFeed claim screen. If not provided we fall back to a static
+  // message (this path should be reached, hence the prop is optional for
+  // backward compat).
+  onGoToClaim?: () => void;
 }) {
+  // Marks unused props quiet for the linter — these stick around so the
+  // call-site doesn't change. Once everyone's on the new flow we can
+  // simplify the prop list.
+  void deviceId; void submitter; void setSubmitter; void onClaimed;
+
   // Read-only display path: user already owns a handle.
   if (handle) {
     return (
@@ -6836,16 +14612,38 @@ function HandleField({ deviceId, handle, submitter, setSubmitter, onClaimed }: {
     );
   }
 
-  // Claim path: user has no handle yet. Show input + live availability + Claim button.
-  // We use submitter state as the typed value so we don't need a second piece
-  // of state and the placeholder behaves naturally.
+  // No handle yet — point them at the DreadFeed claim screen.
   return (
-    <ClaimHandleInline
-      deviceId={deviceId}
-      typed={submitter}
-      onTypedChange={setSubmitter}
-      onClaimed={onClaimed}
-    />
+    <Field label="Your Handle" valid={false} hint="You need a handle to submit a site">
+      <div style={{
+        ...S.input,
+        display: 'flex', flexDirection: 'column', gap: 10,
+        padding: 14,
+      }}>
+        <div style={{ color: BONE, fontSize: 14, lineHeight: 1.4 }}>
+          You don't have a handle yet. Create one in DreadFeed — it takes one tap with Sign in with Apple, or you can use email.
+        </div>
+        {onGoToClaim && (
+          <button
+            type="button"
+            onClick={onGoToClaim}
+            style={{
+              ...S.input,
+              backgroundColor: SUBMIT_RED,
+              color: WHITE,
+              border: 'none',
+              fontWeight: 700,
+              cursor: 'pointer',
+              padding: '10px 16px',
+              borderRadius: 8,
+              alignSelf: 'flex-start',
+            }}
+          >
+            Go to DreadFeed →
+          </button>
+        )}
+      </div>
+    </Field>
   );
 }
 
@@ -6972,12 +14770,15 @@ function ClaimHandleInline({ deviceId, typed, onTypedChange, onClaimed }: {
 // Short Description field REMOVED. The server's `shortDescription` parameter is
 // derived from the first ~150 chars of the full description so the existing
 // /sites/submit endpoint still gets a value (it requires shortDescription).
-function SubmitView({ currentLocation, deviceId, handle, onHandleClaimed, onBack }: {
+function SubmitView({ currentLocation, deviceId, handle, onHandleClaimed, onBack, onGoToSocial }: {
   currentLocation: { lat: number; lng: number } | null;
   deviceId: string | null;
   handle: string | null;
   onHandleClaimed: (h: string) => void;
   onBack: () => void;
+  // Used by HandleField when the user has no handle yet — sends them to
+  // the DreadFeed claim screen, which is the canonical signup path now.
+  onGoToSocial?: () => void;
 }) {
   const [title, setTitle] = useState('');
   const [fullDesc, setFullDesc] = useState('');
@@ -7234,6 +15035,7 @@ function SubmitView({ currentLocation, deviceId, handle, onHandleClaimed, onBack
           submitter={submitter}
           setSubmitter={setSubmitter}
           onClaimed={(h) => { setSubmitter(h); onHandleClaimed(h); }}
+          onGoToClaim={onGoToSocial}
         />
 
         {errorMsg && <div style={S.errorBox}>⚠ {errorMsg}</div>}
@@ -7918,14 +15720,18 @@ const S: Record<string, React.CSSProperties> = {
     transformOrigin: 'center center',
   },
   // Wrapper that pins the LatestSubmissionSpotlight at the spot where the
-  // SUBMIT A LOCATION button used to live (bottom: 116, centered). The
-  // inner spotlight component sits with position: relative, so this
+  // SUBMIT A LOCATION button used to live, centered above the home bar.
+  // The inner spotlight component sits with position: relative, so this
   // fixed-position wrapper does the bottom-anchoring without changing the
   // spotlight's intrinsic layout.
+  //
+  // Lifted from bottom: 116 to bottom: 150 when the bottom bar icons grew
+  // from 58px to 70px tall — the taller bar would otherwise overlap the
+  // spotlight chip.
   spotlightFixedWrap: {
     position: 'fixed' as const,
     left: '50%',
-    bottom: 116,
+    bottom: 150,
     transform: 'translateX(-50%)',
     zIndex: 3,
     display: 'flex',
@@ -8012,13 +15818,17 @@ const S: Record<string, React.CSSProperties> = {
     justifyContent: 'space-around',
     alignItems: 'flex-end',
     gap: 4,
-    padding: '0 12px 2px 12px',
+    padding: '0 8px 4px 8px',
     boxSizing: 'border-box' as const,
     paddingBottom: 'env(safe-area-inset-bottom, 0px)' as any,
   },
   homeBarBtn: {
     flex: 1,
-    maxWidth: 96,
+    // Raised cap from 96 to 120 so each of the 4 buttons can claim
+    // ~25% of a typical iPhone width (390 / 4 ≈ 97 + gap room). With
+    // the bigger 70px icons below this lets them breathe instead of
+    // being capped tiny.
+    maxWidth: 120,
     backgroundColor: 'transparent',
     border: 'none',
     cursor: 'pointer',
@@ -8026,7 +15836,7 @@ const S: Record<string, React.CSSProperties> = {
     flexDirection: 'column' as const,
     alignItems: 'center',
     gap: 2,
-    padding: '2px 0 0 0',
+    padding: '4px 0 0 0',
     // iOS-style press feedback: scale-down + dim on tap. Uses CSS class
     // "sinister-icon-btn" defined in the global stylesheet so :active
     // pseudo-state can drive the animation (inline styles can't).
@@ -8036,9 +15846,11 @@ const S: Record<string, React.CSSProperties> = {
     userSelect: 'none' as const,
   },
   homeBarIcon: {
-    width: 58,
-    height: 58,
-    borderRadius: 13,
+    // Bumped from 58 to 70 to match real iPhone home-screen icon size
+    // (~60pt rendered, which on @2x retina is around 60-70px visible).
+    width: 70,
+    height: 70,
+    borderRadius: 16,
     display: 'block',
     objectFit: 'cover' as const,
     filter: 'drop-shadow(0 2px 6px rgba(0,0,0,0.6))',
@@ -8049,8 +15861,36 @@ const S: Record<string, React.CSSProperties> = {
     userSelect: 'none' as const,
     pointerEvents: 'none' as const,           // taps go to the button, not the img
   },
+  // Visual-balance override for icons whose source PNG art fills more of
+  // the canvas (List View, Submit/location). Renders them slightly smaller
+  // so they appear the same VISUAL size as the more padded icons (DreadFeed,
+  // About). The button slot stays the same width so layout doesn't shift —
+  // only the image inside is smaller. Margin keeps the smaller icons
+  // visually centered relative to the larger ones' baseline.
+  homeBarIconSmall: {
+    // Scaled proportionally with the 58→70 base bump: 50/58 ≈ 0.86,
+    // 0.86 × 70 ≈ 60. Margin scales similarly to keep visual centering.
+    width: 60,
+    height: 60,
+    margin: 5,
+  },
+  // Visual-balance override for icons whose source PNG art has EXTRA
+  // padding inside the canvas (currently just About — the cracked-skull-
+  // question-mark sits with ~10% black padding around it, while DreadFeed's
+  // skull-and-crossbones fills its canvas to the edges). Renders About
+  // bigger so the visible artwork matches DreadFeed's visible artwork
+  // size. Negative margin pulls the bigger image back inside the button's
+  // bounds without changing the slot width.
+  homeBarIconLarge: {
+    width: 80,
+    height: 80,
+    margin: -5,
+  },
   homeBarLabel: {
-    fontSize: 11,
+    // Slightly larger label to match the bigger icons — bumped from 11
+    // to 12. Stays tight enough to fit "List View" / "DreadFeed" on a
+    // single line under each icon.
+    fontSize: 12,
     color: '#F0EBE0',
     letterSpacing: '0.04em',
     textAlign: 'center' as const,
@@ -8107,8 +15947,8 @@ const S: Record<string, React.CSSProperties> = {
     flex: 1,
     maxWidth: 200,
     backgroundColor: 'rgba(0,0,0,0.45)',
-    border: `1.5px solid #BF40FF`,
-    color: '#BF40FF',
+    border: `1.5px solid #FFFFFF`,
+    color: '#FFFFFF',
     fontFamily: '"Jolly Lodger", system-ui, serif',
     fontSize: 18,
     fontWeight: 400,
@@ -8120,11 +15960,11 @@ const S: Record<string, React.CSSProperties> = {
     alignItems: 'center',
     justifyContent: 'center',
     gap: 6,
-    boxShadow: `0 0 14px #BF40FF66, inset 0 0 8px #BF40FF22`,
-    textShadow: `0 0 8px #BF40FFaa`,
+    boxShadow: `0 0 14px #FFFFFF44, inset 0 0 8px #FFFFFF22`,
+    textShadow: `0 0 8px #FFFFFFaa`,
     backdropFilter: 'blur(2px)',
   },
-  socialLabelHighlight: { fontSize: 18, color: '#BF40FF' },
+  socialLabelHighlight: { fontSize: 18, color: '#FFFFFF' },
   socialIcon: { fontSize: 16, lineHeight: 1 },
   socialLabel: { fontSize: 18 },
 
@@ -8145,12 +15985,18 @@ const S: Record<string, React.CSSProperties> = {
     padding: '14px 16px',
     backgroundColor: 'rgba(10,10,10,0.85)',
     backdropFilter: 'blur(8px)',
-    borderBottom: `1px solid #BF40FF44`,
+    borderBottom: `1px solid #FFFFFF33`,
   },
   // ---- Permanent eXposure brand header ----
   // Solid black bar with a two-line treatment: large neon-purple "eXposure"
   // brand on top, small grey tagline beneath. Sticky so it pins to the
   // top of the viewport on every eXposure sub-screen.
+  //
+  // The paddingTop uses env(safe-area-inset-top) so on iOS the brand title
+  // sits BELOW the status bar (clock / wifi / battery) rather than behind
+  // it. Extra padding-top beyond the inset adds breathing room so the
+  // header doesn't feel cramped against the status bar — IG centers its
+  // brand a comfortable distance below the safe area, which this matches.
   exposureBrandHeader: {
     position: 'sticky' as const,
     top: 0,
@@ -8159,19 +16005,202 @@ const S: Record<string, React.CSSProperties> = {
     flexDirection: 'column' as const,
     alignItems: 'center',
     justifyContent: 'center',
-    padding: '12px 16px 10px 16px',
+    paddingTop: 'calc(env(safe-area-inset-top, 44px) + 16px)' as any,
+    paddingBottom: 12,
+    paddingLeft: 16,
+    paddingRight: 16,
     backgroundColor: '#000',
-    borderBottom: `1px solid #BF40FF66`,
+    borderBottom: `1px solid #FFFFFF44`,
     boxShadow: '0 2px 12px rgba(0,0,0,0.6)',
   },
+  // Full-width row that holds the brand title, centered. By making this
+  // row span the entire header width and centering its content, the
+  // DreadFeed title is anchored to the true horizontal center of the
+  // header — the absolutely-positioned bell button on the right
+  // doesn't shift it.
+  exposureBrandTitleRow: {
+    width: '100%',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    pointerEvents: 'none' as const,
+  },
   exposureBrandTitle: {
-    color: '#BF40FF',
-    fontSize: 28,
-    fontFamily: '"Jolly Lodger", system-ui, serif',
+    color: '#FFFFFF',
+    // LivingHell to match the home page "Dread Directory" title — keeps
+    // the brand typography consistent across the whole app. Sized down
+    // from the home page's 84pt to fit comfortably in the DreadFeed
+    // header bar without dominating the screen.
+    fontSize: 40,
+    fontFamily: '"LivingHell", "Jolly Lodger", system-ui, serif',
     fontWeight: 400,
     letterSpacing: '0.04em',
-    textShadow: `0 0 12px #BF40FFaa`,
+    // White text with purple glow keeps DreadFeed visually tied to the
+    // rest of the app's purple accents.
+    textShadow: `0 0 14px #FFFFFFcc, 0 0 4px #FFFFFF88`,
     lineHeight: 1,
+  },
+  // Bell button — absolute-positioned in the top-right of the brand
+  // header. Sized to be tap-friendly (~44pt) but visually small.
+  exposureBellBtn: {
+    position: 'absolute' as const,
+    right: 12,
+    top: 'calc(env(safe-area-inset-top, 44px) + 14px)' as any,
+    width: 36,
+    height: 36,
+    background: 'transparent',
+    border: 'none',
+    padding: 0,
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  // Airplane (DMs) sits to the LEFT of the bell. Same vertical position,
+  // shifted left by enough to clear the bell + a small gap.
+  exposureInboxBtn: {
+    position: 'absolute' as const,
+    right: 52,
+    top: 'calc(env(safe-area-inset-top, 44px) + 14px)' as any,
+    width: 36,
+    height: 36,
+    background: 'transparent',
+    border: 'none',
+    padding: 0,
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  // Red unread-count badge in the bell's top-right corner.
+  exposureBellBadge: {
+    position: 'absolute' as const,
+    top: -2,
+    right: -2,
+    minWidth: 16,
+    height: 16,
+    padding: '0 4px',
+    background: '#FF3B5C',
+    color: '#FFFFFF',
+    fontSize: 10,
+    fontWeight: 700 as const,
+    borderRadius: 8,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    pointerEvents: 'none' as const,
+  },
+  // ---- NotificationsView ----
+  notifWrap: {
+    minHeight: '100vh',
+    background: '#000',
+    color: '#FFFFFF',
+    paddingBottom: 'env(safe-area-inset-bottom, 0)' as any,
+  },
+  notifHeader: {
+    position: 'sticky' as const,
+    top: 0,
+    zIndex: 5,
+    background: '#000',
+    borderBottom: '1px solid #1a1a1a',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: 'calc(env(safe-area-inset-top, 44px) + 8px) 12px 8px' as any,
+  },
+  notifBackBtn: {
+    width: 40,
+    height: 40,
+    background: 'transparent',
+    border: 'none',
+    padding: 0,
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  notifHeaderTitle: {
+    color: '#FFFFFF',
+    fontSize: 17,
+    fontWeight: 600 as const,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  notifEmpty: {
+    padding: '80px 24px',
+    textAlign: 'center' as const,
+    color: '#888',
+    fontSize: 14,
+  },
+  notifList: {
+    display: 'flex',
+    flexDirection: 'column' as const,
+  },
+  notifRow: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 12,
+    padding: '10px 14px',
+    background: 'transparent',
+    border: 'none',
+    borderBottom: '1px solid #111',
+    cursor: 'pointer',
+    width: '100%',
+    textAlign: 'left' as const,
+  },
+  notifRowUnread: {
+    background: 'rgba(255, 59, 92, 0.06)',
+  },
+  notifAvatarBtn: {
+    width: 44,
+    height: 44,
+    minWidth: 44,
+    padding: 0,
+    background: 'transparent',
+    border: 'none',
+    borderRadius: '50%',
+    overflow: 'hidden',
+    cursor: 'pointer',
+  },
+  notifAvatarImg: {
+    width: '100%',
+    height: '100%',
+    objectFit: 'cover' as const,
+    pointerEvents: 'none' as const,
+  },
+  notifBodyCol: {
+    flex: 1,
+    display: 'flex',
+    flexDirection: 'column' as const,
+    gap: 2,
+    minWidth: 0,
+  },
+  notifBodyText: {
+    color: '#F0EBE0',
+    fontSize: 14,
+    lineHeight: 1.35,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis' as const,
+  },
+  notifActorName: {
+    fontWeight: 700 as const,
+    color: '#FFFFFF',
+  },
+  notifVerb: {
+    color: '#aaa',
+  },
+  notifTime: {
+    color: '#666',
+    fontSize: 11,
+  },
+  notifThumb: {
+    width: 44,
+    height: 44,
+    minWidth: 44,
+    objectFit: 'cover' as const,
+    borderRadius: 4,
+    pointerEvents: 'none' as const,
   },
   exposureBrandTagline: {
     color: '#888',
@@ -8192,49 +16221,18 @@ const S: Record<string, React.CSSProperties> = {
     width: '100%',
     overflow: 'hidden',
     backgroundColor: 'transparent',
-    color: '#BF40FF',
+    color: '#FFFFFF',
     fontFamily: '"Jolly Lodger", system-ui, serif',
     fontSize: 16,
     letterSpacing: '0.04em',
     transition: 'height 200ms ease, opacity 150ms ease',
-    textShadow: `0 0 6px #BF40FFaa`,
+    textShadow: `0 0 6px #FFFFFFaa`,
   },
   pullIndicatorText: {
     padding: '8px 12px',
   },
   // Category filter chip strip. Horizontally scrollable row of pill
   // buttons; the active one is filled purple, others are outlined.
-  filterChipBar: {
-    display: 'flex',
-    gap: 8,
-    padding: '10px 12px',
-    overflowX: 'auto' as const,
-    overflowY: 'hidden' as const,
-    whiteSpace: 'nowrap' as const,
-    backgroundColor: 'rgba(10,10,10,0.5)',
-    borderBottom: `1px solid #2a2a2a`,
-    scrollbarWidth: 'none' as const,
-    WebkitOverflowScrolling: 'touch' as const,
-  },
-  filterChip: {
-    flex: '0 0 auto',
-    padding: '6px 14px',
-    borderRadius: 999,
-    border: `1px solid #444`,
-    backgroundColor: 'rgba(0,0,0,0.4)',
-    color: '#BBB',
-    fontFamily: '"Jolly Lodger", system-ui, serif',
-    fontSize: 16,
-    letterSpacing: '0.04em',
-    cursor: 'pointer',
-  },
-  filterChipActive: {
-    border: `1.5px solid #BF40FF`,
-    backgroundColor: 'rgba(191,64,255,0.15)',
-    color: '#BF40FF',
-    textShadow: `0 0 6px #BF40FF88`,
-    boxShadow: `0 0 10px #BF40FF44`,
-  },
   // ---- Static black bottom bar inside eXposure ----
   // Fixed at the bottom of the viewport, never moves on scroll. 4 white
   // SVG icons. Active tab brightens and gets a subtle glow.
@@ -8304,14 +16302,26 @@ const S: Record<string, React.CSSProperties> = {
     gap: 16,
     backgroundColor: 'rgba(10,10,10,0.5)',
   },
+  // Outer wrap — does NOT clip overflow so the +badge can poke outside
+  // the circle. Sized to the same 86x86 as the visible circle since
+  // there's no extra space needed; the badge sits in negative-coords
+  // territory.
   profileAvatarWrap: {
     width: 86,
     height: 86,
     minWidth: 86,
+    position: 'relative' as const,
+  },
+  // Inner element that actually does the circle clipping. Holds the
+  // avatar image. The previous overflow:hidden on the outer wrap was
+  // clipping the +badge — moved here so the badge can sit outside.
+  profileAvatarCircle: {
+    width: 86,
+    height: 86,
     borderRadius: '50%',
     overflow: 'hidden',
-    border: `2px solid #BF40FF`,
-    boxShadow: `0 0 14px #BF40FF55`,
+    border: `2px solid #FFFFFF`,
+    boxShadow: `0 0 14px #FFFFFF44`,
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
@@ -8325,6 +16335,180 @@ const S: Record<string, React.CSSProperties> = {
     pointerEvents: 'none' as const,
     WebkitUserSelect: 'none' as const,
     WebkitTouchCallout: 'none' as const,
+  },
+  // Wraps the big profile avatar when it's tappable (own profile only).
+  // The wrap itself doesn't clip — the inner circle does — so this
+  // button is just a transparent click target the same size as the
+  // outer wrap. The +badge inside it sits as a sibling of the inner
+  // circle, positioned to poke outside the bottom-right edge.
+  profileAvatarEditBtn: {
+    width: '100%',
+    height: '100%',
+    padding: 0,
+    margin: 0,
+    border: 'none',
+    background: 'transparent',
+    cursor: 'pointer',
+    position: 'relative' as const,
+    display: 'block',
+  },
+  // IG-style "+" badge — sits OUTSIDE the bottom-right of the avatar
+  // circle, like Instagram's add-story button. White border separates
+  // it from the dark profile background visually so it reads as a
+  // distinct floating button rather than glued to the circle.
+  profileAvatarEditBadge: {
+    position: 'absolute' as const,
+    right: -4,
+    bottom: -4,
+    width: 28,
+    height: 28,
+    borderRadius: '50%',
+    background: '#FF3B5C',
+    color: '#FFFFFF',
+    fontSize: 18,
+    lineHeight: '24px',
+    fontWeight: 700 as const,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    border: '3px solid #000',
+    pointerEvents: 'none' as const,
+    boxShadow: '0 1px 4px rgba(0,0,0,0.4)',
+  },
+  // Avatar picker modal — bottom sheet style, matches the rest of the
+  // app's modal sheets (BlockedListModal, comment composer, etc).
+  avatarPickerBackdrop: {
+    position: 'fixed' as const,
+    inset: 0,
+    background: 'rgba(0,0,0,0.85)',
+    zIndex: 10000,
+    display: 'flex',
+    alignItems: 'flex-end',
+    justifyContent: 'center',
+  },
+  avatarPickerSheet: {
+    width: '100%',
+    maxWidth: 520,
+    background: '#0a0a0a',
+    borderTopLeftRadius: 16,
+    borderTopRightRadius: 16,
+    padding: '12px 16px 24px',
+    display: 'flex',
+    flexDirection: 'column' as const,
+    maxHeight: '85vh',
+    overflowY: 'auto' as const,
+  },
+  avatarPickerHeader: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingBottom: 8,
+  },
+  avatarPickerTitle: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: 600 as const,
+    flex: 1,
+    textAlign: 'center' as const,
+  },
+  avatarPickerCancelBtn: {
+    background: 'transparent',
+    color: '#FFFFFF',
+    border: 'none',
+    fontSize: 15,
+    width: 60,
+    textAlign: 'left' as const,
+    padding: 0,
+    cursor: 'pointer',
+  },
+  avatarPickerTabs: {
+    display: 'flex',
+    gap: 8,
+    padding: '8px 0 16px',
+  },
+  avatarPickerTab: {
+    flex: 1,
+    padding: '10px 0',
+    background: 'transparent',
+    color: '#888',
+    border: '1px solid #333',
+    borderRadius: 8,
+    fontSize: 14,
+    fontWeight: 600 as const,
+    cursor: 'pointer',
+  },
+  avatarPickerTabActive: {
+    background: '#FFFFFF',
+    color: '#000000',
+    borderColor: '#FFFFFF',
+  },
+  avatarPickerErr: {
+    color: '#FF3B5C',
+    fontSize: 13,
+    padding: '0 0 8px',
+    textAlign: 'center' as const,
+  },
+  avatarPickerGrid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(3, 1fr)',
+    gap: 10,
+  },
+  avatarPickerCell: {
+    aspectRatio: '1 / 1',
+    background: '#1a1a1a',
+    border: '2px solid transparent',
+    borderRadius: '50%',
+    padding: 0,
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    overflow: 'hidden',
+  },
+  avatarPickerCellActive: {
+    borderColor: '#FF3B5C',
+    boxShadow: '0 0 12px #FF3B5C66',
+  },
+  avatarPickerCellImg: {
+    width: '70%',
+    height: '70%',
+    objectFit: 'contain' as const,
+    pointerEvents: 'none' as const,
+  },
+  avatarPickerUploadPane: {
+    padding: '8px 0',
+    display: 'flex',
+    flexDirection: 'column' as const,
+    alignItems: 'center',
+    gap: 16,
+  },
+  avatarPickerUploadHint: {
+    color: '#888',
+    fontSize: 13,
+    lineHeight: 1.4,
+    textAlign: 'center' as const,
+    padding: '0 16px',
+  },
+  avatarPickerUploadBtn: {
+    background: '#FFFFFF',
+    color: '#000000',
+    border: 'none',
+    borderRadius: 8,
+    padding: '12px 28px',
+    fontSize: 15,
+    fontWeight: 600 as const,
+    cursor: 'pointer',
+  },
+  avatarPickerRemoveBtn: {
+    marginTop: 16,
+    background: 'transparent',
+    color: '#FF3B5C',
+    border: '1px solid #FF3B5C',
+    borderRadius: 8,
+    padding: '10px 0',
+    fontSize: 14,
+    fontWeight: 600 as const,
+    cursor: 'pointer',
   },
   profileStatsCluster: {
     flex: 1,
@@ -8342,18 +16526,22 @@ const S: Record<string, React.CSSProperties> = {
     justifyContent: 'center',
   },
   profileStatNum: {
-    fontFamily: '"Jolly Lodger", system-ui, serif',
-    fontSize: 26,
+    // IG-style: bold sans-serif numerals, same family as the rest of
+    // DreadFeed. Was Jolly Lodger which made the profile look like a
+    // different app from the post cards / comments / bottom bar.
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    fontSize: 20,
+    fontWeight: 700,
     color: '#F0EBE0',
-    letterSpacing: '0.04em',
+    letterSpacing: '0.01em',
     lineHeight: 1.1,
   },
   profileStatLabel: {
-    fontSize: 10,
-    color: '#888',
-    letterSpacing: '0.18em',
-    textTransform: 'uppercase' as const,
-    marginTop: 4,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    fontSize: 13,
+    fontWeight: 400,
+    color: '#F0EBE0',
+    marginTop: 2,
   },
   // ---- Display-name / bio strip ----
   profileBioWrap: {
@@ -8361,10 +16549,148 @@ const S: Record<string, React.CSSProperties> = {
     backgroundColor: 'rgba(10,10,10,0.5)',
   },
   profileDisplayName: {
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    color: '#F0EBE0',
+    fontSize: 14,
+    fontWeight: 600,
+    letterSpacing: '0.01em',
+  },
+  // Bio body — multi-line, preserves user-entered newlines.
+  profileBio: {
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    color: '#F0EBE0',
+    fontSize: 13,
+    lineHeight: 1.45,
+    marginTop: 4,
+    whiteSpace: 'pre-wrap' as const,
+    wordBreak: 'break-word' as const,
+  },
+  // External link, IG-style: blue, no underline, slight visited
+  // distinction. Truncates the displayed text (https:// stripped).
+  profileLink: {
+    display: 'inline-block',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    color: '#5BC0FF',
+    fontSize: 13,
+    fontWeight: 600 as const,
+    textDecoration: 'none',
+    marginTop: 6,
+    wordBreak: 'break-all' as const,
+  },
+  // ---- Edit profile modal ----
+  editProfileBackdrop: {
+    position: 'fixed' as const,
+    inset: 0,
+    background: 'rgba(0,0,0,0.85)',
+    zIndex: 10000,
+    display: 'flex',
+    alignItems: 'flex-end',
+    justifyContent: 'center',
+  },
+  editProfileSheet: {
+    width: '100%',
+    maxWidth: 520,
+    background: '#0a0a0a',
+    borderTopLeftRadius: 16,
+    borderTopRightRadius: 16,
+    padding: '12px 16px 24px',
+    display: 'flex',
+    flexDirection: 'column' as const,
+    maxHeight: '92vh',
+    overflowY: 'auto' as const,
+  },
+  editProfileHeader: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingBottom: 8,
+    borderBottom: '1px solid #1a1a1a',
+  },
+  editProfileTitle: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: 600 as const,
+    flex: 1,
+    textAlign: 'center' as const,
+  },
+  editProfileCancelBtn: {
+    background: 'transparent',
+    color: '#FFFFFF',
+    border: 'none',
+    fontSize: 15,
+    minWidth: 64,
+    textAlign: 'left' as const,
+    padding: 0,
+    cursor: 'pointer',
+  },
+  editProfileSaveBtn: {
+    background: 'transparent',
+    color: '#5BC0FF',
+    border: 'none',
+    fontSize: 15,
+    fontWeight: 700 as const,
+    minWidth: 64,
+    textAlign: 'right' as const,
+    padding: 0,
+    cursor: 'pointer',
+  },
+  editProfileErr: {
+    color: '#FF3B5C',
+    fontSize: 13,
+    padding: '8px 0',
+    textAlign: 'center' as const,
+  },
+  editProfileBody: {
+    paddingTop: 16,
+    display: 'flex',
+    flexDirection: 'column' as const,
+  },
+  editProfileFieldLabel: {
+    color: '#888',
+    fontSize: 12,
+    fontWeight: 600 as const,
+    textTransform: 'uppercase' as const,
+    letterSpacing: '0.05em',
+    marginTop: 12,
+    marginBottom: 6,
+  },
+  editProfileInput: {
+    width: '100%',
+    background: '#1a1a1a',
+    border: '1px solid #333',
+    borderRadius: 8,
     color: '#F0EBE0',
     fontSize: 15,
-    fontWeight: 600,
-    letterSpacing: '0.02em',
+    padding: '10px 12px',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    boxSizing: 'border-box' as const,
+    outline: 'none',
+  },
+  editProfileTextarea: {
+    width: '100%',
+    background: '#1a1a1a',
+    border: '1px solid #333',
+    borderRadius: 8,
+    color: '#F0EBE0',
+    fontSize: 15,
+    padding: '10px 12px',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    resize: 'vertical' as const,
+    minHeight: 80,
+    boxSizing: 'border-box' as const,
+    outline: 'none',
+    lineHeight: 1.4,
+  },
+  editProfileCounter: {
+    color: '#666',
+    fontSize: 11,
+    textAlign: 'right' as const,
+    marginTop: 4,
+  },
+  editProfileHint: {
+    color: '#888',
+    fontSize: 11,
+    marginTop: 6,
   },
   // ---- IG-style action button row ----
   profileActionsRow: {
@@ -8385,7 +16711,547 @@ const S: Record<string, React.CSSProperties> = {
     fontWeight: 600,
     letterSpacing: '0.02em',
     cursor: 'pointer',
-    fontFamily: 'inherit',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  // Follow buttons. Filled white when NOT following (call-to-action),
+  // outlined when already following (less visually loud). Matches IG.
+  profileFollowBtn: {
+    flex: 1,
+    padding: '8px 12px',
+    backgroundColor: '#FFFFFF',
+    color: '#000000',
+    border: '1px solid #FFFFFF',
+    borderRadius: 8,
+    fontSize: 13,
+    fontWeight: 700,
+    letterSpacing: '0.02em',
+    cursor: 'pointer',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  profileFollowingBtn: {
+    flex: 1,
+    padding: '8px 12px',
+    backgroundColor: '#1a1a1a',
+    color: '#F0EBE0',
+    border: '1px solid #333',
+    borderRadius: 8,
+    fontSize: 13,
+    fontWeight: 600,
+    letterSpacing: '0.02em',
+    cursor: 'pointer',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  // Inline Follow button on feed cards — smaller than the profile-page
+  // version. Sits between the handle column and the 3-dot menu. IG-style
+  // gray rounded rect.
+  postFollowBtn: {
+    padding: '5px 12px',
+    marginRight: 4,
+    backgroundColor: '#1f1f1f',
+    color: '#F0EBE0',
+    border: '1px solid #333',
+    borderRadius: 8,
+    fontSize: 12,
+    fontWeight: 700,
+    letterSpacing: '0.02em',
+    cursor: 'pointer',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    whiteSpace: 'nowrap' as const,
+  },
+  postFollowBtnFollowing: {
+    padding: '5px 12px',
+    marginRight: 4,
+    backgroundColor: 'transparent',
+    color: '#888',
+    border: '1px solid #333',
+    borderRadius: 8,
+    fontSize: 12,
+    fontWeight: 600,
+    letterSpacing: '0.02em',
+    cursor: 'pointer',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    whiteSpace: 'nowrap' as const,
+  },
+  // Confirm-delete-post modal — centered card, not a sheet. Two buttons.
+  confirmBackdrop: {
+    position: 'fixed' as const,
+    inset: 0,
+    background: 'rgba(0,0,0,0.85)',
+    zIndex: 10001,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 24,
+  },
+  confirmCard: {
+    width: '100%',
+    maxWidth: 360,
+    background: '#0a0a0a',
+    border: '1px solid #222',
+    borderRadius: 14,
+    padding: 20,
+    display: 'flex',
+    flexDirection: 'column' as const,
+    gap: 12,
+  },
+  confirmTitle: {
+    color: '#FFFFFF',
+    fontSize: 17,
+    fontWeight: 700 as const,
+    textAlign: 'center' as const,
+  },
+  confirmBody: {
+    color: '#aaa',
+    fontSize: 13,
+    lineHeight: 1.45,
+    textAlign: 'center' as const,
+    padding: '0 4px',
+  },
+  confirmActions: {
+    display: 'flex',
+    gap: 10,
+    marginTop: 8,
+  },
+  confirmCancelBtn: {
+    flex: 1,
+    padding: '10px 0',
+    background: 'transparent',
+    color: '#FFFFFF',
+    border: '1px solid #333',
+    borderRadius: 8,
+    fontSize: 14,
+    fontWeight: 600 as const,
+    cursor: 'pointer',
+  },
+  confirmDeleteBtn: {
+    flex: 1,
+    padding: '10px 0',
+    background: '#FF3B5C',
+    color: '#FFFFFF',
+    border: 'none',
+    borderRadius: 8,
+    fontSize: 14,
+    fontWeight: 700 as const,
+    cursor: 'pointer',
+  },
+  // ---- Follow / For You segmented toggle at top of feed ----
+  // Two flush buttons under the brand header. Active state gets bold
+  // white text + a 2px underline; inactive is greyed out. IG-style.
+  feedModeRow: {
+    display: 'flex',
+    backgroundColor: '#000',
+    borderBottom: '1px solid #1a1a1a',
+  },
+  feedModeBtn: {
+    flex: 1,
+    padding: '12px 0',
+    backgroundColor: 'transparent',
+    color: '#888888',
+    border: 'none',
+    borderBottom: '2px solid transparent',
+    fontSize: 14,
+    fontWeight: 600,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+  },
+  feedModeBtnActive: {
+    flex: 1,
+    padding: '12px 0',
+    backgroundColor: 'transparent',
+    color: '#FFFFFF',
+    border: 'none',
+    borderBottom: '2px solid #FFFFFF',
+    fontSize: 14,
+    fontWeight: 700,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+  },
+  // ---- DreadFeed Claim Screen (Profile tab when no handle) ----
+  // Full-height centered claim form. Sits in the same scrollable area
+  // that the profile would normally occupy, so it slots cleanly into
+  // the existing SocialView layout (brand header above, bottom bar
+  // below). No background image — pure black to match the IG-style
+  // sign-up aesthetic.
+  dreadFeedClaimWrap: {
+    display: 'flex',
+    alignItems: 'flex-start',
+    justifyContent: 'center',
+    paddingTop: 40,
+    paddingBottom: 120,
+    minHeight: 'calc(100vh - 220px)',
+  },
+  dreadFeedClaimInner: {
+    width: '100%',
+    maxWidth: 360,
+    padding: '0 24px',
+    display: 'flex',
+    flexDirection: 'column' as const,
+    alignItems: 'stretch',
+  },
+  dreadFeedClaimTitle: {
+    color: '#FFFFFF',
+    fontSize: 22,
+    fontWeight: 700,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    textAlign: 'center' as const,
+    marginBottom: 8,
+  },
+  dreadFeedClaimSubtitle: {
+    color: '#888888',
+    fontSize: 13,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    textAlign: 'center' as const,
+    marginBottom: 24,
+    lineHeight: 1.4,
+  },
+  dreadFeedClaimInput: {
+    backgroundColor: '#0f0f0f',
+    color: '#FFFFFF',
+    border: '1px solid #333',
+    borderRadius: 8,
+    padding: '12px 14px',
+    fontSize: 16,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    outline: 'none',
+    marginBottom: 6,
+  } as any,
+  dreadFeedClaimStatus: {
+    fontSize: 12,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    marginBottom: 14,
+    letterSpacing: '0.04em',
+  },
+  dreadFeedClaimBtn: {
+    backgroundColor: '#FFFFFF',
+    color: '#000000',
+    border: 'none',
+    borderRadius: 8,
+    padding: '12px 14px',
+    fontSize: 15,
+    fontWeight: 700,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+    marginTop: 8,
+  },
+  dreadFeedClaimBtnDisabled: {
+    backgroundColor: '#222',
+    color: '#666',
+    border: 'none',
+    borderRadius: 8,
+    padding: '12px 14px',
+    fontSize: 15,
+    fontWeight: 700,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'default',
+    marginTop: 8,
+  },
+  dreadFeedClaimError: {
+    color: '#ff6b6b',
+    fontSize: 13,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    marginTop: 10,
+    textAlign: 'center' as const,
+  },
+  dreadFeedClaimFooter: {
+    color: '#666',
+    fontSize: 11,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    textAlign: 'center' as const,
+    marginTop: 16,
+    letterSpacing: '0.03em',
+  },
+  // ---- Gear icon bar above profile (own profile only) ----
+  // Sits as a small right-aligned strip above the profileTopRow when
+  // viewing your own profile, so the settings entry is obvious and
+  // reachable without sacrificing the IG-style stats layout below.
+  profileSettingsBar: {
+    display: 'flex',
+    justifyContent: 'flex-end',
+    padding: '8px 12px 0 12px',
+    backgroundColor: 'rgba(10,10,10,0.5)',
+  },
+  profileSettingsBtn: {
+    width: 40,
+    height: 40,
+    backgroundColor: 'transparent',
+    border: 'none',
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 0,
+  },
+  // ---- Settings screen ----
+  settingsWrap: {
+    minHeight: '100vh',
+    backgroundColor: '#000',
+    paddingBottom: 40,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  settingsHeaderBar: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: 'calc(env(safe-area-inset-top, 44px) + 12px) 14px 12px 14px' as any,
+    borderBottom: '1px solid #1a1a1a',
+    backgroundColor: '#000',
+    position: 'sticky' as const,
+    top: 0,
+    zIndex: 5,
+  },
+  settingsBackBtn: {
+    width: 36,
+    height: 36,
+    backgroundColor: 'transparent',
+    border: 'none',
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 0,
+  },
+  settingsHeaderTitle: {
+    color: '#FFFFFF',
+    fontSize: 17,
+    fontWeight: 600,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  settingsSectionLabel: {
+    color: '#666',
+    fontSize: 12,
+    letterSpacing: '0.1em',
+    textTransform: 'uppercase' as const,
+    padding: '20px 16px 8px 16px',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  settingsRow: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    width: '100%',
+    padding: '14px 16px',
+    backgroundColor: 'transparent',
+    border: 'none',
+    borderTop: '1px solid #1a1a1a',
+    borderBottom: '1px solid #1a1a1a',
+    cursor: 'pointer',
+    textAlign: 'left' as const,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  settingsRowTextCol: {
+    display: 'flex',
+    flexDirection: 'column' as const,
+    gap: 2,
+    flex: 1,
+    minWidth: 0,
+  },
+  settingsRowLabel: {
+    color: '#FFFFFF',
+    fontSize: 15,
+    fontWeight: 500,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  settingsRowSublabel: {
+    color: '#888',
+    fontSize: 12,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  settingsRowChevron: {
+    marginLeft: 12,
+    display: 'flex',
+    alignItems: 'center',
+  },
+  settingsEmpty: {
+    padding: 40,
+    textAlign: 'center' as const,
+    color: '#888',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  settingsFooter: {
+    padding: '32px 16px 16px',
+    textAlign: 'center' as const,
+    color: '#444',
+    fontSize: 11,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  // ---- Centered Modal (shared by add-email, verify, blocked, delete, report) ----
+  modalOverlay: {
+    position: 'fixed' as const,
+    top: 0, left: 0, right: 0, bottom: 0,
+    zIndex: 250,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 16,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  modalBackdrop: {
+    position: 'absolute' as const,
+    top: 0, left: 0, right: 0, bottom: 0,
+    backgroundColor: 'rgba(0,0,0,0.6)',
+  },
+  modalPanel: {
+    position: 'relative' as const,
+    width: '100%',
+    maxWidth: 400,
+    backgroundColor: '#0c0c0c',
+    border: '1px solid #2a2a2a',
+    borderRadius: 14,
+    overflow: 'hidden' as const,
+    boxShadow: '0 20px 50px rgba(0,0,0,0.6)',
+  },
+  modalHeader: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: '10px 12px',
+    borderBottom: '1px solid #1a1a1a',
+  },
+  modalTitle: {
+    color: '#FFFFFF',
+    fontSize: 15,
+    fontWeight: 600,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  modalCloseBtn: {
+    width: 32,
+    height: 32,
+    backgroundColor: 'transparent',
+    border: 'none',
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 0,
+  },
+  modalBody: {
+    padding: '14px 16px 16px 16px',
+    display: 'flex',
+    flexDirection: 'column' as const,
+    gap: 12,
+  },
+  modalText: {
+    color: '#F0EBE0',
+    fontSize: 14,
+    lineHeight: 1.4,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  modalInput: {
+    width: '100%',
+    backgroundColor: '#0f0f0f',
+    color: '#FFFFFF',
+    border: '1px solid #333',
+    borderRadius: 8,
+    padding: '12px 14px',
+    fontSize: 15,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    outline: 'none',
+    boxSizing: 'border-box' as const,
+  } as any,
+  modalBtnPrimary: {
+    width: '100%',
+    backgroundColor: '#FFFFFF',
+    color: '#000',
+    border: 'none',
+    borderRadius: 8,
+    padding: '12px',
+    fontSize: 14,
+    fontWeight: 700,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+  },
+  modalBtnDisabled: {
+    width: '100%',
+    backgroundColor: '#1a1a1a',
+    color: '#666',
+    border: 'none',
+    borderRadius: 8,
+    padding: '12px',
+    fontSize: 14,
+    fontWeight: 700,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'default',
+  },
+  modalBtnDanger: {
+    width: '100%',
+    backgroundColor: '#a02828',
+    color: '#FFFFFF',
+    border: 'none',
+    borderRadius: 8,
+    padding: '12px',
+    fontSize: 14,
+    fontWeight: 700,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+  },
+  modalError: {
+    color: '#ff6b6b',
+    fontSize: 13,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  // ---- Blocked-list row inside the modal ----
+  blockedRow: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 10,
+    padding: '8px 0',
+    borderBottom: '1px solid #1a1a1a',
+  },
+  blockedHandle: {
+    color: '#FFFFFF',
+    fontSize: 14,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  blockedUnblockBtn: {
+    backgroundColor: 'transparent',
+    color: '#FFFFFF',
+    border: '1px solid #333',
+    borderRadius: 6,
+    padding: '6px 12px',
+    fontSize: 13,
+    fontWeight: 600,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+  },
+  // ---- Report-modal reason buttons ----
+  reasonBtn: {
+    width: '100%',
+    textAlign: 'left' as const,
+    backgroundColor: '#0f0f0f',
+    color: '#F0EBE0',
+    border: '1px solid #2a2a2a',
+    borderRadius: 8,
+    padding: '10px 12px',
+    fontSize: 14,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+  },
+  reasonBtnActive: {
+    width: '100%',
+    textAlign: 'left' as const,
+    backgroundColor: '#1a1a1a',
+    color: '#FFFFFF',
+    border: '1px solid #FFFFFF',
+    borderRadius: 8,
+    padding: '10px 12px',
+    fontSize: 14,
+    fontWeight: 600,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+  },
+  // Row inside the followers / following bottom sheet. Avatar on left,
+  // handle column on right, tap navigates / closes the sheet.
+  handleListRow: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 10,
+    padding: '10px 14px',
+    width: '100%',
+    backgroundColor: 'transparent',
+    border: 'none',
+    cursor: 'pointer',
+    textAlign: 'left' as const,
   },
   // ---- Tab strip above the grid ----
   profileTabStrip: {
@@ -8400,9 +17266,9 @@ const S: Record<string, React.CSSProperties> = {
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
-    color: '#BF40FF',
+    color: '#FFFFFF',
     padding: '4px 18px',
-    borderBottom: `2px solid #BF40FF`,
+    borderBottom: `2px solid #FFFFFF`,
   },
   // ---- 3-column thumbnail grid (IG-style) ----
   // 2px gaps to give the unmistakable IG-grid look without the bright
@@ -8434,13 +17300,232 @@ const S: Record<string, React.CSSProperties> = {
     WebkitUserSelect: 'none' as const,
     WebkitTouchCallout: 'none' as const,
   },
+  // Small ▶ badge overlaid on video-post thumbnails in the profile grid.
+  // Anchored to the top-right corner. Visually consistent with IG's
+  // little corner indicator for Reels/video posts in the profile grid.
+  profileGridVideoBadge: {
+    position: 'absolute' as const,
+    top: 6,
+    right: 6,
+    width: 22,
+    height: 22,
+    borderRadius: '50%',
+    backgroundColor: 'rgba(0,0,0,0.55)',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    pointerEvents: 'none' as const,
+  },
+  // ---- HashtagView (v1.14) ----
+  // Dedicated screen for a single #tag. Header on top, then the same
+  // 3-column thumbnail grid the profile view uses.
+  hashtagViewWrap: {
+    backgroundColor: '#0a0a0a',
+    minHeight: '100vh',
+    color: '#F0EBE0',
+    // Push content below the iOS status bar / notch. env() inset
+    // resolves to ~44-50px on modern iPhones; fallback ~50px keeps
+    // it sane on devices/browsers that don't expose the env var.
+    paddingTop: 'env(safe-area-inset-top, 50px)' as any,
+  },
+  hashtagHeader: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 12,
+    padding: '14px 12px 12px',
+    borderBottom: '1px solid rgba(255,255,255,0.06)',
+  },
+  hashtagBackBtn: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    background: 'transparent',
+    border: 'none',
+    color: '#F0EBE0',
+    fontSize: 24,
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexShrink: 0,
+  },
+  hashtagHeaderText: {
+    display: 'flex',
+    flexDirection: 'column' as const,
+  },
+  hashtagHeaderTitle: {
+    fontSize: 20,
+    fontWeight: 700,
+    color: '#F0EBE0',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  hashtagHeaderSub: {
+    fontSize: 13,
+    color: '#888',
+    marginTop: 2,
+  },
+  hashtagEmpty: {
+    padding: '40px 20px',
+    textAlign: 'center' as const,
+    color: '#888',
+    fontSize: 14,
+  },
+  // ---- DM Inbox / Thread (v1.15) ----
+  // Inbox list. Vertical stack of conversation rows under the safe-area
+  // header (same chrome as HashtagView).
+  dmInboxList: {
+    display: 'flex',
+    flexDirection: 'column' as const,
+  },
+  dmInboxRow: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 12,
+    padding: '12px 14px',
+    background: 'transparent',
+    border: 'none',
+    borderBottom: '1px solid rgba(255,255,255,0.06)',
+    color: '#F0EBE0',
+    cursor: 'pointer',
+    width: '100%',
+    textAlign: 'left' as const,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  // Round avatar bubble. No image fetched yet — falls back to first
+  // letter of the other handle on a colored background.
+  dmInboxAvatar: {
+    width: 44,
+    height: 44,
+    borderRadius: '50%',
+    backgroundColor: '#FF3B5C',
+    color: '#FFFFFF',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    fontWeight: 700,
+    fontSize: 18,
+    flexShrink: 0,
+  },
+  dmInboxBody: {
+    flex: 1,
+    minWidth: 0,
+    display: 'flex',
+    flexDirection: 'column' as const,
+    gap: 2,
+  },
+  dmInboxHandle: {
+    fontSize: 15,
+    fontWeight: 600,
+    color: '#F0EBE0',
+  },
+  dmInboxPreview: {
+    fontSize: 13,
+    color: '#888',
+    overflow: 'hidden' as const,
+    textOverflow: 'ellipsis' as const,
+    whiteSpace: 'nowrap' as const,
+  },
+  // When there's unread, the preview goes brighter + heavier — same
+  // visual cue IG uses.
+  dmInboxPreviewUnread: {
+    color: '#F0EBE0',
+    fontWeight: 600,
+  },
+  dmInboxBadge: {
+    minWidth: 22,
+    height: 22,
+    borderRadius: 11,
+    padding: '0 7px',
+    backgroundColor: '#FF3B5C',
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: 700,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexShrink: 0,
+  },
+  // Thread view — full-height column. Scroll area in middle, composer
+  // pinned to bottom with safe-area bottom inset.
+  dmThreadWrap: {
+    backgroundColor: '#0a0a0a',
+    color: '#F0EBE0',
+    height: '100vh',
+    display: 'flex',
+    flexDirection: 'column' as const,
+    paddingTop: 'env(safe-area-inset-top, 50px)' as any,
+  },
+  dmThreadScroll: {
+    flex: 1,
+    overflowY: 'auto' as const,
+    padding: '8px 12px 16px',
+  },
+  dmBubbleRow: {
+    display: 'flex',
+    width: '100%',
+    margin: '4px 0',
+  },
+  // Bubble base styling — own messages are pink/red, other's are grey.
+  dmBubble: {
+    maxWidth: '78%',
+    padding: '8px 14px',
+    borderRadius: 18,
+    fontSize: 15,
+    lineHeight: 1.35,
+    wordBreak: 'break-word' as const,
+    whiteSpace: 'pre-wrap' as const,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  dmBubbleOwn: {
+    backgroundColor: '#FF3B5C',
+    color: '#FFFFFF',
+  },
+  dmBubbleOther: {
+    backgroundColor: '#2a2a2a',
+    color: '#F0EBE0',
+  },
+  // Composer pinned to the bottom — textarea + Send button.
+  dmComposer: {
+    display: 'flex',
+    gap: 8,
+    padding: '10px 12px',
+    paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 10px)' as any,
+    borderTop: '1px solid rgba(255,255,255,0.08)',
+    backgroundColor: '#0a0a0a',
+    alignItems: 'flex-end',
+  },
+  dmComposerInput: {
+    flex: 1,
+    minHeight: 36,
+    maxHeight: 120,
+    padding: '8px 12px',
+    borderRadius: 18,
+    backgroundColor: '#1a1a1a',
+    border: '1px solid rgba(255,255,255,0.12)',
+    color: '#F0EBE0',
+    fontSize: 15,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    resize: 'none' as const,
+    outline: 'none',
+  },
+  dmComposerSend: {
+    padding: '8px 16px',
+    borderRadius: 18,
+    backgroundColor: '#FF3B5C',
+    color: '#FFFFFF',
+    border: 'none',
+    fontSize: 14,
+    fontWeight: 700,
+    cursor: 'pointer',
+    flexShrink: 0,
+  },
   // ---- Post detail (IG-style swipe-through viewer) ----
   // Small chip just below the brand header showing "N / total" so the
   // user has IG-style orientation while swiping between posts.
   postDetailIndicator: {
     textAlign: 'center' as const,
     padding: '8px 12px 4px 12px',
-    color: '#BF40FF',
+    color: '#FFFFFF',
     fontSize: 12,
     fontFamily: 'system-ui, -apple-system, sans-serif',
     fontWeight: 600,
@@ -8463,12 +17548,12 @@ const S: Record<string, React.CSSProperties> = {
     textTransform: 'uppercase' as const,
   },
   socialHeaderTitle: {
-    color: '#BF40FF',
+    color: '#FFFFFF',
     fontSize: 22,
     fontFamily: '"Jolly Lodger", system-ui, serif',
     fontWeight: 400,
     letterSpacing: '0.04em',
-    textShadow: `0 0 10px #BF40FFaa`,
+    textShadow: `0 0 10px #FFFFFFaa`,
   },
   socialEmpty: {
     textAlign: 'center' as const,
@@ -8496,6 +17581,25 @@ const S: Record<string, React.CSSProperties> = {
     overflow: 'visible',
     marginBottom: 20,
   },
+  // Small grey banner above the post card when this feed entry is a
+  // repost. Mirrors IG's "Reposted by X" line — quiet, ~12px, neutral
+  // grey to avoid stealing attention from the post itself.
+  repostBanner: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 6,
+    padding: '4px 12px 0',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  repostBannerText: {
+    fontSize: 12,
+    color: '#8a8a8a',
+    fontWeight: 500,
+  },
+  repostBannerHandle: {
+    color: '#F0EBE0',
+    fontWeight: 600,
+  },
   postHeader: {
     display: 'flex',
     alignItems: 'center',
@@ -8510,7 +17614,7 @@ const S: Record<string, React.CSSProperties> = {
     minWidth: 36,
     borderRadius: '50%',
     padding: 0,
-    background: 'linear-gradient(45deg, #BF40FF, #FF3B5C)',
+    background: 'linear-gradient(45deg, #FFFFFF, #FF3B5C)',
     border: 'none',
     cursor: 'pointer',
     display: 'flex',
@@ -8591,14 +17695,91 @@ const S: Record<string, React.CSSProperties> = {
     opacity: 0.6,
   },
   // Photo — slightly rounded corners (8px) per request. Edge-to-edge
-  // otherwise. aspectRatio 1:1 keeps cards predictable on a vertical feed.
+  // otherwise. 4:5 portrait matches Instagram's default feed aspect ratio
+  // (1080×1350), giving taller cards that show more of vertical phone
+  // photos without needing a tap-to-expand. Wider source images get
+  // center-cropped on the sides via objectFit: cover, same as IG.
   postPhoto: {
     width: '100%',
     display: 'block',
-    aspectRatio: '1 / 1',
+    aspectRatio: '4 / 5',
     objectFit: 'cover' as const,
     backgroundColor: '#111',
     borderRadius: 8,
+  },
+  // ---- Multi-photo carousel (v1.12) ----
+  // Wraps the scroller + dots + "1/N" badge. Position relative so the
+  // badge can anchor top-right over the photos.
+  postCarouselWrap: {
+    position: 'relative' as const,
+    width: '100%',
+  },
+  // Horizontal snap-scroller. Each slide is 100% width; the browser
+  // snaps to the nearest one when the user releases their finger.
+  // scrollbar is hidden globally so the white bar never shows here.
+  postCarouselScroller: {
+    display: 'flex',
+    overflowX: 'auto' as const,
+    overflowY: 'hidden' as const,
+    scrollSnapType: 'x mandatory' as const,
+    WebkitOverflowScrolling: 'touch' as any,
+    overscrollBehaviorX: 'contain' as const,
+    width: '100%',
+  },
+  // Single slide inside the scroller. Each takes full width; snaps to
+  // start so the active photo always aligns to the left edge. Width
+  // and minWidth both set to 100% — flexbox needs both to behave
+  // correctly with overflow.
+  postCarouselSlide: {
+    flex: '0 0 100%',
+    width: '100%',
+    minWidth: '100%',
+    scrollSnapAlign: 'start' as const,
+    padding: 0,
+    margin: 0,
+    border: 'none',
+    background: 'transparent',
+    cursor: 'pointer',
+    display: 'block',
+  },
+  // Page dots, absolute-positioned below the photo area. Translucent
+  // white circles, the active one is solid blue (matches IG).
+  postCarouselDots: {
+    position: 'absolute' as const,
+    bottom: 8,
+    left: 0,
+    right: 0,
+    display: 'flex',
+    justifyContent: 'center',
+    gap: 4,
+    pointerEvents: 'none' as const,
+  },
+  postCarouselDot: {
+    width: 6,
+    height: 6,
+    borderRadius: '50%',
+    backgroundColor: 'rgba(255,255,255,0.45)',
+    transition: 'background-color 0.2s ease',
+  },
+  postCarouselDotActive: {
+    backgroundColor: '#3FA9FF',
+  },
+  // "1/4" badge top-right of the photo. Same translucent-black pill
+  // IG uses on carousels.
+  postCarouselBadge: {
+    position: 'absolute' as const,
+    top: 10,
+    right: 10,
+    padding: '2px 8px',
+    backgroundColor: 'rgba(0,0,0,0.6)',
+    color: '#ffffff',
+    fontSize: 12,
+    fontWeight: 600,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    borderRadius: 12,
+    backdropFilter: 'blur(4px)',
+    WebkitBackdropFilter: 'blur(4px)',
+    pointerEvents: 'none' as const,
   },
   // Actions row — Instagram-style outlined icons, left-aligned with
   // share pushed to the right via the spacer between buttons.
@@ -8651,6 +17832,393 @@ const S: Record<string, React.CSSProperties> = {
     color: '#F0EBE0',
     fontSize: 14,
     fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+  },
+  // Same visual as postCaptionText but renders as a button that opens
+  // the comment sheet on tap. IG works this way — tapping the caption
+  // text takes you straight into comments. Removing button chrome so
+  // the user just sees plain caption text.
+  postCaptionTextBtn: {
+    color: '#F0EBE0',
+    fontSize: 14,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    background: 'none',
+    border: 'none',
+    padding: 0,
+    margin: 0,
+    cursor: 'pointer',
+    textAlign: 'left' as const,
+    display: 'inline',
+  },
+  // Small numeric badge next to the comment icon — shows the comment
+  // count when > 0. Sits to the right of the icon inside the same
+  // button so it taps as a single target.
+  postIconBtnCount: {
+    color: '#F0EBE0',
+    fontSize: 14,
+    fontWeight: 600,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    marginLeft: 6,
+  },
+  // "View all N comments" button below the caption, IG-style. Plain
+  // grey text, no chrome, opens the comment sheet on tap.
+  postViewCommentsBtn: {
+    display: 'block',
+    padding: '0 14px 8px 14px',
+    color: '#888888',
+    fontSize: 14,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    backgroundColor: 'transparent',
+    border: 'none',
+    cursor: 'pointer',
+    textAlign: 'left' as const,
+  },
+  // Container for inline comment preview rows under each feed card.
+  // Sits between View-all link and the next post; small vertical
+  // padding keeps the section readable without crowding the photo grid.
+  postLatestComments: {
+    display: 'flex',
+    flexDirection: 'column' as const,
+    gap: 2,
+    padding: '0 14px 8px 14px',
+  },
+  // Single preview row. The whole row is a button so tap anywhere opens
+  // the sheet. Visual: handle bold, body inline — same IG layout.
+  postLatestCommentRow: {
+    display: 'block',
+    background: 'none',
+    border: 'none',
+    padding: 0,
+    margin: 0,
+    cursor: 'pointer',
+    textAlign: 'left' as const,
+    fontSize: 14,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    lineHeight: 1.35,
+    overflow: 'hidden' as const,
+    textOverflow: 'ellipsis' as const,
+    whiteSpace: 'nowrap' as const,
+    color: '#F0EBE0',
+  },
+  postLatestCommentHandle: {
+    fontWeight: 600,
+    color: '#F0EBE0',
+  },
+  postLatestCommentBody: {
+    color: '#F0EBE0',
+  },
+  // ---- Comment Sheet (IG-style bottom sheet) ----
+  // Full-viewport overlay that catches taps for backdrop dismiss.
+  commentSheetOverlay: {
+    position: 'fixed' as const,
+    top: 0, left: 0, right: 0, bottom: 0,
+    zIndex: 200,
+    display: 'flex',
+    alignItems: 'flex-end',
+    justifyContent: 'center',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  // Backdrop layer — sits behind the sheet, tap to dismiss. Pure
+  // transparent black; the post photo above still shows through dimly.
+  commentSheetBackdrop: {
+    position: 'absolute' as const,
+    top: 0, left: 0, right: 0, bottom: 0,
+    backgroundColor: 'rgba(0,0,0,0.4)',
+  },
+  // The sliding panel itself. Black background, rounded top corners,
+  // takes 78% of viewport height (per IG). Transform is set inline on
+  // the element so we can drive the slide animation. Background is
+  // Apple's secondary-surface gray (#1c1c1e), matching Instagram's
+  // comment sheet exactly — gives the sheet clear elevation above the
+  // black post area behind it.
+  commentSheetPanel: {
+    position: 'relative' as const,
+    width: '100%',
+    maxWidth: 600,
+    height: '78vh',
+    backgroundColor: '#1c1c1e',
+    borderTopLeftRadius: 14,
+    borderTopRightRadius: 14,
+    display: 'flex',
+    flexDirection: 'column' as const,
+    boxShadow: '0 -8px 28px rgba(0,0,0,0.6)',
+    overflow: 'hidden' as const,
+  },
+  // The drag-handle "grab area" at the very top. Larger than the visible
+  // pill so the touch target is friendly (44px tall).
+  commentSheetHandleArea: {
+    width: '100%',
+    height: 22,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingTop: 8,
+    paddingBottom: 4,
+    cursor: 'grab',
+    touchAction: 'none' as const,
+  },
+  // The visible grey pill inside the handle area.
+  commentSheetHandlePill: {
+    width: 40,
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: '#555555',
+  },
+  // Header — "Comments" centered, share icon right.
+  commentSheetHeader: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: '6px 14px 10px 14px',
+    borderBottom: '1px solid #2a2a2a',
+  },
+  commentSheetTitle: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: 700,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  commentSheetCloseBtn: {
+    width: 40,
+    height: 32,
+    backgroundColor: 'transparent',
+    border: 'none',
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 0,
+  },
+  // Scrollable list region. overscrollBehavior:'contain' is the key fix
+  // for v1.11 — without it, iOS Safari chains scroll events to the body
+  // when the list reaches its top or bottom, causing the feed underneath
+  // to scroll. Containing the scroll keeps it isolated to this region.
+  commentSheetList: {
+    flex: 1,
+    overflowY: 'auto' as const,
+    padding: '8px 0 12px 0',
+    WebkitOverflowScrolling: 'touch' as any,
+    overscrollBehavior: 'contain' as const,
+  },
+  commentSheetEmpty: {
+    textAlign: 'center' as const,
+    padding: '60px 24px',
+    color: '#888888',
+    fontSize: 15,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  // Per-comment row: avatar | body column | like column.
+  commentRow: {
+    display: 'flex',
+    alignItems: 'flex-start',
+    gap: 10,
+    padding: '10px 14px',
+  },
+  commentAvatar: {
+    width: 36,
+    height: 36,
+    minWidth: 36,
+    borderRadius: '50%',
+    objectFit: 'cover' as const,
+    pointerEvents: 'none' as const,
+  },
+  // Smaller avatar for nested reply rows. The indented row already has
+  // a 56px paddingLeft pushing it inward; a 28px avatar keeps the visual
+  // rhythm right without making the row look cramped.
+  commentAvatarReply: {
+    width: 28,
+    height: 28,
+    minWidth: 28,
+    borderRadius: '50%',
+    objectFit: 'cover' as const,
+    pointerEvents: 'none' as const,
+  },
+  // "Reply" link under each comment body. Plain text, low-prominence
+  // gray so it doesn't compete with the comment itself.
+  commentReplyBtn: {
+    background: 'none',
+    border: 'none',
+    padding: '4px 0 0 0',
+    margin: 0,
+    color: '#888888',
+    fontSize: 12,
+    fontWeight: 600,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+    alignSelf: 'flex-start',
+  },
+  // "View N replies" / "Hide replies" toggle. IG mimics this with a
+  // short horizontal line followed by the text, indented to align with
+  // where the parent comment's body starts (i.e. past the avatar gutter).
+  commentRepliesToggle: {
+    background: 'none',
+    border: 'none',
+    margin: '2px 0 8px 56px',
+    padding: '4px 0',
+    color: '#888888',
+    fontSize: 12,
+    fontWeight: 600,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    gap: 10,
+  },
+  commentRepliesToggleLine: {
+    display: 'inline-block',
+    width: 24,
+    height: 1,
+    backgroundColor: '#555555',
+  },
+  // "Replying to @X" pill that sits above the composer when in reply mode.
+  commentReplyPill: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: '6px 14px',
+    backgroundColor: '#262626',
+    borderTop: '1px solid #2a2a2a',
+    fontSize: 12,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  commentReplyPillText: {
+    color: '#aaaaaa',
+  },
+  commentReplyPillHandle: {
+    color: '#ffffff',
+    fontWeight: 600,
+  },
+  commentReplyPillClose: {
+    background: 'none',
+    border: 'none',
+    color: '#aaaaaa',
+    fontSize: 14,
+    cursor: 'pointer',
+    padding: 4,
+    lineHeight: 1,
+  },
+  commentBodyCol: {
+    flex: 1,
+    display: 'flex',
+    flexDirection: 'column' as const,
+    gap: 2,
+    minWidth: 0,
+  },
+  commentMetaLine: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 6,
+    flexWrap: 'wrap' as const,
+  },
+  commentHandle: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: 600,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  commentTime: {
+    color: '#888888',
+    fontSize: 12,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  // Pinned "Author" badge on the post author's own comments.
+  commentAuthorBadge: {
+    color: '#888888',
+    fontSize: 11,
+    fontWeight: 600,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    padding: '1px 6px',
+    border: '1px solid #444',
+    borderRadius: 6,
+    letterSpacing: '0.05em',
+  },
+  commentBodyText: {
+    color: '#FFFFFF',
+    fontSize: 14,
+    lineHeight: 1.35,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    wordBreak: 'break-word' as const,
+  },
+  // Like button column on each comment row.
+  commentLikeBtn: {
+    display: 'flex',
+    flexDirection: 'column' as const,
+    alignItems: 'center',
+    gap: 2,
+    backgroundColor: 'transparent',
+    border: 'none',
+    cursor: 'pointer',
+    padding: '6px 4px',
+    minWidth: 30,
+  },
+  commentLikeCount: {
+    color: '#888888',
+    fontSize: 11,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  // Quick-emoji row above the input. v1.11: 20 horror emojis, horizontally
+  // scrollable since "space-around" packing 20 of these would shrink them
+  // to thumbnails. flex-start + overflow-x lets the row read at native size
+  // and lets users swipe through. flexShrink:0 on the button keeps each
+  // emoji from squishing.
+  commentSheetEmojiRow: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 4,
+    padding: '10px 8px 8px 8px',
+    borderTop: '1px solid #2a2a2a',
+    overflowX: 'auto',
+    WebkitOverflowScrolling: 'touch',
+  },
+  commentSheetEmojiBtn: {
+    backgroundColor: 'transparent',
+    border: 'none',
+    cursor: 'pointer',
+    fontSize: 24,
+    padding: 4,
+    lineHeight: 1,
+    flexShrink: 0,
+  },
+  // Composer row at the bottom: avatar + input + Post button.
+  // Uses safe-area-inset-bottom so it doesn't collide with the iOS
+  // home indicator. Background inherits from the panel (#1c1c1e) so
+  // the composer reads as part of the same surface, not a darker strip.
+  commentSheetComposer: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 10,
+    padding: '8px 14px 8px 14px',
+    paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 8px)' as any,
+    borderTop: '1px solid #2a2a2a',
+    backgroundColor: '#1c1c1e',
+  },
+  commentSheetComposerAvatar: {
+    width: 28,
+    height: 28,
+    minWidth: 28,
+    borderRadius: '50%',
+    objectFit: 'cover' as const,
+    pointerEvents: 'none' as const,
+  },
+  commentSheetComposerInput: {
+    flex: 1,
+    backgroundColor: 'transparent',
+    border: 'none',
+    outline: 'none',
+    color: '#FFFFFF',
+    fontSize: 14,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    padding: '8px 0',
+  } as any,
+  commentSheetComposerPostBtn: {
+    backgroundColor: 'transparent',
+    border: 'none',
+    color: '#3897F0',                       // IG blue
+    fontSize: 14,
+    fontWeight: 700,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+    padding: '8px 4px',
   },
   // ---- Deprecated post styles (kept for backwards compat in case other
   // code references them; not used by the current SocialPostCard) ----
@@ -8687,10 +18255,10 @@ const S: Record<string, React.CSSProperties> = {
     width: '100%',
     textAlign: 'left' as const,
     padding: '10px 14px',
-    backgroundColor: 'rgba(191,64,255,0.06)',
+    backgroundColor: 'rgba(255,255,255,0.04)',
     borderTop: `1px solid #2a2a2a`,
     border: 'none',
-    color: '#BF40FF',
+    color: '#FFFFFF',
     fontSize: 13,
     fontWeight: 600,
     letterSpacing: '0.04em',
@@ -8702,9 +18270,9 @@ const S: Record<string, React.CSSProperties> = {
     width: '100%',
     padding: '14px 16px',
     marginTop: 12,
-    backgroundColor: 'rgba(191,64,255,0.08)',
-    border: `2px solid #BF40FF`,
-    color: '#BF40FF',
+    backgroundColor: 'rgba(255,255,255,0.05)',
+    border: `2px solid #FFFFFF`,
+    color: '#FFFFFF',
     fontFamily: 'system-ui, -apple-system, sans-serif',
     fontSize: 18,
     fontWeight: 700,
@@ -8712,8 +18280,8 @@ const S: Record<string, React.CSSProperties> = {
     textTransform: 'uppercase' as const,
     borderRadius: 12,
     cursor: 'pointer',
-    boxShadow: `0 0 14px #BF40FF55, inset 0 0 10px #BF40FF22`,
-    textShadow: `0 0 8px #BF40FFaa`,
+    boxShadow: `0 0 14px #FFFFFF44, inset 0 0 10px #FFFFFF22`,
+    textShadow: `0 0 8px #FFFFFFaa`,
   },
   addPhotoBtnDisabled: {
     width: '100%',
@@ -8744,16 +18312,16 @@ const S: Record<string, React.CSSProperties> = {
     width: '100%',
     maxWidth: 460,
     backgroundColor: '#141414',
-    border: `1.5px solid #BF40FF`,
+    border: `1.5px solid #FFFFFF`,
     borderRadius: 16,
     padding: 18,
-    boxShadow: `0 0 30px #BF40FF33`,
+    boxShadow: `0 0 30px #FFFFFF22`,
     display: 'flex',
     flexDirection: 'column' as const,
     gap: 14,
   },
   postComposerTitle: {
-    color: '#BF40FF',
+    color: '#FFFFFF',
     fontSize: 18,
     fontWeight: 800,
     letterSpacing: '0.22em',
@@ -8809,16 +18377,16 @@ const S: Record<string, React.CSSProperties> = {
   postComposerSubmit: {
     width: '100%',
     padding: '14px',
-    backgroundColor: 'rgba(191,64,255,0.1)',
-    border: `1.5px solid #BF40FF`,
-    color: '#BF40FF',
+    backgroundColor: 'rgba(255,255,255,0.06)',
+    border: `1.5px solid #FFFFFF`,
+    color: '#FFFFFF',
     fontSize: 13,
     fontWeight: 700,
     letterSpacing: '0.18em',
     textTransform: 'uppercase' as const,
     borderRadius: 10,
     cursor: 'pointer',
-    boxShadow: `0 0 12px #BF40FF44`,
+    boxShadow: `0 0 12px #FFFFFF33`,
   },
   // Photo picker placeholder shown before a photo is selected.
   postComposerPicker: {
@@ -8938,6 +18506,15 @@ const S: Record<string, React.CSSProperties> = {
     fontSize: 13,
     color: '#888',
   },
+  // Smaller secondary hint specifically for the video size/duration
+  // notice. Sits below the main hint, dimmer and slightly italic so
+  // it reads as supplementary info rather than a primary instruction.
+  igPickPromptHintSmall: {
+    fontSize: 11,
+    color: '#666',
+    marginTop: 8,
+    fontStyle: 'italic' as const,
+  },
   igPickPreviewWrap: {
     flex: 1,
     position: 'relative' as const,
@@ -9024,6 +18601,294 @@ const S: Record<string, React.CSSProperties> = {
     fontFamily: 'system-ui, -apple-system, sans-serif',
     letterSpacing: 0,
   },
+
+  // ---- DreadFeed Post Editor (between pick and caption) ----
+  // Filmstrip overlay bars are drawn at the top/bottom of the preview at
+  // 6% of preview height — same proportion the canvas-bake uses. Sprocket
+  // holes are flex children for cheap responsive spacing.
+  editorPreviewWrap: {
+    flex: 1,
+    position: 'relative' as const,
+    backgroundColor: '#000',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    overflow: 'hidden' as const,
+    touchAction: 'none' as const,
+  },
+  editorPreviewImg: {
+    maxWidth: '100%',
+    maxHeight: '100%',
+    objectFit: 'contain' as const,
+    display: 'block',
+    userSelect: 'none' as const,
+    pointerEvents: 'none' as const,
+  },
+  editorFilmstripBarTop: {
+    position: 'absolute' as const,
+    top: 0, left: 0, right: 0,
+    height: '6%',
+    backgroundColor: '#0a0a0a',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-around' as const,
+    pointerEvents: 'none' as const,
+  },
+  editorFilmstripBarBottom: {
+    position: 'absolute' as const,
+    bottom: 0, left: 0, right: 0,
+    height: '6%',
+    backgroundColor: '#0a0a0a',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-around' as const,
+    pointerEvents: 'none' as const,
+  },
+  editorFilmstripHole: {
+    width: 10,
+    height: 14,
+    backgroundColor: '#F5EFE0',
+    borderRadius: 3,
+  },
+  // Slider-based size/rotation controls (v1.13). The two rows + delete
+  // button stack vertically over the bottom toolbar, with a translucent
+  // black panel so they read against any background image.
+  editorLayerControls: {
+    position: 'absolute' as const,
+    bottom: 96,
+    left: 12,
+    right: 12,
+    display: 'flex',
+    flexDirection: 'column' as const,
+    gap: 8,
+    padding: '10px 12px',
+    backgroundColor: 'rgba(0,0,0,0.72)',
+    borderRadius: 12,
+    backdropFilter: 'blur(8px)',
+    WebkitBackdropFilter: 'blur(8px)',
+    border: '1px solid rgba(255,255,255,0.12)',
+    zIndex: 5,
+  },
+  editorSliderRow: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 10,
+  },
+  editorSliderIcon: {
+    color: '#FFFFFF',
+    fontSize: 18,
+    width: 22,
+    textAlign: 'center' as const,
+    flexShrink: 0,
+  },
+  // Native range slider styled to match the dark editor chrome. The
+  // appearance: none + WebkitAppearance: none combo strips iOS Safari's
+  // default styling so our gradient track and pink thumb show through.
+  editorSlider: {
+    flex: 1,
+    height: 32,
+    accentColor: '#FF3B5C',
+    background: 'transparent',
+    margin: 0,
+  },
+  // Delete button sits below the sliders, full-width, with red text.
+  editorLayerDeleteBtn: {
+    height: 36,
+    borderRadius: 8,
+    backgroundColor: 'rgba(255,77,77,0.15)',
+    border: '1px solid rgba(255,77,77,0.4)',
+    color: '#FF4D4D',
+    fontSize: 16,
+    fontWeight: 600,
+    cursor: 'pointer',
+  },
+  // (legacy editorLayerBtn kept so existing +/− style references in
+  // any code I missed don't break — safe to remove later)
+  editorLayerBtn: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: 'rgba(0,0,0,0.78)',
+    border: '1px solid rgba(255,255,255,0.18)',
+    color: '#FFFFFF',
+    fontSize: 18,
+    fontWeight: 700,
+    cursor: 'pointer',
+    backdropFilter: 'blur(8px)',
+  },
+  editorToolbar: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-around' as const,
+    padding: '10px 12px 14px',
+    backgroundColor: '#000',
+    borderTop: '1px solid #1a1a1a',
+  },
+  editorToolBtn: {
+    display: 'flex',
+    flexDirection: 'column' as const,
+    alignItems: 'center',
+    gap: 3,
+    padding: '6px 10px',
+    backgroundColor: 'transparent',
+    border: 'none',
+    color: '#FFFFFF',
+    cursor: 'pointer',
+    minWidth: 70,
+  },
+  editorToolIcon: {
+    fontSize: 22,
+    lineHeight: 1,
+  },
+  editorToolLabel: {
+    fontSize: 11,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    letterSpacing: '0.04em',
+    textTransform: 'uppercase' as const,
+  },
+  editorTray: {
+    position: 'absolute' as const,
+    bottom: 64,
+    left: 0,
+    right: 0,
+    backgroundColor: '#0c0c0c',
+    borderTop: '1px solid #1a1a1a',
+    maxHeight: '50%',
+    overflowY: 'auto' as const,
+    zIndex: 6,
+  },
+  editorTrayHeader: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between' as const,
+    padding: '10px 14px',
+    borderBottom: '1px solid #1a1a1a',
+  },
+  editorTrayTitle: {
+    color: '#F0EBE0',
+    fontSize: 13,
+    fontWeight: 700,
+    letterSpacing: '0.12em',
+    textTransform: 'uppercase' as const,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  editorTrayClose: {
+    width: 30,
+    height: 30,
+    border: 'none',
+    backgroundColor: 'transparent',
+    color: '#BBB',
+    fontSize: 16,
+    cursor: 'pointer',
+  },
+  editorStickerGrid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(4, 1fr)',
+    gap: 8,
+    padding: 12,
+  },
+  editorStickerCell: {
+    aspectRatio: '1',
+    backgroundColor: 'rgba(255,255,255,0.04)',
+    border: '1px solid rgba(255,255,255,0.08)',
+    borderRadius: 10,
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 8,
+  },
+  editorTextInput: {
+    flex: 1,
+    padding: '10px 12px',
+    backgroundColor: '#1a1a1a',
+    border: '1px solid #2a2a2a',
+    borderRadius: 8,
+    color: '#F0EBE0',
+    fontSize: 15,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    outline: 'none',
+  },
+  editorTextAddBtn: {
+    padding: '10px 16px',
+    backgroundColor: '#3B5BFF',
+    border: 'none',
+    borderRadius: 8,
+    color: '#FFF',
+    fontSize: 14,
+    fontWeight: 700,
+    cursor: 'pointer',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+
+  // ---- Crop screen ----
+  editorCropWrap: {
+    flex: 1,
+    position: 'relative' as const,
+    backgroundColor: '#000',
+    overflow: 'hidden' as const,
+    touchAction: 'none' as const,
+  },
+  editorCropImg: {
+    position: 'absolute' as const,
+    inset: 0,
+    width: '100%',
+    height: '100%',
+    objectFit: 'contain' as const,
+    userSelect: 'none' as const,
+    pointerEvents: 'none' as const,
+  },
+  editorCropRow: {
+    display: 'flex',
+    gap: 8,
+    padding: '10px 12px 16px',
+    overflowX: 'auto' as const,
+    backgroundColor: '#000',
+    borderTop: '1px solid #1a1a1a',
+  },
+  editorCropChip: {
+    flexShrink: 0,
+    padding: '8px 14px',
+    backgroundColor: 'rgba(255,255,255,0.06)',
+    border: '1px solid rgba(255,255,255,0.12)',
+    borderRadius: 18,
+    color: '#F0EBE0',
+    fontSize: 13,
+    fontWeight: 600,
+    cursor: 'pointer',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    letterSpacing: '0.04em',
+  },
+
+  // ---- Filter strip ----
+  // Horizontal scroll row of preview thumbnails. Sits above the toolbar
+  // when the Filter tool is active.
+  editorFilterStrip: {
+    display: 'flex',
+    gap: 10,
+    padding: '10px 12px',
+    overflowX: 'auto' as const,
+    backgroundColor: '#0a0a0a',
+    borderTop: '1px solid #1a1a1a',
+  },
+  editorFilterCell: {
+    flexShrink: 0,
+    display: 'flex',
+    flexDirection: 'column' as const,
+    alignItems: 'center',
+    gap: 4,
+    padding: 4,
+    backgroundColor: 'transparent',
+    borderRadius: 8,
+    cursor: 'pointer',
+  },
+  editorFilterLabel: {
+    fontSize: 10,
+    color: '#F0EBE0',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    letterSpacing: '0.04em',
+    textTransform: 'uppercase' as const,
+  },
   postComposerSubmitDisabled: {
     flex: 1.4,
     padding: '12px',
@@ -9092,7 +18957,7 @@ const S: Record<string, React.CSSProperties> = {
   mapBackBtn: {
     position: 'absolute' as const,
     left: 12,
-    bottom: 12,
+    bottom: 16,
     zIndex: 2,
     width: 36,
     height: 36,
@@ -9486,12 +19351,14 @@ const S: Record<string, React.CSSProperties> = {
   // Radius selector row beneath the NearbyView header. Five chips for the
   // available radii plus an optional Reset chip that appears when the user
   // has long-pressed to drop a custom search center on the map.
+  // Small left-pad nudges the chips right just enough to clear the
+  // bottom-left back button, without wrapping "100 MI" to a second line.
   radiusRow: {
     display: 'flex',
     flexWrap: 'wrap' as const,
     justifyContent: 'center' as const,
     gap: 6,
-    padding: '8px 12px 4px',
+    padding: '8px 12px 4px 28px',
   },
   radiusChip: {
     background: 'transparent',
@@ -9530,25 +19397,25 @@ const S: Record<string, React.CSSProperties> = {
   },
   listBackBtn: {
     background: 'transparent',
-    border: '1px solid #2a2a2a',
-    color: '#aaa',
+    border: '1px solid #333',
+    color: '#F0EBE0',
     padding: '8px 14px',
-    fontSize: 12,
-    fontWeight: 700,
-    letterSpacing: '0.15em',
+    fontSize: 13,
+    fontWeight: 600,
+    letterSpacing: 0,
     borderRadius: 8,
     cursor: 'pointer',
-    fontFamily: 'inherit',
-    textTransform: 'uppercase' as const,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
   },
   listSitesWrap: {
     display: 'flex',
     flexDirection: 'column' as const,
     gap: 6,
   },
-  // Category-row variant — slightly taller and uses a border/glow tint
-  // matched to the category color so the level-1 picker feels distinct
-  // from the state and site rows below it.
+  // Category-row variant — same monochrome treatment as listRow but
+  // slightly taller padding for level 1. The previous version tinted
+  // these by category color; per request the entire List View is now
+  // black/white only so category color no longer bleeds in.
   listCategoryRow: {
     display: 'flex',
     alignItems: 'center',
@@ -9557,10 +19424,10 @@ const S: Record<string, React.CSSProperties> = {
     boxSizing: 'border-box' as const,
     padding: '16px 14px',
     background: '#0d0d0d',
-    border: '1px solid',
+    border: '1px solid #1f1f1f',
     borderRadius: 10,
-    color: BONE,
-    fontFamily: 'inherit',
+    color: '#F0EBE0',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
     cursor: 'pointer',
     textAlign: 'left' as const,
   },
@@ -9574,8 +19441,8 @@ const S: Record<string, React.CSSProperties> = {
     background: '#0d0d0d',
     border: '1px solid #1f1f1f',
     borderRadius: 8,
-    color: BONE,
-    fontFamily: 'inherit',
+    color: '#F0EBE0',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
     cursor: 'pointer',
     textAlign: 'left' as const,
   },
@@ -9583,13 +19450,16 @@ const S: Record<string, React.CSSProperties> = {
     width: 8,
     height: 8,
     borderRadius: '50%',
+    backgroundColor: '#F0EBE0',
     flexShrink: 0,
   },
   listRowTitle: {
     flex: 1,
-    fontSize: 18,
-    fontWeight: 700,
-    letterSpacing: '0.04em',
+    fontSize: 16,
+    fontWeight: 600,
+    letterSpacing: 0,
+    color: '#F0EBE0',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
     overflow: 'hidden' as const,
     textOverflow: 'ellipsis' as const,
     whiteSpace: 'nowrap' as const,
@@ -9640,17 +19510,21 @@ const S: Record<string, React.CSSProperties> = {
     display: 'flex',
     alignItems: 'center',
   },
-  searchInput: {
+  // List View search input — restyled to match DreadFeed's search bar
+  // (dark grey background, neutral border, system font, white text). The
+  // old blue-glow style felt out of place in the otherwise monochrome
+  // List View.
+  localeSearchInput: {
     flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.6)',
-    color: BONE,
-    border: `1.5px solid ${BLUE}`,
-    borderRadius: 14,
-    padding: '12px 40px 12px 16px',
-    fontSize: 18,
-    fontFamily: 'inherit',
+    backgroundColor: '#1a1a1a',
+    color: '#F0EBE0',
+    border: '1px solid #333',
+    borderRadius: 10,
+    padding: '10px 40px 10px 14px',
+    fontSize: 15,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
     outline: 'none',
-    boxShadow: `0 0 12px ${BLUE}33`,
+    boxSizing: 'border-box' as const,
   },
   searchClear: {
     position: 'absolute',
@@ -9673,18 +19547,6 @@ const S: Record<string, React.CSSProperties> = {
   siteCardDesc: { fontSize: 13, lineHeight: 1.5, color: '#BBB' },
   siteCardDistance: { fontSize: 11, marginTop: 12, fontWeight: 700, letterSpacing: '0.15em' },
 
-  emptyState: {
-    margin: '40px 32px',
-    padding: '32px 20px',
-    textAlign: 'center',
-    color: GRAY_MID,
-    fontSize: 13,
-    letterSpacing: '0.05em',
-    border: `1px dashed ${GRAY_MID}`,
-    borderRadius: 14,
-    position: 'relative',
-    zIndex: 1,
-  },
   emptyStateSub: { marginTop: 10, fontSize: 11, color: GRAY_MID },
 
   heroImage: { width: 'calc(100% - 32px)', height: 260, backgroundSize: 'cover', backgroundPosition: 'center', margin: '14px 16px', borderRadius: 18, boxSizing: 'border-box', position: 'relative', zIndex: 1 },
@@ -9804,5 +19666,538 @@ const S: Record<string, React.CSSProperties> = {
     fontFamily: 'inherit',
     borderRadius: 16,
     marginTop: 8,
+  },
+
+  // ---- Batch 2b: Action sheet, EULA, comment menu, profile block,
+  //                claim screen recovery + Apple stub, modal secondary ----
+
+  // Bottom-sheet action menu — slides up over content. Backdrop dims
+  // the rest; tap-to-dismiss. Used by SocialPostCard and CommentSheet
+  // for the 3-dot menu (Report / Block / Cancel).
+  actionSheetBackdrop: {
+    position: 'fixed' as const,
+    inset: 0,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+    zIndex: 10000,
+    display: 'flex',
+    flexDirection: 'column' as const,
+    justifyContent: 'flex-end',
+    transition: 'opacity 180ms ease',
+  },
+  actionSheet: {
+    backgroundColor: '#181818',
+    borderTopLeftRadius: 16,
+    borderTopRightRadius: 16,
+    padding: '8px 12px calc(env(safe-area-inset-bottom, 12px) + 12px)',
+    display: 'flex',
+    flexDirection: 'column' as const,
+    gap: 4,
+    transition: 'transform 180ms ease',
+  },
+  actionSheetTitle: {
+    color: '#888',
+    fontSize: 12,
+    textAlign: 'center' as const,
+    padding: '8px 4px 6px',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  actionSheetBtn: {
+    width: '100%',
+    backgroundColor: 'transparent',
+    color: '#F0EBE0',
+    border: 'none',
+    borderRadius: 10,
+    padding: '14px',
+    fontSize: 16,
+    fontWeight: 500,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+    textAlign: 'center' as const,
+  },
+  actionSheetBtnDestructive: {
+    width: '100%',
+    backgroundColor: 'transparent',
+    color: '#ff5a5a',
+    border: 'none',
+    borderRadius: 10,
+    padding: '14px',
+    fontSize: 16,
+    fontWeight: 600,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+    textAlign: 'center' as const,
+  },
+  actionSheetCancelBtn: {
+    width: '100%',
+    backgroundColor: '#0a0a0a',
+    color: '#F0EBE0',
+    border: 'none',
+    borderRadius: 10,
+    padding: '14px',
+    fontSize: 16,
+    fontWeight: 700,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+    textAlign: 'center' as const,
+    marginTop: 6,
+  },
+
+  // 3-dot menu on comment rows — smaller than postMenuBtn since the
+  // row is tighter. Matches comment-like btn for visual balance.
+  commentMenuBtn: {
+    color: '#888888',
+    fontSize: 18,
+    backgroundColor: 'transparent',
+    border: 'none',
+    padding: '4px 6px',
+    cursor: 'pointer',
+    lineHeight: 1,
+    alignSelf: 'flex-start' as const,
+  },
+
+  // EULA first-launch modal — full-screen, no close button, no escape.
+  eulaBackdrop: {
+    position: 'fixed' as const,
+    inset: 0,
+    backgroundColor: '#000',
+    zIndex: 20000,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 16,
+  },
+  eulaSheet: {
+    width: '100%',
+    maxWidth: 420,
+    maxHeight: '90vh',
+    backgroundColor: '#111',
+    border: '1px solid #2a2a2a',
+    borderRadius: 16,
+    padding: 20,
+    display: 'flex',
+    flexDirection: 'column' as const,
+    gap: 12,
+    overflow: 'hidden',
+  },
+  eulaTitle: {
+    color: '#F0EBE0',
+    fontSize: 20,
+    fontWeight: 800,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    textAlign: 'center' as const,
+  },
+  eulaBody: {
+    color: '#cccccc',
+    fontSize: 14,
+    lineHeight: 1.5,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    overflowY: 'auto' as const,
+    flex: 1,
+    paddingRight: 4,
+  },
+  eulaPara: {
+    margin: '0 0 10px 0',
+  },
+  eulaLink: {
+    color: '#7AB8FF',
+    textDecoration: 'underline',
+  },
+  eulaAcceptBtn: {
+    width: '100%',
+    backgroundColor: '#FFFFFF',
+    color: '#000',
+    border: 'none',
+    borderRadius: 10,
+    padding: '14px',
+    fontSize: 15,
+    fontWeight: 700,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+  },
+
+  // Block button on UserProfileView — sits in the same actions row as
+  // Follow / Share. Visually de-emphasized: outlined red rather than
+  // filled, so it doesn't shout.
+  profileBlockBtn: {
+    backgroundColor: 'transparent',
+    color: '#ff5a5a',
+    border: '1px solid #5a2222',
+    borderRadius: 8,
+    padding: '8px 14px',
+    fontSize: 13,
+    fontWeight: 600,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+    whiteSpace: 'nowrap' as const,
+  },
+
+  // Claim screen — OR divider + Apple Sign In button + Recover link.
+  dreadFeedClaimOrRow: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 10,
+    marginTop: 18,
+    marginBottom: 12,
+  },
+  dreadFeedClaimOrLine: {
+    flex: 1,
+    height: 1,
+    backgroundColor: '#2a2a2a',
+  },
+  dreadFeedClaimOrText: {
+    color: '#666',
+    fontSize: 12,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    textTransform: 'uppercase' as const,
+    letterSpacing: 1,
+  },
+  dreadFeedAppleBtn: {
+    width: '100%',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#000',
+    color: '#FFFFFF',
+    border: '1px solid #2a2a2a',
+    borderRadius: 10,
+    padding: '12px',
+    fontSize: 15,
+    fontWeight: 600,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+  },
+  dreadFeedEmailBtn: {
+    width: '100%',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'transparent',
+    color: '#F0EBE0',
+    border: '1px solid #3a3a3a',
+    borderRadius: 10,
+    padding: '12px',
+    fontSize: 15,
+    fontWeight: 500,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+  },
+  dreadFeedRecoverLink: {
+    width: '100%',
+    backgroundColor: 'transparent',
+    color: '#7AB8FF',
+    border: 'none',
+    padding: '14px 8px 4px',
+    fontSize: 13,
+    fontWeight: 500,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+    textAlign: 'center' as const,
+    textDecoration: 'underline',
+  },
+
+  // Secondary modal button — used by RecoverAccountModal "Back" action.
+  modalBtnSecondary: {
+    width: '100%',
+    backgroundColor: 'transparent',
+    color: '#888',
+    border: '1px solid #2a2a2a',
+    borderRadius: 8,
+    padding: '12px',
+    fontSize: 14,
+    fontWeight: 500,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+    marginTop: 6,
+  },
+
+  // ---------- Poll feed cards (SocialPollCard) ----------
+  // Matches SocialPostCard chrome: dark background, full-width card,
+  // borderless top/bottom (the feed gutter handles separation).
+  pollCard: {
+    width: '100%',
+    backgroundColor: '#000',
+    borderTop: '1px solid #1a1a1a',
+    borderBottom: '1px solid #1a1a1a',
+    padding: '14px 14px 16px',
+    boxSizing: 'border-box',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    color: '#F0EBE0',
+  },
+  pollCardHeader: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 12,
+  },
+  pollCardHandleBtn: {
+    background: 'transparent',
+    border: 'none',
+    padding: 0,
+    color: '#FFFFFF',
+    fontSize: 14,
+    fontWeight: 700,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+  },
+  pollCardBadge: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 4,
+    fontSize: 11,
+    color: '#9a8e7a',
+    backgroundColor: '#171717',
+    border: '1px solid #2a2a2a',
+    borderRadius: 999,
+    padding: '4px 10px',
+    fontWeight: 600,
+    letterSpacing: 0.2,
+  },
+  pollCardQuestion: {
+    fontSize: 17,
+    lineHeight: 1.35,
+    fontWeight: 600,
+    color: '#F0EBE0',
+    marginBottom: 14,
+    whiteSpace: 'pre-wrap',
+    wordBreak: 'break-word',
+  },
+  pollCardOptions: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 8,
+  },
+  // Pre-vote pill button — borderless dark pill, tappable.
+  pollOptionBtn: {
+    width: '100%',
+    minHeight: 44,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'flex-start',
+    backgroundColor: '#141414',
+    color: '#F0EBE0',
+    border: '1px solid #262626',
+    borderRadius: 10,
+    padding: '10px 14px',
+    fontSize: 15,
+    fontWeight: 500,
+    textAlign: 'left' as const,
+    cursor: 'pointer',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  // Post-vote results row — container that holds the fill bar, label,
+  // and percent. position:relative is required so the fill can absolute-
+  // position underneath. overflow:hidden clips the fill to the rounded
+  // corners.
+  pollOptionResult: {
+    position: 'relative' as const,
+    overflow: 'hidden' as const,
+    width: '100%',
+    minHeight: 44,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#101010',
+    color: '#F0EBE0',
+    border: '1px solid #262626',
+    borderRadius: 10,
+    padding: '10px 14px',
+    fontSize: 15,
+    fontWeight: 500,
+    textAlign: 'left' as const,
+    cursor: 'pointer',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+  },
+  pollOptionResultPicked: {
+    borderColor: '#8B0000',
+  },
+  pollOptionFill: {
+    position: 'absolute' as const,
+    left: 0,
+    top: 0,
+    bottom: 0,
+    backgroundColor: '#1f1f1f',
+    transition: 'width 280ms ease-out',
+    pointerEvents: 'none' as const,
+  },
+  pollOptionFillPicked: {
+    backgroundColor: '#3a0000',
+  },
+  pollOptionLabel: {
+    position: 'relative' as const,
+    zIndex: 1,
+    flex: 1,
+    minWidth: 0,
+    overflow: 'hidden' as const,
+    textOverflow: 'ellipsis' as const,
+    whiteSpace: 'nowrap' as const,
+  },
+  pollOptionPct: {
+    position: 'relative' as const,
+    zIndex: 1,
+    fontSize: 13,
+    fontWeight: 700,
+    color: '#bbb',
+    marginLeft: 12,
+    minWidth: 36,
+    textAlign: 'right' as const,
+  },
+  pollCardFooter: {
+    marginTop: 12,
+    fontSize: 12,
+    color: '#9a8e7a',
+    display: 'flex',
+    alignItems: 'center',
+    flexWrap: 'wrap' as const,
+  },
+
+  // ---------- Poll composer (PollComposerSheet) ----------
+  pollComposerBody: {
+    padding: '18px 16px 24px',
+    overflowY: 'auto' as const,
+    flex: 1,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    color: '#F0EBE0',
+  },
+  pollComposerLabelRow: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 8,
+  },
+  pollComposerLabel: {
+    fontSize: 13,
+    fontWeight: 700,
+    color: '#F0EBE0',
+    letterSpacing: 0.5,
+    textTransform: 'uppercase' as const,
+  },
+  pollComposerCount: {
+    fontSize: 12,
+    color: '#7a7a7a',
+    fontVariantNumeric: 'tabular-nums' as const,
+  },
+  pollComposerQuestion: {
+    width: '100%',
+    backgroundColor: '#101010',
+    color: '#F0EBE0',
+    border: '1px solid #2a2a2a',
+    borderRadius: 10,
+    padding: '12px 14px',
+    fontSize: 16,
+    fontWeight: 500,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    resize: 'none' as const,
+    outline: 'none',
+    boxSizing: 'border-box' as const,
+  },
+  pollComposerOptionRow: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 10,
+    marginBottom: 8,
+  },
+  pollComposerOptionNum: {
+    width: 24,
+    height: 24,
+    flexShrink: 0,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#1a1a1a',
+    color: '#888',
+    border: '1px solid #2a2a2a',
+    borderRadius: 999,
+    fontSize: 12,
+    fontWeight: 700,
+  },
+  pollComposerOptionInput: {
+    flex: 1,
+    backgroundColor: '#101010',
+    color: '#F0EBE0',
+    border: '1px solid #2a2a2a',
+    borderRadius: 10,
+    padding: '10px 12px',
+    fontSize: 15,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    outline: 'none',
+    boxSizing: 'border-box' as const,
+    minWidth: 0,
+  },
+  pollComposerHint: {
+    marginTop: 16,
+    fontSize: 12,
+    color: '#7a7a7a',
+    lineHeight: 1.4,
+  },
+
+  // ---------- ChoosePostTypeSheet (➕ chooser) ----------
+  pollChooserBackdrop: {
+    position: 'fixed' as const,
+    inset: 0,
+    backgroundColor: 'rgba(0,0,0,0.78)',
+    zIndex: 9000,
+    display: 'flex',
+    alignItems: 'flex-end',
+    justifyContent: 'center',
+  },
+  pollChooserCard: {
+    width: '100%',
+    maxWidth: 520,
+    backgroundColor: '#0c0c0c',
+    borderTopLeftRadius: 18,
+    borderTopRightRadius: 18,
+    borderTop: '1px solid #1a1a1a',
+    padding: '20px 18px calc(28px + env(safe-area-inset-bottom))',
+    boxSizing: 'border-box' as const,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    color: '#F0EBE0',
+  },
+  pollChooserTitle: {
+    fontSize: 13,
+    fontWeight: 700,
+    color: '#9a8e7a',
+    letterSpacing: 0.6,
+    textTransform: 'uppercase' as const,
+    textAlign: 'center' as const,
+    marginBottom: 14,
+  },
+  pollChooserBtn: {
+    width: '100%',
+    display: 'flex',
+    alignItems: 'center',
+    gap: 14,
+    backgroundColor: '#141414',
+    color: '#F0EBE0',
+    border: '1px solid #262626',
+    borderRadius: 12,
+    padding: '14px 16px',
+    fontSize: 16,
+    fontWeight: 600,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+    marginBottom: 10,
+    textAlign: 'left' as const,
+  },
+  pollChooserBtnIcon: {
+    fontSize: 22,
+    width: 28,
+    textAlign: 'center' as const,
+  },
+  pollChooserBtnLabel: {
+    fontSize: 16,
+    fontWeight: 600,
+  },
+  pollChooserCancel: {
+    width: '100%',
+    backgroundColor: 'transparent',
+    color: '#888',
+    border: '1px solid #2a2a2a',
+    borderRadius: 12,
+    padding: '12px',
+    fontSize: 15,
+    fontWeight: 500,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    cursor: 'pointer',
+    marginTop: 4,
   },
 };
