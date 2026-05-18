@@ -12576,9 +12576,36 @@ function AboutView({ onBack }: { onBack: () => void }) {
       </header>
 
       <div style={S.aboutBody}>
+        <p style={S.aboutCreatedBy}>
+          Created by <b>Drew Krotzer</b>
+        </p>
+
+        <div style={S.aboutDonateBlock}>
+          <div style={S.aboutDonateHeader}>Please consider donating</div>
+          <p style={S.aboutDonatePara}>
+            The Dread Directory was built by one person and is offered completely free —
+            no ads, no paywalls, no subscriptions. Every site, every story, every feature
+            is here because I love this stuff and wanted to put it in your pocket.
+          </p>
+          <p style={S.aboutDonatePara}>
+            If the app brings you a moment of dread, a fun night out, or a story you didn't
+            know was buried in your own neighborhood, a small donation helps keep the
+            servers running, the map updated, and new locations rolling in. Every dollar
+            goes back into the app.
+          </p>
+          <a
+            href="https://www.paypal.com/donate/?hosted_button_id=S2MWGSUQNR5YS"
+            target="_blank"
+            rel="noopener noreferrer"
+            style={S.aboutDonateBtn}
+          >
+            Donate via PayPal
+          </a>
+        </div>
+
         <p style={S.aboutPara}>
-          <b>The Dread Directory</b> is a field guide to the macabre — historic crimes, hauntings, horror
-          film locations, UFO sightings, serial killers, and unsettling history hiding all around you.
+          <b>The Dread Directory</b> is a field guide to the macabre — historic crimes, hauntings, and
+          horror film locations hiding all around you.
         </p>
 
         <div style={S.aboutSectionHeader}>What this app does</div>
@@ -12626,8 +12653,8 @@ function AboutView({ onBack }: { onBack: () => void }) {
 
         <p style={S.aboutPara}>
           <b>The List.</b> Tap the list icon on the home screen to browse by category — True Crime,
-          Hauntings, Film Locations, UFO Sightings, Serial Killers, and Grave Sites. Drill into a category,
-          then a state, then a site to see its full lore.
+          Hauntings, and Film Locations. Drill into a category, then a state, then a site to see its
+          full lore.
         </p>
         <p style={S.aboutPara}>
           <b>The Map.</b> Tap the map icon on a category screen to see all sites in that category around
@@ -19100,6 +19127,58 @@ const S: Record<string, React.CSSProperties> = {
     margin: '0 auto',
   },
   aboutPara: { fontSize: 14, lineHeight: 1.6, marginBottom: 14 },
+
+  // Top-of-About creator credit. Small caps-style, dimmer than body text,
+  // sits between the About header and the donation block.
+  aboutCreatedBy: {
+    fontSize: 13,
+    color: '#888',
+    textAlign: 'center' as const,
+    marginTop: 0,
+    marginBottom: 16,
+    letterSpacing: 0.5,
+  },
+
+  // Donation call-to-action block. Red-tinted bordered card with a header,
+  // two short paragraphs of context, and a CTA button linking to PayPal.
+  // Sits at the very top of the About body, right under the creator credit.
+  aboutDonateBlock: {
+    backgroundColor: 'rgba(255, 59, 59, 0.06)',
+    border: `1px solid ${TILE_RED}66`,
+    borderRadius: 12,
+    padding: '16px 18px',
+    marginBottom: 22,
+    boxShadow: `0 0 18px ${TILE_RED}22`,
+  },
+  aboutDonateHeader: {
+    fontSize: 17,
+    fontWeight: 700,
+    color: WHITE,
+    textShadow: `0 0 10px ${TILE_RED}aa`,
+    marginBottom: 10,
+    textAlign: 'center' as const,
+  },
+  aboutDonatePara: {
+    fontSize: 14,
+    lineHeight: 1.55,
+    color: BONE,
+    marginBottom: 12,
+  },
+  aboutDonateBtn: {
+    display: 'block',
+    width: '100%',
+    textAlign: 'center' as const,
+    backgroundColor: TILE_RED,
+    color: '#FFFFFF',
+    fontSize: 15,
+    fontWeight: 700,
+    padding: '12px 18px',
+    borderRadius: 10,
+    textDecoration: 'none',
+    boxShadow: `0 0 14px ${TILE_RED}88`,
+    marginTop: 6,
+    boxSizing: 'border-box' as const,
+  },
 
   // Empty state — used when a list/grid has zero results to show. Shared
   // across CategoryView (no sites in category yet, or search filtered to
