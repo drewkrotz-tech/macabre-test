@@ -563,6 +563,24 @@ workflows:
               f.write(s)
           print(open(path).read())
           PYEOF
+      - name: Bump Android SDK versions to 35
+        script: |
+          # Capacitor 6 scaffolds android/variables.gradle with compileSdkVersion
+          # and targetSdkVersion = 34. Some plugin transitive deps (androidx.work
+          # 2.10.0 specifically) require API 35+. Bump both to 35 here so Gradle
+          # accepts the dependency graph.
+          python3 <<'PYEOF'
+          import re
+          path = "android/variables.gradle"
+          with open(path, "r") as f:
+              s = f.read()
+          s = re.sub(r'compileSdkVersion\s*=\s*\d+', 'compileSdkVersion = 35', s)
+          s = re.sub(r'targetSdkVersion\s*=\s*\d+', 'targetSdkVersion = 35', s)
+          with open(path, "w") as f:
+              f.write(s)
+          print("--- variables.gradle after SDK bump ---")
+          print(open(path).read())
+          PYEOF
       - name: Sync Capacitor to Android
         script: |
           npx cap sync android
@@ -805,6 +823,22 @@ workflows:
           for line in open(path):
               if 'version' in line.lower():
                   print(line.rstrip())
+          PYEOF
+      - name: Bump Android SDK versions to 35
+        script: |
+          # Same SDK bump as the unsigned workflow; needed for androidx.work
+          # 2.10.0 and other 35-targeting transitive deps.
+          python3 <<'PYEOF'
+          import re
+          path = "android/variables.gradle"
+          with open(path, "r") as f:
+              s = f.read()
+          s = re.sub(r'compileSdkVersion\s*=\s*\d+', 'compileSdkVersion = 35', s)
+          s = re.sub(r'targetSdkVersion\s*=\s*\d+', 'targetSdkVersion = 35', s)
+          with open(path, "w") as f:
+              f.write(s)
+          print("--- variables.gradle after SDK bump ---")
+          print(open(path).read())
           PYEOF
       - name: Sync Capacitor to Android
         script: |
