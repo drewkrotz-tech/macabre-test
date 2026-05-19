@@ -397,3 +397,452 @@ workflows:
         auth: integration
         submit_to_testflight: false
         submit_to_app_store: false
+
+  # ===========================================================================
+  # ANDROID — Unsigned smoke test.
+  # Mirrors ios-unsigned-build: scaffold the Android platform fresh, generate
+  # icons from appicon_master.b64, patch AndroidManifest with all the
+  # permissions the app needs, and build a debug APK. No signing, no upload.
+  # Use this to confirm the project compiles before burning Play Console builds.
+  # ===========================================================================
+  android-unsigned-build:
+    name: Android Unsigned Build (Pre-signing Smoke Test)
+    instance_type: linux_x2
+    max_build_duration: 60
+    environment:
+      node: 22
+      java: 21
+    scripts:
+      - name: Install npm dependencies
+        script: |
+          npm install
+      - name: Build web app (Vite)
+        script: |
+          npm run build
+      - name: Add Android platform (Capacitor)
+        script: |
+          npx cap add android
+      - name: Generate Android app icons from appicon_master.b64
+        script: |
+          set -e
+          if [ ! -f "appicon_master.b64" ]; then
+            echo "ERROR: appicon_master.b64 not found at repo root. App icon will be generic."
+            exit 1
+          fi
+          # Decode the 1024x1024 master PNG.
+          base64 -d appicon_master.b64 > /tmp/icon_master.png
+          echo "Master decoded: $(ls -la /tmp/icon_master.png)"
+
+          RES_DIR="android/app/src/main/res"
+          # Android density buckets for the legacy launcher icon (ic_launcher.png)
+          # and the round variant (ic_launcher_round.png). These are the fallback
+          # icons used on pre-Android-8 devices; adaptive icons handle 8+.
+          declare -A SIZES=(
+            [mipmap-mdpi]=48
+            [mipmap-hdpi]=72
+            [mipmap-xhdpi]=96
+            [mipmap-xxhdpi]=144
+            [mipmap-xxxhdpi]=192
+          )
+          for bucket in "${!SIZES[@]}"; do
+            sz="${SIZES[$bucket]}"
+            mkdir -p "$RES_DIR/$bucket"
+            # Standard square launcher icon.
+            convert /tmp/icon_master.png -resize "${sz}x${sz}" "$RES_DIR/$bucket/ic_launcher.png"
+            # Round variant — Android 7.1+ uses this when the launcher requests circle icons.
+            convert /tmp/icon_master.png -resize "${sz}x${sz}" "$RES_DIR/$bucket/ic_launcher_round.png"
+            # Adaptive icon foreground layer. Adaptive icons render the foreground
+            # on top of a separately defined background, so the foreground should
+            # be ~108dp with the visible art centered in ~66dp. We over-resize
+            # to give the launcher safe-zone padding.
+            FG_SIZE=$((sz * 108 / 48))
+            convert /tmp/icon_master.png -resize "${FG_SIZE}x${FG_SIZE}" \
+              -gravity center -background none -extent "${FG_SIZE}x${FG_SIZE}" \
+              "$RES_DIR/$bucket/ic_launcher_foreground.png"
+          done
+
+          # Write the adaptive icon background color (Android 8+).
+          # The master icon is on a black square, so background = solid black.
+          mkdir -p "$RES_DIR/values"
+          cat > "$RES_DIR/values/ic_launcher_background.xml" <<'XML_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="ic_launcher_background">#000000</color>
+          </resources>
+          XML_EOF
+
+          # Adaptive icon XML — points the launcher at the foreground PNG and
+          # the background color resource. Required for Android 8+.
+          mkdir -p "$RES_DIR/mipmap-anydpi-v26"
+          cat > "$RES_DIR/mipmap-anydpi-v26/ic_launcher.xml" <<'XML_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_launcher_background" />
+              <foreground android:drawable="@mipmap/ic_launcher_foreground" />
+          </adaptive-icon>
+          XML_EOF
+          cp "$RES_DIR/mipmap-anydpi-v26/ic_launcher.xml" "$RES_DIR/mipmap-anydpi-v26/ic_launcher_round.xml"
+
+          echo "--- Generated Android icon resources ---"
+          find "$RES_DIR" -name 'ic_launcher*' | sort
+      - name: Patch AndroidManifest.xml with permissions and app name
+        script: |
+          set -e
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          STRINGS="android/app/src/main/res/values/strings.xml"
+
+          # App display name. Capacitor seeds strings.xml with appName from
+          # capacitor.config.ts, but force it here to be explicit and to
+          # survive any future drift.
+          python3 <<'PYEOF'
+          import re
+          path = "android/app/src/main/res/values/strings.xml"
+          with open(path, "r") as f:
+              s = f.read()
+          for key in ("app_name", "title_activity_main"):
+              s = re.sub(
+                  r'(<string name="' + key + r'">)[^<]*(</string>)',
+                  r'\g<1>The Dread Directory\g<2>',
+                  s,
+              )
+          with open(path, "w") as f:
+              f.write(s)
+          print(open(path).read())
+          PYEOF
+
+          # Inject the permission set the app needs. The geolocation plugin
+          # auto-adds ACCESS_FINE_LOCATION and ACCESS_COARSE_LOCATION, but
+          # background location, notifications, foreground service, motion,
+          # camera, and media access all need to be declared explicitly.
+          python3 <<'PYEOF'
+          import re
+          path = "android/app/src/main/AndroidManifest.xml"
+          with open(path, "r") as f:
+              s = f.read()
+
+          permissions = [
+              ('android.permission.ACCESS_FINE_LOCATION', None),
+              ('android.permission.ACCESS_COARSE_LOCATION', None),
+              ('android.permission.ACCESS_BACKGROUND_LOCATION', None),
+              ('android.permission.POST_NOTIFICATIONS', None),
+              ('android.permission.FOREGROUND_SERVICE', None),
+              ('android.permission.FOREGROUND_SERVICE_LOCATION', None),
+              ('android.permission.ACTIVITY_RECOGNITION', None),
+              ('android.permission.RECEIVE_BOOT_COMPLETED', None),
+              ('android.permission.WAKE_LOCK', None),
+              ('android.permission.CAMERA', None),
+              ('android.permission.RECORD_AUDIO', None),
+              ('android.permission.READ_MEDIA_IMAGES', None),
+              ('android.permission.READ_MEDIA_VIDEO', None),
+              ('android.permission.READ_EXTERNAL_STORAGE', '32'),  # maxSdkVersion 32
+              ('android.permission.WRITE_EXTERNAL_STORAGE', '28'), # maxSdkVersion 28
+              ('android.permission.INTERNET', None),
+              ('android.permission.ACCESS_NETWORK_STATE', None),
+          ]
+
+          # Build the <uses-permission> block.
+          lines = []
+          for perm, max_sdk in permissions:
+              if max_sdk:
+                  lines.append(f'    <uses-permission android:name="{perm}" android:maxSdkVersion="{max_sdk}" />')
+              else:
+                  lines.append(f'    <uses-permission android:name="{perm}" />')
+          # Camera feature flag — not required, since the app gracefully degrades
+          # if there's no camera (e.g. some tablets).
+          lines.append('    <uses-feature android:name="android.hardware.camera" android:required="false" />')
+          block = "\n".join(lines)
+
+          # Strip any existing <uses-permission> / <uses-feature> lines Capacitor
+          # may have written so we don't get duplicates.
+          s = re.sub(r'\s*<uses-permission [^/]*/>', '', s)
+          s = re.sub(r'\s*<uses-feature [^/]*/>', '', s)
+
+          # Insert our block right after the opening <manifest ...> tag.
+          s = re.sub(
+              r'(<manifest [^>]*>)',
+              r'\1\n' + block,
+              s,
+              count=1,
+          )
+
+          with open(path, "w") as f:
+              f.write(s)
+          print(open(path).read())
+          PYEOF
+      - name: Sync Capacitor to Android
+        script: |
+          npx cap sync android
+      - name: Build unsigned debug APK (smoke test)
+        script: |
+          cd android
+          ./gradlew assembleDebug --no-daemon
+    artifacts:
+      - android/app/build/outputs/**/*.apk
+      - android/app/build/outputs/**/mapping.txt
+    publishing:
+      email:
+        recipients:
+          - drewkrotz@gmail.com
+        notify:
+          success: true
+          failure: true
+
+  # ===========================================================================
+  # ANDROID — Signed Google Play release (AAB).
+  # Mirrors ios-testflight: scaffold platform, generate icons, patch manifest,
+  # sign with the upload keystore, build a release AAB, and (optionally)
+  # publish to a Play Console internal/closed/production track.
+  #
+  # Required Codemagic env vars (group: "google-play"):
+  #   CM_KEYSTORE              - base64-encoded JKS upload keystore
+  #   CM_KEYSTORE_PASSWORD     - keystore password
+  #   CM_KEY_ALIAS             - key alias inside the keystore
+  #   CM_KEY_PASSWORD          - key password
+  #   GCLOUD_SERVICE_ACCOUNT_CREDENTIALS - JSON service account key for
+  #                                        Google Play API (only needed if
+  #                                        auto-publishing; leave blank for
+  #                                        manual upload).
+  # ===========================================================================
+  android-googleplay:
+    name: Android Google Play Build (Signed AAB)
+    instance_type: linux_x2
+    max_build_duration: 90
+    environment:
+      groups:
+        - google-play
+      node: 22
+      java: 21
+      vars:
+        PACKAGE_NAME: "com.sinistertrivia.macabretest"
+    scripts:
+      - name: Install npm dependencies
+        script: |
+          npm install
+      - name: Build web app (Vite)
+        script: |
+          npm run build
+      - name: Add Android platform (Capacitor)
+        script: |
+          npx cap add android
+      - name: Generate Android app icons from appicon_master.b64
+        script: |
+          set -e
+          if [ ! -f "appicon_master.b64" ]; then
+            echo "ERROR: appicon_master.b64 not found at repo root. App icon will be generic."
+            exit 1
+          fi
+          base64 -d appicon_master.b64 > /tmp/icon_master.png
+          echo "Master decoded: $(ls -la /tmp/icon_master.png)"
+
+          RES_DIR="android/app/src/main/res"
+          declare -A SIZES=(
+            [mipmap-mdpi]=48
+            [mipmap-hdpi]=72
+            [mipmap-xhdpi]=96
+            [mipmap-xxhdpi]=144
+            [mipmap-xxxhdpi]=192
+          )
+          for bucket in "${!SIZES[@]}"; do
+            sz="${SIZES[$bucket]}"
+            mkdir -p "$RES_DIR/$bucket"
+            convert /tmp/icon_master.png -resize "${sz}x${sz}" "$RES_DIR/$bucket/ic_launcher.png"
+            convert /tmp/icon_master.png -resize "${sz}x${sz}" "$RES_DIR/$bucket/ic_launcher_round.png"
+            FG_SIZE=$((sz * 108 / 48))
+            convert /tmp/icon_master.png -resize "${FG_SIZE}x${FG_SIZE}" \
+              -gravity center -background none -extent "${FG_SIZE}x${FG_SIZE}" \
+              "$RES_DIR/$bucket/ic_launcher_foreground.png"
+          done
+
+          mkdir -p "$RES_DIR/values"
+          cat > "$RES_DIR/values/ic_launcher_background.xml" <<'XML_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="ic_launcher_background">#000000</color>
+          </resources>
+          XML_EOF
+
+          mkdir -p "$RES_DIR/mipmap-anydpi-v26"
+          cat > "$RES_DIR/mipmap-anydpi-v26/ic_launcher.xml" <<'XML_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_launcher_background" />
+              <foreground android:drawable="@mipmap/ic_launcher_foreground" />
+          </adaptive-icon>
+          XML_EOF
+          cp "$RES_DIR/mipmap-anydpi-v26/ic_launcher.xml" "$RES_DIR/mipmap-anydpi-v26/ic_launcher_round.xml"
+
+          # Also write a high-res Play Store icon (512x512) to the repo root
+          # as an artifact for upload to the Play Console listing.
+          convert /tmp/icon_master.png -resize 512x512 /tmp/play_store_icon_512.png
+          echo "--- Play Store icon ---"
+          ls -la /tmp/play_store_icon_512.png
+      - name: Patch AndroidManifest.xml with permissions and app name
+        script: |
+          set -e
+          python3 <<'PYEOF'
+          import re
+          path = "android/app/src/main/res/values/strings.xml"
+          with open(path, "r") as f:
+              s = f.read()
+          for key in ("app_name", "title_activity_main"):
+              s = re.sub(
+                  r'(<string name="' + key + r'">)[^<]*(</string>)',
+                  r'\g<1>The Dread Directory\g<2>',
+                  s,
+              )
+          with open(path, "w") as f:
+              f.write(s)
+          print(open(path).read())
+          PYEOF
+
+          python3 <<'PYEOF'
+          import re
+          path = "android/app/src/main/AndroidManifest.xml"
+          with open(path, "r") as f:
+              s = f.read()
+
+          permissions = [
+              ('android.permission.ACCESS_FINE_LOCATION', None),
+              ('android.permission.ACCESS_COARSE_LOCATION', None),
+              ('android.permission.ACCESS_BACKGROUND_LOCATION', None),
+              ('android.permission.POST_NOTIFICATIONS', None),
+              ('android.permission.FOREGROUND_SERVICE', None),
+              ('android.permission.FOREGROUND_SERVICE_LOCATION', None),
+              ('android.permission.ACTIVITY_RECOGNITION', None),
+              ('android.permission.RECEIVE_BOOT_COMPLETED', None),
+              ('android.permission.WAKE_LOCK', None),
+              ('android.permission.CAMERA', None),
+              ('android.permission.RECORD_AUDIO', None),
+              ('android.permission.READ_MEDIA_IMAGES', None),
+              ('android.permission.READ_MEDIA_VIDEO', None),
+              ('android.permission.READ_EXTERNAL_STORAGE', '32'),
+              ('android.permission.WRITE_EXTERNAL_STORAGE', '28'),
+              ('android.permission.INTERNET', None),
+              ('android.permission.ACCESS_NETWORK_STATE', None),
+          ]
+
+          lines = []
+          for perm, max_sdk in permissions:
+              if max_sdk:
+                  lines.append(f'    <uses-permission android:name="{perm}" android:maxSdkVersion="{max_sdk}" />')
+              else:
+                  lines.append(f'    <uses-permission android:name="{perm}" />')
+          lines.append('    <uses-feature android:name="android.hardware.camera" android:required="false" />')
+          block = "\n".join(lines)
+
+          s = re.sub(r'\s*<uses-permission [^/]*/>', '', s)
+          s = re.sub(r'\s*<uses-feature [^/]*/>', '', s)
+          s = re.sub(
+              r'(<manifest [^>]*>)',
+              r'\1\n' + block,
+              s,
+              count=1,
+          )
+
+          with open(path, "w") as f:
+              f.write(s)
+          print(open(path).read())
+          PYEOF
+      - name: Configure signing in app/build.gradle
+        script: |
+          set -e
+          # Decode the upload keystore from the base64 env var into a real
+          # JKS file inside the android folder.
+          echo "$CM_KEYSTORE" | base64 --decode > /tmp/upload-keystore.jks
+          ls -la /tmp/upload-keystore.jks
+
+          # Append a signingConfigs block + release config to app/build.gradle.
+          # We use sed/python to patch the generated build.gradle rather than
+          # checking in a custom one, so future Capacitor upgrades don't drift.
+          python3 <<'PYEOF'
+          import re, os
+          path = "android/app/build.gradle"
+          with open(path, "r") as f:
+              s = f.read()
+
+          signing_block = '''
+              signingConfigs {
+                  release {
+                      keyAlias System.getenv("CM_KEY_ALIAS")
+                      keyPassword System.getenv("CM_KEY_PASSWORD")
+                      storeFile file("/tmp/upload-keystore.jks")
+                      storePassword System.getenv("CM_KEYSTORE_PASSWORD")
+                  }
+              }
+          '''
+
+          # Insert signingConfigs right after the opening of `android {`.
+          if "signingConfigs" not in s:
+              s = re.sub(
+                  r'(android\s*\{)',
+                  r'\1\n' + signing_block,
+                  s,
+                  count=1,
+              )
+
+          # Point the release buildType at signingConfig.release.
+          if "buildTypes" in s and "signingConfig signingConfigs.release" not in s:
+              s = re.sub(
+                  r'(buildTypes\s*\{[^}]*release\s*\{)',
+                  r'\1\n            signingConfig signingConfigs.release',
+                  s,
+                  count=1,
+                  flags=re.DOTALL,
+              )
+
+          with open(path, "w") as f:
+              f.write(s)
+          print(open(path).read())
+          PYEOF
+      - name: Set version code and version name
+        script: |
+          set -e
+          # Match the iOS marketing version (1.10). Version code increments
+          # from a floor of 41 to stay above any earlier internal builds,
+          # using the Codemagic build number as the source of truth.
+          VERSION_CODE=$(($BUILD_NUMBER + 40))
+          if [ "$VERSION_CODE" -lt 41 ]; then VERSION_CODE=41; fi
+          export VERSION_CODE
+          python3 <<'PYEOF'
+          import re, os
+          version_code = os.environ["VERSION_CODE"]
+          path = "android/app/build.gradle"
+          with open(path, "r") as f:
+              s = f.read()
+          s = re.sub(r'versionCode\s+\d+', f'versionCode {version_code}', s)
+          s = re.sub(r'versionName\s+"[^"]*"', 'versionName "1.10"', s)
+          with open(path, "w") as f:
+              f.write(s)
+          print("--- versionCode/versionName patched ---")
+          for line in open(path):
+              if 'version' in line.lower():
+                  print(line.rstrip())
+          PYEOF
+      - name: Sync Capacitor to Android
+        script: |
+          npx cap sync android
+      - name: Build signed release AAB
+        script: |
+          cd android
+          ./gradlew bundleRelease --no-daemon
+    artifacts:
+      - android/app/build/outputs/**/*.aab
+      - android/app/build/outputs/**/mapping.txt
+      - /tmp/play_store_icon_512.png
+    publishing:
+      email:
+        recipients:
+          - drewkrotz@gmail.com
+        notify:
+          success: true
+          failure: true
+      # NOTE: Auto-publishing to Play Console is disabled for now. The first
+      # several builds should be uploaded manually so we can verify the AAB
+      # in the Play Console internal testing track before wiring up the
+      # service account. To enable later, uncomment the block below and
+      # add GCLOUD_SERVICE_ACCOUNT_CREDENTIALS to the google-play env group.
+      #
+      # google_play:
+      #   credentials: $GCLOUD_SERVICE_ACCOUNT_CREDENTIALS
+      #   track: internal
+      #   submit_as_draft: true
