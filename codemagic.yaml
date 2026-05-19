@@ -670,12 +670,36 @@ workflows:
                   count=1,
               )
 
+          # ----- Force androidx.lifecycle 2.8.7 across all modules -----
+          # Capacitor 6 + Capacitor plugins reference newer lifecycle classes
+          # (e.g. ReportFragment$ActivityInitializationListener which only
+          # exists in androidx.lifecycle:* 2.7.0+). Plugins like transistorsoft
+          # background-geolocation can pull in older lifecycle versions
+          # transitively, causing NoClassDefFoundError at app startup.
+          # Force-resolve every androidx.lifecycle-* dep to 2.8.7 so the runtime
+          # classpath is consistent.
+          resolution_block = (
+              "\n\n"
+              "// Force consistent androidx.lifecycle version across all modules.\n"
+              "// Without this, plugins pulling in older lifecycle libs cause\n"
+              "// NoClassDefFoundError: ReportFragment$ActivityInitializationListener\n"
+              "// at app startup on Android.\n"
+              "configurations.all {\n"
+              "    resolutionStrategy.eachDependency { details ->\n"
+              "        if (details.requested.group == 'androidx.lifecycle') {\n"
+              "            details.useVersion '2.8.7'\n"
+              "        }\n"
+              "    }\n"
+              "}\n"
+          )
+          if 'androidx.lifecycle' not in s or "useVersion '2.8.7'" not in s:
+              s = s + resolution_block
+
           with open(path, "w") as f:
               f.write(s)
           print("--- android/app/build.gradle after edits ---")
           print(open(path).read())
           PYEOF
-      - name: Sync Capacitor to Android
         script: |
           npx cap sync android
       - name: Build unsigned debug APK (smoke test)
@@ -1004,6 +1028,21 @@ workflows:
                   s,
                   count=1,
               )
+
+          # Force consistent androidx.lifecycle 2.8.7 across all modules.
+          # See android-unsigned-build for full rationale.
+          resolution_block = (
+              "\n\n"
+              "configurations.all {\n"
+              "    resolutionStrategy.eachDependency { details ->\n"
+              "        if (details.requested.group == 'androidx.lifecycle') {\n"
+              "            details.useVersion '2.8.7'\n"
+              "        }\n"
+              "    }\n"
+              "}\n"
+          )
+          if "useVersion '2.8.7'" not in s:
+              s = s + resolution_block
 
           with open(path, "w") as f:
               f.write(s)
