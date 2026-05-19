@@ -58,6 +58,32 @@ import { SINISTER_SITES as FALLBACK_SITES, SinisterSite } from './locations';
 // ---------- Production server URL ----------
 const API_BASE = 'https://dread.sinistertrivia.com';
 
+// ---------- Platform detection ----------
+// Returns true when running on iOS (native app via Capacitor) and false on
+// Android or web. Apple-specific UI (Sign in with Apple buttons, the "Link
+// your Apple ID" migration prompt, etc.) must hide on Android because the
+// @capacitor-community/apple-sign-in plugin only works on iOS. We read
+// Capacitor's platform via the global it injects at runtime (avoids an
+// additional import dependency).
+function isIOS(): boolean {
+  try {
+    // Capacitor injects window.Capacitor with getPlatform() returning
+    // 'ios' | 'android' | 'web'.
+    const cap = (window as any)?.Capacitor;
+    if (cap && typeof cap.getPlatform === 'function') {
+      return cap.getPlatform() === 'ios';
+    }
+    // Fallback for non-Capacitor environments (e.g. dev web preview): use
+    // userAgent. iPad on iOS 13+ reports as Mac, so also check touchpoints.
+    const ua = navigator.userAgent || '';
+    if (/iPad|iPhone|iPod/.test(ua)) return true;
+    if (/Mac/.test(ua) && (navigator as any).maxTouchPoints > 1) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 // ---------- Native: Sign in with Apple ----------
 // Wrapper around @capacitor-community/apple-sign-in. Dynamically imported
 // so a web/desktop preview where the plugin isn't installed doesn't crash
@@ -2715,11 +2741,15 @@ export default function App() {
         if (cancelled) return;
         if (me.handle) {
           setHandle(me.handle);
-          // Migration prompt fires when EITHER recovery method is missing —
-          // we want every account to have both an email and an Apple ID
-          // for redundant recovery. Apple is preferred (one-tap on next
-          // device), email is the universal fallback.
-          if (!me.hasEmail || !me.hasApple) {
+          // Migration prompt fires when a recovery method is missing.
+          // On iOS we want both email and Apple ID for redundant recovery
+          // (Apple is preferred for one-tap on next device, email is the
+          // universal fallback). On Android, Apple Sign-In is unavailable,
+          // so we only require email.
+          const needsRecovery = isIOS()
+            ? (!me.hasEmail || !me.hasApple)
+            : !me.hasEmail;
+          if (needsRecovery) {
             setMigrateHasEmail(me.hasEmail);
             setMigrateHasApple(me.hasApple);
             setShowMigrateEmail(true);
@@ -4502,14 +4532,16 @@ function MigrateEmailModal({ handle, deviceId, hasEmail, hasApple, onDone }: {
             <div style={S.eulaTitle}>One more thing</div>
             <div style={S.eulaBody}>
               <p style={S.eulaPara}>
-                Welcome back, <strong>@{handle}</strong>. {hasEmail && !hasApple
+                Welcome back, <strong>@{handle}</strong>. {!isIOS()
+                  ? "Add a recovery email so you don't lose access if you lose your phone."
+                  : hasEmail && !hasApple
                   ? "Link your Apple ID so you can sign in on a new device with one tap."
                   : !hasEmail && hasApple
                   ? "Add a recovery email as a backup in case you lose access to your Apple ID."
                   : "We need a recovery method on your account so you don't lose access if you lose your phone."}
               </p>
             </div>
-            {!hasApple && (
+            {!hasApple && isIOS() && (
               <button
                 onClick={onApple}
                 disabled={busy}
@@ -4521,7 +4553,7 @@ function MigrateEmailModal({ handle, deviceId, hasEmail, hasApple, onDone }: {
                 {busy ? 'Connecting…' : (hasEmail ? 'Link Apple ID' : 'Sign in with Apple')}
               </button>
             )}
-            {!hasApple && !hasEmail && (
+            {!hasApple && !hasEmail && isIOS() && (
               <div style={S.dreadFeedClaimOrRow}>
                 <div style={S.dreadFeedClaimOrLine} />
                 <span style={S.dreadFeedClaimOrText}>or</span>
@@ -5115,28 +5147,36 @@ function DreadFeedClaimScreen({ deviceId, onClaimed }: {
           <>
             <div style={S.dreadFeedClaimTitle}>Create your account</div>
             <div style={S.dreadFeedClaimSubtitle}>
-              Sign in with Apple to get started in one tap.
+              {isIOS()
+                ? 'Sign in with Apple to get started in one tap.'
+                : 'Sign in with your email to get started.'}
             </div>
 
-            <button
-              onClick={onAppleTap}
-              disabled={appleBusy}
-              style={S.dreadFeedAppleBtn}
-              aria-label="Sign in with Apple"
-            >
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="#FFFFFF" style={{ marginRight: 8 }}>
-                <path d="M17.05 20.28c-.98.95-2.05.8-3.08.35-1.09-.46-2.09-.48-3.24 0-1.44.62-2.2.44-3.06-.35C2.79 15.25 3.51 7.59 9.05 7.31c1.35.07 2.29.74 3.08.8 1.18-.24 2.31-.93 3.57-.84 1.51.12 2.65.72 3.4 1.8-3.12 1.87-2.38 5.98.48 7.13-.57 1.5-1.31 2.99-2.54 4.09zM12.03 7.25c-.15-2.23 1.66-4.07 3.74-4.25.29 2.58-2.34 4.5-3.74 4.25z" />
-              </svg>
-              {appleBusy ? 'Connecting…' : 'Sign in with Apple'}
-            </button>
+            {isIOS() && (
+              <>
+                <button
+                  onClick={onAppleTap}
+                  disabled={appleBusy}
+                  style={S.dreadFeedAppleBtn}
+                  aria-label="Sign in with Apple"
+                >
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="#FFFFFF" style={{ marginRight: 8 }}>
+                    <path d="M17.05 20.28c-.98.95-2.05.8-3.08.35-1.09-.46-2.09-.48-3.24 0-1.44.62-2.2.44-3.06-.35C2.79 15.25 3.51 7.59 9.05 7.31c1.35.07 2.29.74 3.08.8 1.18-.24 2.31-.93 3.57-.84 1.51.12 2.65.72 3.4 1.8-3.12 1.87-2.38 5.98.48 7.13-.57 1.5-1.31 2.99-2.54 4.09zM12.03 7.25c-.15-2.23 1.66-4.07 3.74-4.25.29 2.58-2.34 4.5-3.74 4.25z" />
+                  </svg>
+                  {appleBusy ? 'Connecting…' : 'Sign in with Apple'}
+                </button>
 
-            {claimErr && <div style={S.dreadFeedClaimError}>{claimErr}</div>}
+                {claimErr && <div style={S.dreadFeedClaimError}>{claimErr}</div>}
 
-            <div style={S.dreadFeedClaimOrRow}>
-              <div style={S.dreadFeedClaimOrLine} />
-              <span style={S.dreadFeedClaimOrText}>or</span>
-              <div style={S.dreadFeedClaimOrLine} />
-            </div>
+                <div style={S.dreadFeedClaimOrRow}>
+                  <div style={S.dreadFeedClaimOrLine} />
+                  <span style={S.dreadFeedClaimOrText}>or</span>
+                  <div style={S.dreadFeedClaimOrLine} />
+                </div>
+              </>
+            )}
+
+            {!isIOS() && claimErr && <div style={S.dreadFeedClaimError}>{claimErr}</div>}
 
             <button
               onClick={() => {
@@ -5268,7 +5308,7 @@ function DreadFeedClaimScreen({ deviceId, onClaimed }: {
               onClick={() => { setStep('entry'); setClaimErr(null); }}
               style={S.dreadFeedRecoverLink}
             >
-              ← Use Sign in with Apple instead
+              {isIOS() ? '← Use Sign in with Apple instead' : '← Back'}
             </button>
           </>
         )}
@@ -12636,8 +12676,9 @@ function AboutView({ onBack }: { onBack: () => void }) {
         </p>
         <p style={S.aboutPara}>
           <b>2. Grant location access.</b> Choose "Allow While Using App" the first time you open the map.
-          For background notifications when you're near a Dread Location, go to iOS Settings → The Dread
-          Directory → Location → and switch to "Always".
+          For background notifications when you're near a Dread Location, {isIOS()
+            ? 'go to iOS Settings → The Dread Directory → Location → and switch to "Always".'
+            : 'go to your device Settings → Apps → The Dread Directory → Permissions → Location → and choose "Allow all the time".'}
         </p>
         <p style={S.aboutPara}>
           <b>3. Allow notifications.</b> This lets the app ping you when you walk within range of a site,
@@ -12646,7 +12687,9 @@ function AboutView({ onBack }: { onBack: () => void }) {
         <p style={S.aboutPara}>
           <b>4. Claim a handle when you're ready to participate.</b> To post to DreadFeed, comment, submit
           a new Dread Location, or like other people's posts, you'll need a handle. Tap any of those
-          actions and the app will walk you through Sign in with Apple — it takes one tap.
+          actions and the app will walk you through {isIOS()
+            ? 'Sign in with Apple — it takes one tap.'
+            : 'a quick email sign-up.'}
         </p>
 
         <div style={S.aboutSectionHeader}>Browsing Dread Locations</div>
@@ -14648,7 +14691,9 @@ function HandleField({ deviceId, handle, submitter, setSubmitter, onClaimed, onG
         padding: 14,
       }}>
         <div style={{ color: BONE, fontSize: 14, lineHeight: 1.4 }}>
-          You don't have a handle yet. Create one in DreadFeed — it takes one tap with Sign in with Apple, or you can use email.
+          You don't have a handle yet. Create one in DreadFeed — {isIOS()
+            ? 'it takes one tap with Sign in with Apple, or you can use email.'
+            : 'sign up with email in a few seconds.'}
         </div>
         {onGoToClaim && (
           <button
