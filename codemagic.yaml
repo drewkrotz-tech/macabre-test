@@ -407,7 +407,7 @@ workflows:
   # ===========================================================================
   android-unsigned-build:
     name: Android Unsigned Build (Pre-signing Smoke Test)
-    instance_type: linux
+    instance_type: mac_mini_m2
     max_build_duration: 60
     environment:
       node: 22
@@ -430,7 +430,7 @@ workflows:
             exit 1
           fi
           # Decode the 1024x1024 master PNG.
-          base64 -d appicon_master.b64 > /tmp/icon_master.png
+          base64 -D -i appicon_master.b64 -o /tmp/icon_master.png
           echo "Master decoded: $(ls -la /tmp/icon_master.png)"
 
           RES_DIR="android/app/src/main/res"
@@ -447,18 +447,14 @@ workflows:
           for bucket in "${!SIZES[@]}"; do
             sz="${SIZES[$bucket]}"
             mkdir -p "$RES_DIR/$bucket"
-            # Standard square launcher icon.
-            convert /tmp/icon_master.png -resize "${sz}x${sz}" "$RES_DIR/$bucket/ic_launcher.png"
+            # Standard square launcher icon (pre-Android-8 devices).
+            sips -z "$sz" "$sz" /tmp/icon_master.png --out "$RES_DIR/$bucket/ic_launcher.png" > /dev/null
             # Round variant — Android 7.1+ uses this when the launcher requests circle icons.
-            convert /tmp/icon_master.png -resize "${sz}x${sz}" "$RES_DIR/$bucket/ic_launcher_round.png"
-            # Adaptive icon foreground layer. Adaptive icons render the foreground
-            # on top of a separately defined background, so the foreground should
-            # be ~108dp with the visible art centered in ~66dp. We over-resize
-            # to give the launcher safe-zone padding.
-            FG_SIZE=$((sz * 108 / 48))
-            convert /tmp/icon_master.png -resize "${FG_SIZE}x${FG_SIZE}" \
-              -gravity center -background none -extent "${FG_SIZE}x${FG_SIZE}" \
-              "$RES_DIR/$bucket/ic_launcher_foreground.png"
+            sips -z "$sz" "$sz" /tmp/icon_master.png --out "$RES_DIR/$bucket/ic_launcher_round.png" > /dev/null
+            # Adaptive icon foreground layer (Android 8+). The art will sit on
+            # the configured background color. Same square art for foreground —
+            # Android applies the safe-zone crop automatically.
+            sips -z "$sz" "$sz" /tmp/icon_master.png --out "$RES_DIR/$bucket/ic_launcher_foreground.png" > /dev/null
           done
 
           # Write the adaptive icon background color (Android 8+).
@@ -605,7 +601,7 @@ workflows:
   # ===========================================================================
   android-googleplay:
     name: Android Google Play Build (Signed AAB)
-    instance_type: linux
+    instance_type: mac_mini_m2
     max_build_duration: 90
     environment:
       groups:
@@ -631,7 +627,7 @@ workflows:
             echo "ERROR: appicon_master.b64 not found at repo root. App icon will be generic."
             exit 1
           fi
-          base64 -d appicon_master.b64 > /tmp/icon_master.png
+          base64 -D -i appicon_master.b64 -o /tmp/icon_master.png
           echo "Master decoded: $(ls -la /tmp/icon_master.png)"
 
           RES_DIR="android/app/src/main/res"
@@ -645,12 +641,9 @@ workflows:
           for bucket in "${!SIZES[@]}"; do
             sz="${SIZES[$bucket]}"
             mkdir -p "$RES_DIR/$bucket"
-            convert /tmp/icon_master.png -resize "${sz}x${sz}" "$RES_DIR/$bucket/ic_launcher.png"
-            convert /tmp/icon_master.png -resize "${sz}x${sz}" "$RES_DIR/$bucket/ic_launcher_round.png"
-            FG_SIZE=$((sz * 108 / 48))
-            convert /tmp/icon_master.png -resize "${FG_SIZE}x${FG_SIZE}" \
-              -gravity center -background none -extent "${FG_SIZE}x${FG_SIZE}" \
-              "$RES_DIR/$bucket/ic_launcher_foreground.png"
+            sips -z "$sz" "$sz" /tmp/icon_master.png --out "$RES_DIR/$bucket/ic_launcher.png" > /dev/null
+            sips -z "$sz" "$sz" /tmp/icon_master.png --out "$RES_DIR/$bucket/ic_launcher_round.png" > /dev/null
+            sips -z "$sz" "$sz" /tmp/icon_master.png --out "$RES_DIR/$bucket/ic_launcher_foreground.png" > /dev/null
           done
 
           mkdir -p "$RES_DIR/values"
@@ -671,9 +664,9 @@ workflows:
           XML_EOF
           cp "$RES_DIR/mipmap-anydpi-v26/ic_launcher.xml" "$RES_DIR/mipmap-anydpi-v26/ic_launcher_round.xml"
 
-          # Also write a high-res Play Store icon (512x512) to the repo root
-          # as an artifact for upload to the Play Console listing.
-          convert /tmp/icon_master.png -resize 512x512 /tmp/play_store_icon_512.png
+          # Also write a high-res Play Store icon (512x512) for upload to
+          # the Play Console listing.
+          sips -z 512 512 /tmp/icon_master.png --out /tmp/play_store_icon_512.png > /dev/null
           echo "--- Play Store icon ---"
           ls -la /tmp/play_store_icon_512.png
       - name: Patch AndroidManifest.xml with permissions and app name
@@ -748,7 +741,7 @@ workflows:
           set -e
           # Decode the upload keystore from the base64 env var into a real
           # JKS file inside the android folder.
-          echo "$CM_KEYSTORE" | base64 --decode > /tmp/upload-keystore.jks
+          echo "$CM_KEYSTORE" | base64 -D > /tmp/upload-keystore.jks
           ls -la /tmp/upload-keystore.jks
 
           # Append a signingConfigs block + release config to app/build.gradle.
