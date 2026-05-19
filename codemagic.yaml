@@ -580,8 +580,8 @@ workflows:
           path = "android/variables.gradle"
           with open(path, "r") as f:
               s = f.read()
-          s = re.sub(r'compileSdkVersion\s*=\s*\d+', 'compileSdkVersion = 34', s)
-          s = re.sub(r'targetSdkVersion\s*=\s*\d+', 'targetSdkVersion = 34', s)
+          s = re.sub(r'compileSdkVersion\s*=\s*\d+', 'compileSdkVersion = 35', s)
+          s = re.sub(r'targetSdkVersion\s*=\s*\d+', 'targetSdkVersion = 35', s)
           s = re.sub(r'minSdkVersion\s*=\s*\d+', 'minSdkVersion = 24', s)
           # Add playServicesLocationVersion if missing (required by bg-geolocation).
           if 'playServicesLocationVersion' not in s:
@@ -627,6 +627,17 @@ workflows:
                   count=1,
                   flags=re.DOTALL,
               )
+
+          # Bump Android Gradle Plugin from Capacitor 6's default 8.2.1 to 8.7.2.
+          # AGP 8.2.1 max-supports compileSdk 34 and refuses libs targeting 35
+          # (like androidx.work 2.10.0, pulled in transitively by plugins).
+          # AGP 8.7.x supports compileSdk 35 and is compatible with Gradle 8.9
+          # (which Capacitor 6 uses).
+          s = re.sub(
+              r"classpath\s+['\"]com\.android\.tools\.build:gradle:[^'\"]+['\"]",
+              "classpath 'com.android.tools.build:gradle:8.7.2'",
+              s,
+          )
 
           with open(path, "w") as f:
               f.write(s)
@@ -680,21 +691,13 @@ workflows:
           # classpath is consistent.
           resolution_block = (
               "\n\n"
-              "// Force consistent dependency versions across all modules.\n"
-              "//  - androidx.lifecycle 2.8.7: prevents NoClassDefFoundError\n"
-              "//    ReportFragment$ActivityInitializationListener at app startup\n"
-              "//    when plugins pull in older lifecycle libs.\n"
-              "//  - androidx.work 2.9.1: prevents 2.10.0 from being pulled in,\n"
-              "//    which requires compileSdk 35. We compile against SDK 34 because\n"
-              "//    Capacitor 6 ships with Android Gradle Plugin 8.2.1, which only\n"
-              "//    supports up to compileSdk 34.\n"
+              "// Force consistent androidx.lifecycle version across all modules.\n"
+              "// Prevents NoClassDefFoundError: ReportFragment$ActivityInitializationListener\n"
+              "// at app startup when plugins pull in older lifecycle libs.\n"
               "configurations.all {\n"
               "    resolutionStrategy.eachDependency { details ->\n"
               "        if (details.requested.group == 'androidx.lifecycle') {\n"
               "            details.useVersion '2.8.7'\n"
-              "        }\n"
-              "        if (details.requested.group == 'androidx.work') {\n"
-              "            details.useVersion '2.9.1'\n"
               "        }\n"
               "    }\n"
               "}\n"
@@ -963,8 +966,8 @@ workflows:
           path = "android/variables.gradle"
           with open(path, "r") as f:
               s = f.read()
-          s = re.sub(r'compileSdkVersion\s*=\s*\d+', 'compileSdkVersion = 34', s)
-          s = re.sub(r'targetSdkVersion\s*=\s*\d+', 'targetSdkVersion = 34', s)
+          s = re.sub(r'compileSdkVersion\s*=\s*\d+', 'compileSdkVersion = 35', s)
+          s = re.sub(r'targetSdkVersion\s*=\s*\d+', 'targetSdkVersion = 35', s)
           s = re.sub(r'minSdkVersion\s*=\s*\d+', 'minSdkVersion = 24', s)
           if 'playServicesLocationVersion' not in s:
               s = re.sub(
@@ -1001,6 +1004,13 @@ workflows:
                   flags=re.DOTALL,
               )
 
+          # Bump AGP to 8.7.2 — supports compileSdk 35.
+          s = re.sub(
+              r"classpath\s+['\"]com\.android\.tools\.build:gradle:[^'\"]+['\"]",
+              "classpath 'com.android.tools.build:gradle:8.7.2'",
+              s,
+          )
+
           with open(path, "w") as f:
               f.write(s)
           print("--- android/build.gradle after edits ---")
@@ -1036,7 +1046,7 @@ workflows:
                   count=1,
               )
 
-          # Force consistent dependency versions across all modules.
+          # Force consistent androidx.lifecycle version across all modules.
           # See android-unsigned-build for full rationale.
           resolution_block = (
               "\n\n"
@@ -1044,9 +1054,6 @@ workflows:
               "    resolutionStrategy.eachDependency { details ->\n"
               "        if (details.requested.group == 'androidx.lifecycle') {\n"
               "            details.useVersion '2.8.7'\n"
-              "        }\n"
-              "        if (details.requested.group == 'androidx.work') {\n"
-              "            details.useVersion '2.9.1'\n"
               "        }\n"
               "    }\n"
               "}\n"
