@@ -437,15 +437,13 @@ workflows:
           # Android density buckets for the legacy launcher icon (ic_launcher.png)
           # and the round variant (ic_launcher_round.png). These are the fallback
           # icons used on pre-Android-8 devices; adaptive icons handle 8+.
-          declare -A SIZES=(
-            [mipmap-mdpi]=48
-            [mipmap-hdpi]=72
-            [mipmap-xhdpi]=96
-            [mipmap-xxhdpi]=144
-            [mipmap-xxxhdpi]=192
-          )
-          for bucket in "${!SIZES[@]}"; do
-            sz="${SIZES[$bucket]}"
+          # NOTE: macOS ships bash 3.2 which lacks associative arrays, so we use
+          # parallel arrays with a single iteration loop.
+          BUCKETS=(mipmap-mdpi mipmap-hdpi mipmap-xhdpi mipmap-xxhdpi mipmap-xxxhdpi)
+          SIZES=(48 72 96 144 192)
+          for i in 0 1 2 3 4; do
+            bucket="${BUCKETS[$i]}"
+            sz="${SIZES[$i]}"
             mkdir -p "$RES_DIR/$bucket"
             # Standard square launcher icon (pre-Android-8 devices).
             sips -z "$sz" "$sz" /tmp/icon_master.png --out "$RES_DIR/$bucket/ic_launcher.png" > /dev/null
@@ -631,15 +629,12 @@ workflows:
           echo "Master decoded: $(ls -la /tmp/icon_master.png)"
 
           RES_DIR="android/app/src/main/res"
-          declare -A SIZES=(
-            [mipmap-mdpi]=48
-            [mipmap-hdpi]=72
-            [mipmap-xhdpi]=96
-            [mipmap-xxhdpi]=144
-            [mipmap-xxxhdpi]=192
-          )
-          for bucket in "${!SIZES[@]}"; do
-            sz="${SIZES[$bucket]}"
+          # NOTE: macOS bash 3.2 doesn't support associative arrays.
+          BUCKETS=(mipmap-mdpi mipmap-hdpi mipmap-xhdpi mipmap-xxhdpi mipmap-xxxhdpi)
+          SIZES=(48 72 96 144 192)
+          for i in 0 1 2 3 4; do
+            bucket="${BUCKETS[$i]}"
+            sz="${SIZES[$i]}"
             mkdir -p "$RES_DIR/$bucket"
             sips -z "$sz" "$sz" /tmp/icon_master.png --out "$RES_DIR/$bucket/ic_launcher.png" > /dev/null
             sips -z "$sz" "$sz" /tmp/icon_master.png --out "$RES_DIR/$bucket/ic_launcher_round.png" > /dev/null
