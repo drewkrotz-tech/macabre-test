@@ -710,6 +710,7 @@ workflows:
           print("--- android/app/build.gradle after edits ---")
           print(open(path).read())
           PYEOF
+      - name: Sync Capacitor to Android
         script: |
           npx cap sync android
       - name: Build unsigned debug APK (smoke test)
