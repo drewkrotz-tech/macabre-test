@@ -645,6 +645,32 @@ workflows:
           print(open(path).read())
           PYEOF
 
+          # ----- 2b. Bump Gradle wrapper version to 8.9 -----
+          # AGP 8.7.x requires Gradle 8.9+. Capacitor 6 scaffolds Gradle 8.2.1
+          # in android/gradle/wrapper/gradle-wrapper.properties. Without this
+          # bump, the build fails with:
+          #   "Minimum supported Gradle version is 8.9. Current version is 8.2.1"
+          python3 <<'PYEOF'
+          import re
+          path = "android/gradle/wrapper/gradle-wrapper.properties"
+          with open(path, "r") as f:
+              s = f.read()
+          s = re.sub(
+              r"gradle-[\d.]+-all\.zip",
+              "gradle-8.9-all.zip",
+              s,
+          )
+          s = re.sub(
+              r"gradle-[\d.]+-bin\.zip",
+              "gradle-8.9-bin.zip",
+              s,
+          )
+          with open(path, "w") as f:
+              f.write(s)
+          print("--- gradle-wrapper.properties after edits ---")
+          print(open(path).read())
+          PYEOF
+
           # ----- 3. Apply app.gradle from background-geolocation in app/build.gradle -----
           # Per transistorsoft Android install docs, the background-geolocation
           # plugin requires its own app.gradle to be applied at the top of the
@@ -1015,6 +1041,20 @@ workflows:
           with open(path, "w") as f:
               f.write(s)
           print("--- android/build.gradle after edits ---")
+          print(open(path).read())
+          PYEOF
+
+          # ----- 2b. Bump Gradle wrapper to 8.9 (required by AGP 8.7.x) -----
+          python3 <<'PYEOF'
+          import re
+          path = "android/gradle/wrapper/gradle-wrapper.properties"
+          with open(path, "r") as f:
+              s = f.read()
+          s = re.sub(r"gradle-[\d.]+-all\.zip", "gradle-8.9-all.zip", s)
+          s = re.sub(r"gradle-[\d.]+-bin\.zip", "gradle-8.9-bin.zip", s)
+          with open(path, "w") as f:
+              f.write(s)
+          print("--- gradle-wrapper.properties after edits ---")
           print(open(path).read())
           PYEOF
 
