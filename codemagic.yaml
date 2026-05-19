@@ -563,12 +563,18 @@ workflows:
               f.write(s)
           print(open(path).read())
           PYEOF
-      - name: Bump Android SDK versions to 35
+      - name: Configure Android project for transistorsoft plugins and SDK 35
         script: |
-          # Capacitor 6 scaffolds android/variables.gradle with compileSdkVersion
-          # and targetSdkVersion = 34. Some plugin transitive deps (androidx.work
-          # 2.10.0 specifically) require API 35+. Bump both to 35 here so Gradle
-          # accepts the dependency graph.
+          set -e
+          # ----- 1. Bump SDK versions in variables.gradle -----
+          # Capacitor 6 defaults: compileSdkVersion=34, targetSdkVersion=34,
+          #   minSdkVersion=22. We need:
+          # - compile/target=35 because androidx.work 2.10.0 (transitive dep)
+          #   requires API 35+
+          # - min=24 because tslocationmanager (transistorsoft's native AAR)
+          #   requires API 24+
+          # Also pin playServicesLocationVersion which the bg-geolocation
+          # plugin reads from variables.gradle.
           python3 <<'PYEOF'
           import re
           path = "android/variables.gradle"
@@ -576,9 +582,97 @@ workflows:
               s = f.read()
           s = re.sub(r'compileSdkVersion\s*=\s*\d+', 'compileSdkVersion = 35', s)
           s = re.sub(r'targetSdkVersion\s*=\s*\d+', 'targetSdkVersion = 35', s)
+          s = re.sub(r'minSdkVersion\s*=\s*\d+', 'minSdkVersion = 24', s)
+          # Add playServicesLocationVersion if missing (required by bg-geolocation).
+          if 'playServicesLocationVersion' not in s:
+              # Insert inside the existing ext { ... } block.
+              s = re.sub(
+                  r'(ext\s*\{)',
+                  r"\1\n    playServicesLocationVersion = '21.0.1'",
+                  s,
+                  count=1,
+              )
           with open(path, "w") as f:
               f.write(s)
-          print("--- variables.gradle after SDK bump ---")
+          print("--- variables.gradle after edits ---")
+          print(open(path).read())
+          PYEOF
+
+          # ----- 2. Add transistorsoft maven repos to android/build.gradle -----
+          # The background-geolocation and background-fetch plugins ship their
+          # .aar files in their own node_modules/libs folders and require their
+          # paths to be registered as maven repos in allprojects.repositories.
+          # Capacitor's scaffolded android/build.gradle has google() + mavenCentral()
+          # but not these. Without them, Gradle can't resolve tslocationmanager.aar
+          # or tsbackgroundfetch.aar and fails at :app:checkDebugAarMetadata.
+          python3 <<'PYEOF'
+          import re
+          path = "android/build.gradle"
+          with open(path, "r") as f:
+              s = f.read()
+
+          repo_block = (
+              "\n        maven { url(\"${project(':transistorsoft-capacitor-background-geolocation').projectDir}/libs\") }"
+              "\n        maven { url(\"${project(':transistorsoft-capacitor-background-fetch').projectDir}/libs\") }"
+              "\n        maven { url 'https://developer.huawei.com/repo/' }"
+          )
+
+          # Only insert once.
+          if 'transistorsoft-capacitor-background-geolocation' not in s:
+              # Inject right after the `mavenCentral()` line inside allprojects.repositories.
+              s = re.sub(
+                  r'(allprojects\s*\{[^}]*?repositories\s*\{[^}]*?mavenCentral\(\))',
+                  r'\1' + repo_block,
+                  s,
+                  count=1,
+                  flags=re.DOTALL,
+              )
+
+          with open(path, "w") as f:
+              f.write(s)
+          print("--- android/build.gradle after edits ---")
+          print(open(path).read())
+          PYEOF
+
+          # ----- 3. Apply app.gradle from background-geolocation in app/build.gradle -----
+          # Per transistorsoft Android install docs, the background-geolocation
+          # plugin requires its own app.gradle to be applied at the top of the
+          # app module's build.gradle. This wires in tslocationmanager.aar and
+          # the proguard rules. Without it, the plugin won't link.
+          python3 <<'PYEOF'
+          import re
+          path = "android/app/build.gradle"
+          with open(path, "r") as f:
+              s = f.read()
+
+          apply_line = (
+              "Project background_geolocation = "
+              "project(':transistorsoft-capacitor-background-geolocation')\n"
+              "apply from: \"${background_geolocation.projectDir}/app.gradle\"\n"
+          )
+
+          if 'background_geolocation.projectDir' not in s:
+              # Insert right after the `apply plugin: 'com.android.application'` line.
+              s = re.sub(
+                  r"(apply plugin: 'com\.android\.application'\s*\n)",
+                  r'\1\n' + apply_line + '\n',
+                  s,
+                  count=1,
+              )
+
+          # Also append the bg-geolocation proguard-rules to the release
+          # buildType's proguardFiles list, if release is configured.
+          if 'background_geolocation.projectDir}/proguard-rules.pro' not in s:
+              s = re.sub(
+                  r"(proguardFiles getDefaultProguardFile\('proguard-android\.txt'\),\s*'proguard-rules\.pro')",
+                  r'\1, "${background_geolocation.projectDir}/proguard-rules.pro"',
+                  s,
+                  count=1,
+              )
+
+          with open(path, "w") as f:
+              f.write(s)
+          print("--- android/app/build.gradle after edits ---")
           print(open(path).read())
           PYEOF
       - name: Sync Capacitor to Android
@@ -587,7 +681,9 @@ workflows:
       - name: Build unsigned debug APK (smoke test)
         script: |
           cd android
-          ./gradlew assembleDebug --no-daemon
+          # --stacktrace + --info give us much more diagnostic output if
+          # something fails downstream.
+          ./gradlew assembleDebug --no-daemon --stacktrace --info
     artifacts:
       - android/app/build/outputs/**/*.apk
       - android/app/build/outputs/**/mapping.txt
@@ -824,10 +920,13 @@ workflows:
               if 'version' in line.lower():
                   print(line.rstrip())
           PYEOF
-      - name: Bump Android SDK versions to 35
+      - name: Configure Android project for transistorsoft plugins and SDK 35
         script: |
-          # Same SDK bump as the unsigned workflow; needed for androidx.work
-          # 2.10.0 and other 35-targeting transitive deps.
+          set -e
+          # Same as android-unsigned-build's Configure Android step. See that
+          # workflow for full rationale on each block.
+
+          # ----- 1. SDK versions in variables.gradle -----
           python3 <<'PYEOF'
           import re
           path = "android/variables.gradle"
@@ -835,9 +934,80 @@ workflows:
               s = f.read()
           s = re.sub(r'compileSdkVersion\s*=\s*\d+', 'compileSdkVersion = 35', s)
           s = re.sub(r'targetSdkVersion\s*=\s*\d+', 'targetSdkVersion = 35', s)
+          s = re.sub(r'minSdkVersion\s*=\s*\d+', 'minSdkVersion = 24', s)
+          if 'playServicesLocationVersion' not in s:
+              s = re.sub(
+                  r'(ext\s*\{)',
+                  r"\1\n    playServicesLocationVersion = '21.0.1'",
+                  s,
+                  count=1,
+              )
           with open(path, "w") as f:
               f.write(s)
-          print("--- variables.gradle after SDK bump ---")
+          print("--- variables.gradle after edits ---")
+          print(open(path).read())
+          PYEOF
+
+          # ----- 2. transistorsoft maven repos in android/build.gradle -----
+          python3 <<'PYEOF'
+          import re
+          path = "android/build.gradle"
+          with open(path, "r") as f:
+              s = f.read()
+
+          repo_block = (
+              "\n        maven { url(\"${project(':transistorsoft-capacitor-background-geolocation').projectDir}/libs\") }"
+              "\n        maven { url(\"${project(':transistorsoft-capacitor-background-fetch').projectDir}/libs\") }"
+              "\n        maven { url 'https://developer.huawei.com/repo/' }"
+          )
+
+          if 'transistorsoft-capacitor-background-geolocation' not in s:
+              s = re.sub(
+                  r'(allprojects\s*\{[^}]*?repositories\s*\{[^}]*?mavenCentral\(\))',
+                  r'\1' + repo_block,
+                  s,
+                  count=1,
+                  flags=re.DOTALL,
+              )
+
+          with open(path, "w") as f:
+              f.write(s)
+          print("--- android/build.gradle after edits ---")
+          print(open(path).read())
+          PYEOF
+
+          # ----- 3. Apply bg-geolocation app.gradle in app/build.gradle -----
+          python3 <<'PYEOF'
+          import re
+          path = "android/app/build.gradle"
+          with open(path, "r") as f:
+              s = f.read()
+
+          apply_line = (
+              "Project background_geolocation = "
+              "project(':transistorsoft-capacitor-background-geolocation')\n"
+              "apply from: \"${background_geolocation.projectDir}/app.gradle\"\n"
+          )
+
+          if 'background_geolocation.projectDir' not in s:
+              s = re.sub(
+                  r"(apply plugin: 'com\.android\.application'\s*\n)",
+                  r'\1\n' + apply_line + '\n',
+                  s,
+                  count=1,
+              )
+
+          if 'background_geolocation.projectDir}/proguard-rules.pro' not in s:
+              s = re.sub(
+                  r"(proguardFiles getDefaultProguardFile\('proguard-android\.txt'\),\s*'proguard-rules\.pro')",
+                  r'\1, "${background_geolocation.projectDir}/proguard-rules.pro"',
+                  s,
+                  count=1,
+              )
+
+          with open(path, "w") as f:
+              f.write(s)
+          print("--- android/app/build.gradle after edits ---")
           print(open(path).read())
           PYEOF
       - name: Sync Capacitor to Android
@@ -846,7 +1016,7 @@ workflows:
       - name: Build signed release AAB
         script: |
           cd android
-          ./gradlew bundleRelease --no-daemon
+          ./gradlew bundleRelease --no-daemon --stacktrace --info
     artifacts:
       - android/app/build/outputs/**/*.aab
       - android/app/build/outputs/**/mapping.txt
