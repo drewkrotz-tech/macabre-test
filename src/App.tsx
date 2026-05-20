@@ -9064,109 +9064,140 @@ function PollComposerSheet({ handle, deviceId, onClose, onPosted }: {
 }
 
 // ---------- YouTubeEmbed ----------
-// Renders a YouTube video post inline. Uses YouTube's iframe API (via
-// enablejsapi=1 + origin + postMessage) so we can pause the player when
-// the iframe scrolls out of view. Without that, scrolling past a playing
-// video lets it keep playing and bleed audio over other posts — exactly
-// the IG/TikTok auto-pause behavior people expect from a feed.
+// Renders a YouTube video post inline using YouTube's official IFrame
+// Player API (https://www.youtube.com/iframe_api), NOT a direct <iframe>.
+//
+// Why the indirection: Capacitor on iOS serves the app from
+// `capacitor://localhost`, a non-standard scheme that WKWebView won't
+// accept as a Referer source. A direct YouTube /embed/ iframe checks
+// the parent's Referer to validate the embedding context and returns
+// "Error 153: Video player configuration error" when the Referer is
+// missing or has a non-http scheme. The Capacitor docs explicitly
+// state iosScheme cannot be set to "http" or "https" — WKWebView
+// reserves those — so the parent scheme can't be made standard.
+//
+// The IFrame Player API solves this differently. The script at
+// www.youtube.com/iframe_api creates and manages the player from
+// inside the embed itself; the auth check happens via JavaScript +
+// the `origin` URL param rather than via Referer header. This works
+// inside WKWebView regardless of the parent's scheme.
 //
 // Behavior:
-//   - Iframe enters viewport (>=25% visible): no auto-play (YouTube
-//     blocks autoplay-with-sound anyway; user taps the player to start).
-//   - Iframe leaves viewport (<25% visible): we postMessage 'pauseVideo'
-//     to halt playback. User can re-enter and tap to resume.
-//
-// WKWebView fix bundled in: youtube-nocookie.com domain + referrerPolicy
-// "origin" so the Referer survives the capacitor:// → https: scheme
-// transition. Without these, YouTube returns Error 153.
-//
-// DIAGNOSTIC PANEL: a tappable green overlay shows live environment info
-// (protocol, origin, document.referrer, iframe URL, iframe load status,
-// and YouTube postMessage events). Helps debug Error 153 in the live
-// app without DevTools. Tap "▾ DIAG" red button to collapse. Tap the
-// panel itself to copy all contents to clipboard. Remove this panel
-// once iOS playback is confirmed working.
+//   - Player mounts when the post first renders.
+//   - IntersectionObserver pauses playback when the iframe scrolls
+//     out of view (>=75% off-screen) so audio doesn't bleed across
+//     feed cards. Matches the native video post behavior.
+//   - User taps the player to play/pause via YouTube's native controls.
+//   - Fullscreen via YouTube's built-in fullscreen button.
+
+// Module-level cache of the IFrame API loader promise. We only ever
+// inject the <script> tag once per app session; every YouTubeEmbed
+// after the first reuses the same loader.
+let _ytApiPromise: Promise<any> | null = null;
+function loadYouTubeIframeAPI(): Promise<any> {
+  if (_ytApiPromise) return _ytApiPromise;
+  _ytApiPromise = new Promise((resolve, reject) => {
+    if (typeof window === 'undefined') {
+      reject(new Error('no window'));
+      return;
+    }
+    // If YT is already defined (e.g. another component loaded it earlier
+    // and we're past the cache miss), resolve immediately.
+    if ((window as any).YT && (window as any).YT.Player) {
+      resolve((window as any).YT);
+      return;
+    }
+    // YouTube's loader calls window.onYouTubeIframeAPIReady() once ready.
+    // We need to preserve any existing handler in case the host page
+    // installed one — though in our case nothing else uses this.
+    const prev = (window as any).onYouTubeIframeAPIReady;
+    (window as any).onYouTubeIframeAPIReady = () => {
+      try { if (typeof prev === 'function') prev(); } catch { /* silent */ }
+      resolve((window as any).YT);
+    };
+    const tag = document.createElement('script');
+    tag.src = 'https://www.youtube.com/iframe_api';
+    tag.async = true;
+    tag.onerror = () => reject(new Error('failed to load YouTube IFrame API'));
+    document.head.appendChild(tag);
+  });
+  return _ytApiPromise;
+}
+
 function YouTubeEmbed({ youtubeId }: { youtubeId: string }) {
-  const iframeRef = useRef<HTMLIFrameElement | null>(null);
-  const [expanded, setExpanded] = useState(true);
-  const [messages, setMessages] = useState<string[]>([]);
-  const [iframeStatus, setIframeStatus] = useState<'pending' | 'loaded' | 'error'>('pending');
-
-  // Capture environment info once at mount. These are the fields most
-  // likely to matter for Error 153 diagnosis:
-  //   - location.protocol: capacitor: / https: / http: / file:
-  //   - document.referrer: what's currently being sent
-  //   - navigator.userAgent: WKWebView UA (iOS version + capacitor build)
-  const env = useMemo(() => ({
-    protocol: window.location.protocol,
-    href: window.location.href,
-    origin: window.location.origin,
-    referrer: document.referrer || '(empty)',
-    ua: navigator.userAgent,
-  }), []);
-
-  // Build the iframe URL. enablejsapi=1 + origin are REQUIRED for the
-  // postMessage control plane to work (and on iOS WKWebView, omitting
-  // them breaks the embed entirely).
-  const iframeUrl = useMemo(
-    () => `https://www.youtube-nocookie.com/embed/${youtubeId}?rel=0&modestbranding=1&enablejsapi=1&origin=${encodeURIComponent(window.location.origin)}`,
+  // Stable id for the div the YT.Player mounts into. YouTube replaces
+  // this div with the player iframe at construction time.
+  const playerDivId = useMemo(
+    () => `yt-player-${youtubeId}-${Math.random().toString(36).slice(2, 9)}`,
     [youtubeId]
   );
+  const wrapperRef = useRef<HTMLDivElement | null>(null);
+  const playerRef = useRef<any>(null);
+  const [error, setError] = useState<string | null>(null);
 
-  // Pause the player by posting a JSON command to the iframe's window.
-  // YouTube's iframe API listens for {event:'command', func:'pauseVideo'}
-  // (and 'playVideo', 'stopVideo', 'mute', etc).
-  const pauseIframe = () => {
-    const el = iframeRef.current;
-    if (!el || !el.contentWindow) return;
-    try {
-      el.contentWindow.postMessage(
-        JSON.stringify({ event: 'command', func: 'pauseVideo', args: [] }),
-        '*'
-      );
-    } catch { /* silent */ }
-  };
-
-  // Listen for postMessage events from the YouTube iframe. The player
-  // posts JSON-stringified messages on init + on errors. Error messages
-  // include an `info` field with the actual reason — "Embedding disabled
-  // by request", a numeric code, etc. These tell us exactly what's
-  // failing on iOS without DevTools.
+  // Mount: load the API script, then construct a YT.Player on the
+  // placeholder div. The player constructor replaces the div with the
+  // iframe and sets up the JS bridge.
   useEffect(() => {
-    const onMsg = (e: MessageEvent) => {
-      const origin = String(e.origin || '');
-      if (!/^https:\/\/(www\.)?(youtube\.com|youtube-nocookie\.com)$/.test(origin)) {
-        return;
-      }
-      let data: any = e.data;
-      let line: string;
+    let cancelled = false;
+    loadYouTubeIframeAPI().then((YT) => {
+      if (cancelled) return;
       try {
-        if (typeof data === 'string') {
-          try { data = JSON.parse(data); } catch { /* leave as string */ }
-        }
-        line = typeof data === 'string' ? data : JSON.stringify(data);
-      } catch {
-        line = String(data);
+        playerRef.current = new YT.Player(playerDivId, {
+          videoId: youtubeId,
+          // host: youtube-nocookie isn't strictly needed for the API
+          // path (the Referer issue doesn't apply), but it keeps the
+          // privacy posture consistent with non-Capacitor browsers.
+          host: 'https://www.youtube-nocookie.com',
+          playerVars: {
+            rel: 0,
+            modestbranding: 1,
+            playsinline: 1,
+          },
+          events: {
+            onError: (e: any) => {
+              // YouTube error codes:
+              //   2  = invalid parameter
+              //   5  = HTML5 player error
+              //   100 = video not found / private
+              //   101, 150 = embedding disabled by uploader
+              const code = e && e.data;
+              setError(`YouTube error ${code}`);
+            },
+          },
+        });
+      } catch (err: any) {
+        if (!cancelled) setError(err?.message || 'Failed to create player');
       }
-      setMessages((prev) => {
-        const next = [...prev, `${origin}: ${line}`];
-        return next.slice(-20);
-      });
+    }).catch((err) => {
+      if (!cancelled) setError(err?.message || 'Failed to load YouTube API');
+    });
+    return () => {
+      cancelled = true;
+      // Tear down the player on unmount to avoid orphan audio.
+      try {
+        if (playerRef.current && typeof playerRef.current.destroy === 'function') {
+          playerRef.current.destroy();
+        }
+      } catch { /* silent */ }
+      playerRef.current = null;
     };
-    window.addEventListener('message', onMsg);
-    return () => window.removeEventListener('message', onMsg);
-  }, []);
+  }, [youtubeId, playerDivId]);
 
-  // IntersectionObserver — same threshold as the native video posts so
-  // pause behavior feels consistent across photo/video/YouTube posts.
+  // Pause when the iframe scrolls out of view. The player exposes a
+  // pauseVideo() method once it's constructed.
   useEffect(() => {
-    const el = iframeRef.current;
+    const el = wrapperRef.current;
     if (!el || typeof IntersectionObserver === 'undefined') return;
     const io = new IntersectionObserver(
       (entries) => {
         for (const ent of entries) {
           if (!ent.isIntersecting) {
-            pauseIframe();
+            try {
+              if (playerRef.current && typeof playerRef.current.pauseVideo === 'function') {
+                playerRef.current.pauseVideo();
+              }
+            } catch { /* silent */ }
           }
         }
       },
@@ -9176,108 +9207,47 @@ function YouTubeEmbed({ youtubeId }: { youtubeId: string }) {
     return () => io.disconnect();
   }, []);
 
-  // Copy helper — uses execCommand fallback because clipboard API needs
-  // user gesture + HTTPS, and capacitor:// origins fail the HTTPS check.
-  const copy = (text: string) => {
-    try {
-      const ta = document.createElement('textarea');
-      ta.value = text;
-      ta.style.position = 'fixed';
-      ta.style.left = '-9999px';
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand('copy');
-      document.body.removeChild(ta);
-    } catch { /* silent */ }
-  };
-
-  const panelText = [
-    `PROTOCOL: ${env.protocol}`,
-    `ORIGIN: ${env.origin}`,
-    `HREF: ${env.href}`,
-    `REFERRER: ${env.referrer}`,
-    `IFRAME URL: ${iframeUrl}`,
-    `IFRAME STATUS: ${iframeStatus}`,
-    `MESSAGES (${messages.length}):`,
-    ...messages.map((m, i) => `[${i}] ${m}`),
-    `UA: ${env.ua}`,
-  ].join('\n');
-
   return (
-    <div style={{ width: '100%', aspectRatio: '16 / 9', background: '#000', position: 'relative' }}>
-      <iframe
-        ref={iframeRef}
-        src={iframeUrl}
-        title="YouTube video"
-        allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
-        allowFullScreen
-        referrerPolicy="origin"
-        onLoad={() => setIframeStatus('loaded')}
-        onError={() => setIframeStatus('error')}
-        style={{
-          position: 'absolute',
-          inset: 0,
-          width: '100%',
-          height: '100%',
-          border: 'none',
-          display: 'block',
-        }}
-      />
+    <div
+      ref={wrapperRef}
+      style={{ width: '100%', aspectRatio: '16 / 9', background: '#000', position: 'relative' }}
+    >
+      {/* Placeholder div the YT.Player constructor replaces with its
+          iframe. The wrapper div above stays as the IntersectionObserver
+          target since the iframe element will be different after mount. */}
+      <div id={playerDivId} style={{ position: 'absolute', inset: 0, width: '100%', height: '100%' }} />
 
-      {/* Diagnostic toggle — small red badge in bottom-left. */}
-      <button
-        onClick={(e) => { e.stopPropagation(); setExpanded(!expanded); }}
-        style={{
-          position: 'absolute',
-          bottom: 4,
-          left: 4,
-          padding: '4px 8px',
-          background: 'rgba(255,0,0,0.85)',
-          color: '#fff',
-          border: 'none',
-          borderRadius: 4,
-          fontSize: 11,
-          fontFamily: 'monospace',
-          zIndex: 2,
-          cursor: 'pointer',
-        }}
-      >
-        {expanded ? '▾ DIAG' : '▸ DIAG'}
-      </button>
-
-      {expanded && (
-        <div
-          onClick={(e) => { e.stopPropagation(); copy(panelText); }}
+      {/* Error fallback — if YouTube can't play (private video, embed
+          disabled by uploader, etc), show a tappable card that opens
+          the video in YouTube directly. */}
+      {error && (
+        <a
+          href={`https://www.youtube.com/watch?v=${youtubeId}`}
+          target="_blank"
+          rel="noopener noreferrer"
           style={{
             position: 'absolute',
-            top: 4,
-            left: 4,
-            right: 4,
-            maxHeight: '85%',
-            overflowY: 'auto',
-            background: 'rgba(0,0,0,0.92)',
-            color: '#0f0',
-            border: '1px solid #0f0',
-            borderRadius: 4,
-            padding: 6,
-            fontSize: 10,
-            fontFamily: 'monospace',
-            lineHeight: 1.3,
-            whiteSpace: 'pre-wrap',
-            wordBreak: 'break-all',
+            inset: 0,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            flexDirection: 'column',
+            background: 'rgba(0,0,0,0.85)',
+            color: '#fff',
+            textDecoration: 'none',
+            fontFamily: 'system-ui, -apple-system, sans-serif',
+            fontSize: 14,
+            gap: 8,
             zIndex: 1,
-            cursor: 'pointer',
           }}
         >
-          {panelText}
-          {'\n\n'}
-          [tap panel to copy all]
-        </div>
+          <div style={{ opacity: 0.7, fontSize: 12 }}>{error}</div>
+          <div>Open on YouTube ▶</div>
+        </a>
       )}
     </div>
   );
 }
-
 
 // ---------- YouTubeComposerSheet ----------
 // Full-screen sheet for posting a YouTube video to DreadFeed. Reached
