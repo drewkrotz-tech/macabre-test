@@ -84,6 +84,61 @@ function isIOS(): boolean {
   }
 }
 
+// ---------- YouTube URL parsing ----------
+// Pulls the 11-char video ID out of any standard YouTube URL the user
+// might paste. Supports:
+//   - https://www.youtube.com/watch?v=ID
+//   - https://m.youtube.com/watch?v=ID
+//   - https://youtu.be/ID
+//   - https://www.youtube.com/shorts/ID
+//   - https://www.youtube.com/embed/ID
+//   - https://www.youtube.com/v/ID
+//   - bare ID strings (11 chars, URL-safe base64 alphabet)
+// Returns null if nothing valid is found. The server validates the ID
+// shape again with the same regex, so an invalid paste fails fast on
+// either side.
+function extractYouTubeId(input: string): string | null {
+  if (!input || typeof input !== 'string') return null;
+  const s = input.trim();
+  if (!s) return null;
+
+  // Bare 11-char ID — accept as-is.
+  if (/^[A-Za-z0-9_-]{11}$/.test(s)) return s;
+
+  // Try to parse as URL. If it doesn't parse, fall through to regex
+  // scrape — handles cases like "youtube.com/..." without a scheme.
+  let u: URL | null = null;
+  try {
+    u = new URL(s.startsWith('http') ? s : `https://${s}`);
+  } catch {
+    u = null;
+  }
+
+  if (u) {
+    const host = u.hostname.replace(/^www\.|^m\./, '');
+    // youtu.be/<id>
+    if (host === 'youtu.be') {
+      const id = u.pathname.replace(/^\//, '').split('/')[0];
+      if (/^[A-Za-z0-9_-]{11}$/.test(id)) return id;
+    }
+    if (host === 'youtube.com' || host === 'youtube-nocookie.com') {
+      // watch?v=<id>
+      const v = u.searchParams.get('v');
+      if (v && /^[A-Za-z0-9_-]{11}$/.test(v)) return v;
+      // /shorts/<id>, /embed/<id>, /v/<id>, /live/<id>
+      const m = u.pathname.match(/^\/(?:shorts|embed|v|live)\/([A-Za-z0-9_-]{11})/);
+      if (m) return m[1];
+    }
+  }
+
+  // Last-ditch regex scrape — looks for any 11-char ID in the input
+  // preceded by something that smells like a YouTube URL.
+  const scrape = s.match(/(?:youtube\.com\/(?:watch\?v=|shorts\/|embed\/|v\/|live\/)|youtu\.be\/)([A-Za-z0-9_-]{11})/);
+  if (scrape) return scrape[1];
+
+  return null;
+}
+
 // ---------- Native: Sign in with Apple ----------
 // Wrapper around @capacitor-community/apple-sign-in. Dynamically imported
 // so a web/desktop preview where the plugin isn't installed doesn't crash
@@ -792,6 +847,11 @@ type SocialPost = {
   // preview rows ("@handle their comment text") without N+1 follow-up
   // requests. Older API responses won't include this field; the card
   // defaults to an empty array in that case.
+  // v1.17: YouTube post — when set, this is an 11-char YouTube video
+  // ID. The feed renders an inline 16:9 iframe in place of the photo
+  // carousel; profile/hashtag grids render the YouTube thumbnail
+  // (i.ytimg.com/vi/{id}/hqdefault.jpg) with a play badge.
+  youtubeId?: string | null;
   latestComments?: Array<{ id: string; handle: string; body: string; createdAt: string }>;
 };
 
@@ -1185,6 +1245,35 @@ async function apiCreatePost(args: {
       if (args.captureLng !== undefined) fd.append('captureLng', String(args.captureLng));
     }
     const res = await fetch(`${API_BASE}/posts`, { method: 'POST', body: fd });
+    const data = await res.json();
+    if (!res.ok) return { ok: false, reason: data?.error || `HTTP ${res.status}` };
+    return { ok: true, postId: data?.postId };
+  } catch (e: any) {
+    return { ok: false, reason: e?.message || 'network error' };
+  }
+}
+
+// Create a YouTube-video post (v1.17). JSON-only — no file upload, no
+// R2 storage. The server auto-approves (YouTube already moderates the
+// underlying video), so no admin queue. The feed renders an inline
+// 16:9 iframe in place of the photo carousel.
+async function apiCreateYouTubePost(args: {
+  handle: string;
+  deviceId: string;
+  caption: string;
+  youtubeId: string;
+}): Promise<{ ok: boolean; postId?: string; reason?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/posts/youtube`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        handle: args.handle,
+        deviceId: args.deviceId,
+        caption: args.caption,
+        youtubeId: args.youtubeId,
+      }),
+    });
     const data = await res.json();
     if (!res.ok) return { ok: false, reason: data?.error || `HTTP ${res.status}` };
     return { ok: true, postId: data?.postId };
@@ -5431,6 +5520,7 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
   // closes itself.
   const [chooserOpen, setChooserOpen] = useState(false);
   const [pollSheetOpen, setPollSheetOpen] = useState(false);
+  const [youtubeSheetOpen, setYoutubeSheetOpen] = useState(false);
 
   // Unread notifications badge count, shown on the bell in the brand
   // header. Polled on mount + every 60 seconds while DreadFeed is open.
@@ -5927,8 +6017,8 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
         }}
       />
 
-      {/* ➕ chooser — Photo vs Poll. Tiny bottom-sheet modal that
-          routes the user to the matching composer flow. */}
+      {/* ➕ chooser — Photo, YouTube, or Poll. Tiny bottom-sheet modal
+          that routes the user to the matching composer flow. */}
       {chooserOpen && (
         <ChoosePostTypeSheet
           onPickPhoto={() => {
@@ -5938,6 +6028,10 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
           onPickPoll={() => {
             setChooserOpen(false);
             setPollSheetOpen(true);
+          }}
+          onPickYouTube={() => {
+            setChooserOpen(false);
+            setYoutubeSheetOpen(true);
           }}
           onCancel={() => setChooserOpen(false)}
         />
@@ -5968,6 +6062,22 @@ function SocialView({ handle, deviceId, sites, currentLocation, onSelectSite, on
           onPosted={() => {
             setPollSheetOpen(false);
             showToast('Poll posted', 'success');
+            void refreshFeed();
+          }}
+        />
+      )}
+
+      {/* YouTube composer sheet — opened by the chooser after picking
+          YouTube Video. URL paste + caption. Auto-approved server-side
+          (YouTube already moderates), no admin queue. */}
+      {youtubeSheetOpen && (
+        <YouTubeComposerSheet
+          handle={handle}
+          deviceId={deviceId}
+          onClose={() => setYoutubeSheetOpen(false)}
+          onPosted={() => {
+            setYoutubeSheetOpen(false);
+            showToast('YouTube post shared', 'success');
             void refreshFeed();
           }}
         />
@@ -8161,13 +8271,37 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap,
         >⋯</button>
       </div>
 
-      {/* Photo(s) — single-photo posts render one image edge-to-edge;
-          multi-photo posts (v1.12 carousels) render a horizontal snap-
-          scroll strip with page dots underneath. Tap any photo to open
-          the full-aspect lightbox viewer with pinch-zoom and pan.
-          We use CSS scroll-snap so the gesture feels native — no JS
-          touch handling, no jank. */}
-      {(() => {
+      {/* v1.17: YouTube video post — renders an inline iframe at 16:9
+          in place of the photo carousel. Tap the iframe to use YouTube's
+          native fullscreen controls. playsinline=1 keeps it embedded
+          on iOS instead of launching the system player; rel=0 hides
+          related-video suggestions when paused. */}
+      {post.youtubeId ? (
+        <div style={{ width: '100%', aspectRatio: '16 / 9', background: '#000', position: 'relative' }}>
+          <iframe
+            src={`https://www.youtube.com/embed/${post.youtubeId}?playsinline=1&rel=0&modestbranding=1`}
+            title="YouTube video"
+            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; fullscreen"
+            allowFullScreen
+            referrerPolicy="strict-origin-when-cross-origin"
+            style={{
+              position: 'absolute',
+              inset: 0,
+              width: '100%',
+              height: '100%',
+              border: 'none',
+              display: 'block',
+            }}
+          />
+        </div>
+      ) : (
+        /* Photo(s) — single-photo posts render one image edge-to-edge;
+           multi-photo posts (v1.12 carousels) render a horizontal snap-
+           scroll strip with page dots underneath. Tap any photo to open
+           the full-aspect lightbox viewer with pinch-zoom and pan.
+           We use CSS scroll-snap so the gesture feels native — no JS
+           touch handling, no jank. */
+      (() => {
         const photos = (post.photoUrls && post.photoUrls.length > 0)
           ? post.photoUrls
           : [post.photoUrl];
@@ -8341,7 +8475,8 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap,
             </div>
           </div>
         );
-      })()}
+      })()
+      )}
 
       {/* Actions row — Instagram-style line icons: heart, comment (disabled
           for now, real comments later), share. All outlined SVGs at equal
@@ -8470,23 +8605,19 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap,
       )}
 
       {/* Caption — handle in bold inline with caption text, like IG.
-          Tapping the handle goes to profile; tapping a hashtag goes to
-          that tag's view; tapping plain caption text opens the comment
-          sheet. CaptionWithTags renders the body and stops propagation
-          on tag taps so plain-text taps still bubble. */}
-      <div style={S.postCaptionLine}>
-        <button onClick={onHandleTap} style={S.postCaptionHandle}>{post.handle}</button>
-        <span
-          onClick={() => setCommentsOpen(true)}
-          style={S.postCaptionText}
-        >
-          {' '}
-          <CaptionWithTags
-            text={post.caption}
-            onTagTap={(tag) => onHashtagTap && onHashtagTap(tag)}
-          />
-        </span>
-      </div>
+          v1.17 fix: caption is 2-line truncated with inline "more"
+          affordance that expands in place. Tapping the caption body
+          NO LONGER opens the comments sheet (was a bug). Tapping the
+          handle still goes to profile; hashtag taps still go to the
+          tag view via CaptionWithTags' internal stopPropagation. */}
+      <CaptionExpander
+        caption={post.caption}
+        onTagTap={(tag) => onHashtagTap && onHashtagTap(tag)}
+        handleElement={
+          <button onClick={onHandleTap} style={S.postCaptionHandle}>{post.handle}</button>
+        }
+        baseStyle={S.postCaptionLine}
+      />
 
       {/* "View all N comments" link, IG-style — appears below the
           caption when there's at least one comment. Tapping opens the
@@ -8949,13 +9080,179 @@ function PollComposerSheet({ handle, deviceId, onClose, onPosted }: {
   );
 }
 
+// ---------- YouTubeComposerSheet ----------
+// Full-screen sheet for posting a YouTube video to DreadFeed. Reached
+// from the ➕ chooser's "YouTube Video" option. Matches the IG-style
+// chrome of the photo and poll composers (✕ Cancel | "New YouTube post"
+// | Share).
+//
+// Fields:
+//   - URL paste field (any YouTube URL shape; extractYouTubeId parses)
+//   - Caption (1-280 chars, same rules as photo/freeform posts)
+// Live thumbnail preview at 16:9 the moment a valid URL is detected.
+// Share enables only when both fields pass + we have a handle/deviceId.
+function YouTubeComposerSheet({ handle, deviceId, onClose, onPosted }: {
+  handle: string | null;
+  deviceId: string | null;
+  onClose: () => void;
+  onPosted: () => void;
+}) {
+  const [urlInput, setUrlInput] = useState('');
+  const [caption, setCaption] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+
+  // Re-parse on every keystroke. Cheap — it's just regex + URL().
+  const youtubeId = useMemo(() => extractYouTubeId(urlInput), [urlInput]);
+  const captionTrim = caption.trim();
+  const captionValid = captionTrim.length >= 1 && captionTrim.length <= 280;
+  const canShare = !!youtubeId && captionValid && !submitting && !!handle && !!deviceId;
+
+  const onShare = async () => {
+    if (!canShare) return;
+    setSubmitting(true);
+    const result = await apiCreateYouTubePost({
+      handle: handle!,
+      deviceId: deviceId!,
+      caption: captionTrim,
+      youtubeId: youtubeId!,
+    });
+    setSubmitting(false);
+    if (result.ok) {
+      playPostShared();
+      onPosted();
+    } else {
+      showToast(`YouTube post failed: ${result.reason || 'unknown error'}`, 'error');
+    }
+  };
+
+  // No handle? Match the other composers' fallback screen.
+  if (!handle || !deviceId) {
+    return createPortal(
+      <div style={S.igComposerScreen}>
+        <div style={S.igComposerHeader}>
+          <button onClick={onClose} style={S.igComposerHeaderBtn} aria-label="Close">✕</button>
+          <div style={S.igComposerHeaderTitle}>New YouTube post</div>
+          <div style={{ width: 40 }} />
+        </div>
+        <div style={{ padding: '40px 24px', textAlign: 'center', color: '#BBB', fontSize: 15, fontFamily: 'system-ui, -apple-system, sans-serif' }}>
+          Claim a handle to post a YouTube video.
+        </div>
+      </div>,
+      document.body
+    );
+  }
+
+  return createPortal(
+    <div style={S.igComposerScreen}>
+      <div style={S.igComposerHeader}>
+        <button onClick={onClose} style={S.igComposerHeaderBtn} aria-label="Cancel">✕</button>
+        <div style={S.igComposerHeaderTitle}>New YouTube post</div>
+        <button
+          onClick={onShare}
+          disabled={!canShare}
+          style={{
+            ...S.igComposerHeaderBtn,
+            color: canShare ? '#0095F6' : '#0095F655',
+            fontWeight: 700,
+            fontSize: 15,
+            width: 'auto',
+            paddingLeft: 8,
+            paddingRight: 8,
+          }}
+          aria-label="Share YouTube post"
+        >
+          {submitting ? '…' : 'Share'}
+        </button>
+      </div>
+
+      <div style={S.pollComposerBody}>
+        {/* URL field */}
+        <div style={S.pollComposerLabelRow}>
+          <span style={S.pollComposerLabel}>YouTube URL</span>
+          <span style={S.pollComposerCount}>{youtubeId ? '✓ valid' : 'paste any link'}</span>
+        </div>
+        <input
+          type="url"
+          inputMode="url"
+          autoCapitalize="off"
+          autoCorrect="off"
+          spellCheck={false}
+          value={urlInput}
+          onChange={(e) => setUrlInput(e.target.value)}
+          placeholder="https://youtube.com/watch?v=…"
+          style={S.pollComposerOptionInput}
+        />
+
+        {/* Live 16:9 thumbnail preview the moment we detect a valid ID. */}
+        {youtubeId && (
+          <div style={{
+            width: '100%',
+            aspectRatio: '16 / 9',
+            background: '#000',
+            borderRadius: 8,
+            overflow: 'hidden',
+            marginTop: 12,
+            position: 'relative',
+          }}>
+            <img
+              src={`https://i.ytimg.com/vi/${youtubeId}/hqdefault.jpg`}
+              alt="YouTube thumbnail"
+              style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
+            />
+            {/* Play badge overlay — purely cosmetic; tap doesn't play. */}
+            <div style={{
+              position: 'absolute',
+              top: '50%',
+              left: '50%',
+              transform: 'translate(-50%, -50%)',
+              width: 60,
+              height: 60,
+              borderRadius: '50%',
+              background: 'rgba(0,0,0,0.6)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              pointerEvents: 'none',
+            }}>
+              <svg width="26" height="26" viewBox="0 0 24 24" fill="#fff">
+                <path d="M8 5v14l11-7z" />
+              </svg>
+            </div>
+          </div>
+        )}
+
+        {/* Caption */}
+        <div style={{ ...S.pollComposerLabelRow, marginTop: 18 }}>
+          <span style={S.pollComposerLabel}>Caption</span>
+          <span style={S.pollComposerCount}>{captionTrim.length}/280</span>
+        </div>
+        <textarea
+          value={caption}
+          onChange={(e) => setCaption(e.target.value.slice(0, 280))}
+          placeholder="Say something about this video…"
+          style={S.pollComposerQuestion}
+          rows={3}
+        />
+
+        <div style={S.pollComposerHint}>
+          Paste any YouTube link — watch, shorts, youtu.be, or embed.
+          The video plays inline in the feed.
+        </div>
+      </div>
+    </div>,
+    document.body
+  );
+}
+
 // ---------- ChoosePostTypeSheet ----------
 // Tiny bottom sheet that appears when the user taps ➕ on DreadFeed.
-// Two options: "Photo" → opens ExposurePostSheet, or "Poll" → opens
-// PollComposerSheet. Matches the dark IG-style modal aesthetic.
-function ChoosePostTypeSheet({ onPickPhoto, onPickPoll, onCancel }: {
+// Three options: "Photo / Video" → ExposurePostSheet, "Poll" →
+// PollComposerSheet, "YouTube Video" → YouTubeComposerSheet. Matches
+// the dark IG-style modal aesthetic.
+function ChoosePostTypeSheet({ onPickPhoto, onPickPoll, onPickYouTube, onCancel }: {
   onPickPhoto: () => void;
   onPickPoll: () => void;
+  onPickYouTube: () => void;
   onCancel: () => void;
 }) {
   return createPortal(
@@ -8965,6 +9262,10 @@ function ChoosePostTypeSheet({ onPickPhoto, onPickPoll, onCancel }: {
         <button onClick={onPickPhoto} style={S.pollChooserBtn} className="sinister-icon-btn">
           <span style={S.pollChooserBtnIcon}>📷</span>
           <span style={S.pollChooserBtnLabel}>Photo / Video</span>
+        </button>
+        <button onClick={onPickYouTube} style={S.pollChooserBtn} className="sinister-icon-btn">
+          <span style={S.pollChooserBtnIcon}>▶︎</span>
+          <span style={S.pollChooserBtnLabel}>YouTube Video</span>
         </button>
         <button onClick={onPickPoll} style={S.pollChooserBtn} className="sinister-icon-btn">
           <span style={S.pollChooserBtnIcon}>📊</span>
@@ -9856,6 +10157,87 @@ function CaptionWithTags({
   );
 }
 
+// ---------- CaptionExpander ----------
+// IG-style caption with 2-line truncate + inline "more" affordance.
+// Tapping "more" expands the caption in place — does NOT navigate to
+// the comments sheet (previous bug). Once expanded, stays expanded for
+// the lifetime of the component (no "less" toggle, matching IG).
+//
+// Implementation: render with -webkit-line-clamp: 2 by default; measure
+// scrollHeight vs clientHeight after layout to decide whether the
+// "more" button is needed. Captions short enough to fit in 2 lines
+// never show "more". Re-measures if the text changes (e.g. caption
+// edit in the future).
+function CaptionExpander({
+  caption,
+  onTagTap,
+  handleElement,
+  baseStyle,
+}: {
+  caption: string;
+  onTagTap?: (tag: string) => void;
+  // Rendered inline before the caption (the bold @handle button). Kept
+  // as a prop so the layout stays a single inline flow — line-clamp
+  // counts the handle width when wrapping.
+  handleElement: React.ReactNode;
+  baseStyle?: React.CSSProperties;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [overflowing, setOverflowing] = useState(false);
+  const ref = useRef<HTMLDivElement | null>(null);
+
+  // Measure once after layout, and again if the caption changes. Using
+  // useLayoutEffect so the measurement happens BEFORE the browser
+  // paints — avoids a single-frame flash of "more" appearing.
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    // scrollHeight > clientHeight means the line-clamp is hiding text.
+    // Add a 1px slop because sub-pixel rounding occasionally lies.
+    setOverflowing(el.scrollHeight - el.clientHeight > 1);
+  }, [caption]);
+
+  const clampStyle: React.CSSProperties = expanded
+    ? {}
+    : {
+        display: '-webkit-box',
+        WebkitLineClamp: 2,
+        WebkitBoxOrient: 'vertical',
+        overflow: 'hidden',
+      };
+
+  return (
+    <div style={{ ...baseStyle, ...clampStyle }} ref={ref}>
+      {handleElement}
+      {' '}
+      <CaptionWithTags text={caption} onTagTap={onTagTap} />
+      {!expanded && overflowing && (
+        <>
+          {' '}
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              setExpanded(true);
+            }}
+            style={{
+              background: 'none',
+              border: 'none',
+              padding: 0,
+              margin: 0,
+              color: '#8A8A8A',
+              cursor: 'pointer',
+              font: 'inherit',
+            }}
+          >
+            more
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
 // ---- HashtagView (v1.14) ----
 // Dedicated screen shown when the user taps a hashtag anywhere in the
 // app (feed caption, post detail caption, etc). Loads /posts/hashtag/:tag
@@ -9916,6 +10298,7 @@ function HashtagView({
               (Array.isArray((p as any).mediaTypes) && (p as any).mediaTypes[0]) ||
               (/\.(mp4|mov)(\?|$)/i.test(p.photoUrl) ? 'video' : 'photo');
             const isVideo = firstType === 'video';
+            const isYouTube = !!p.youtubeId;
             return (
               <button
                 key={p.id}
@@ -9923,7 +10306,21 @@ function HashtagView({
                 style={S.profileGridCell}
                 aria-label={`Open post: ${p.caption.slice(0, 40)}`}
               >
-                {isVideo ? (
+                {isYouTube ? (
+                  <>
+                    <img
+                      src={`https://i.ytimg.com/vi/${p.youtubeId}/hqdefault.jpg`}
+                      alt=""
+                      style={S.profileGridImg}
+                      loading="lazy"
+                    />
+                    <div style={S.profileGridVideoBadge} aria-hidden="true">
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="#ffffff">
+                        <path d="M8 5v14l11-7z" />
+                      </svg>
+                    </div>
+                  </>
+                ) : isVideo ? (
                   <>
                     <video
                       src={`${p.photoUrl}#t=0.1`}
@@ -10600,6 +10997,7 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
               (Array.isArray((p as any).mediaTypes) && (p as any).mediaTypes[0]) ||
               (/\.(mp4|mov)(\?|$)/i.test(p.photoUrl) ? 'video' : 'photo');
             const isVideo = firstType === 'video';
+            const isYouTube = !!p.youtubeId;
             return (
               <button
                 key={p.id}
@@ -10607,7 +11005,24 @@ function UserProfileView({ profileHandle, currentHandle, deviceId, sites, onSele
                 style={S.profileGridCell}
                 aria-label={`Open post: ${p.caption.slice(0, 40)}`}
               >
-                {isVideo ? (
+                {isYouTube ? (
+                  // YouTube grid thumbnail. hqdefault is the safest size —
+                  // available for every video and renders the same 16:9
+                  // aspect cropped to the grid cell.
+                  <>
+                    <img
+                      src={`https://i.ytimg.com/vi/${p.youtubeId}/hqdefault.jpg`}
+                      alt=""
+                      style={S.profileGridImg}
+                      loading="lazy"
+                    />
+                    <div style={S.profileGridVideoBadge} aria-hidden="true">
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="#ffffff">
+                        <path d="M8 5v14l11-7z" />
+                      </svg>
+                    </div>
+                  </>
+                ) : isVideo ? (
                   // Static first-frame thumbnail. preload="metadata"
                   // tells the browser to fetch just enough bytes for
                   // the poster frame, NOT the whole video. No autoplay,
