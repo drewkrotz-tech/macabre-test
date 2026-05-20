@@ -166,29 +166,6 @@ workflows:
       - name: Sync Capacitor to iOS
         script: |
           npx cap sync ios
-      - name: Force iOS WebView scheme to https (YouTube embed fix)
-        script: |
-          # See signed-build workflow for full rationale. Short version:
-          # Capacitor sometimes ignores iosScheme from capacitor.config.ts;
-          # we force https here by editing the runtime config the native
-          # bridge reads at app launch.
-          CONFIG="ios/App/App/capacitor.config.json"
-          if [ -f "$CONFIG" ]; then
-            node -e "
-              const fs = require('fs');
-              const p = '$CONFIG';
-              const cfg = JSON.parse(fs.readFileSync(p, 'utf8'));
-              cfg.server = cfg.server || {};
-              cfg.server.iosScheme = 'https';
-              cfg.server.androidScheme = 'https';
-              fs.writeFileSync(p, JSON.stringify(cfg, null, 2));
-              console.log('Patched server config:', JSON.stringify(cfg.server));
-            "
-            cat "$CONFIG"
-          else
-            echo "WARNING: $CONFIG not found"
-            exit 1
-          fi
       - name: Install CocoaPods dependencies
         script: |
           cd ios/App && pod install
@@ -374,40 +351,6 @@ workflows:
       - name: Sync Capacitor to iOS
         script: |
           npx cap sync ios
-      - name: Force iOS WebView scheme to https (YouTube embed fix)
-        script: |
-          # Capacitor's iOS bridge defaults to capacitor://localhost as
-          # the WebView origin. This breaks any cross-origin iframe that
-          # checks Referer (notably YouTube embed — returns Error 153)
-          # because WebKit strips the Referer on capacitor:// → https:
-          # transitions.
-          #
-          # Setting iosScheme: 'https' in capacitor.config.ts is the
-          # documented fix, but Capacitor's iOS scaffolding sometimes
-          # ignores it depending on plugin versions. We force it here
-          # by directly patching the bundled capacitor.config.json that
-          # the native bridge reads at app launch.
-          CONFIG="ios/App/App/capacitor.config.json"
-          if [ -f "$CONFIG" ]; then
-            echo "--- Before patch ---"
-            cat "$CONFIG"
-            # Use node to safely edit the JSON.
-            node -e "
-              const fs = require('fs');
-              const p = '$CONFIG';
-              const cfg = JSON.parse(fs.readFileSync(p, 'utf8'));
-              cfg.server = cfg.server || {};
-              cfg.server.iosScheme = 'https';
-              cfg.server.androidScheme = 'https';
-              fs.writeFileSync(p, JSON.stringify(cfg, null, 2));
-              console.log('Patched server config:', JSON.stringify(cfg.server));
-            "
-            echo "--- After patch ---"
-            cat "$CONFIG"
-          else
-            echo "WARNING: $CONFIG not found — Capacitor sync did not generate the iOS config"
-            exit 1
-          fi
       - name: Install CocoaPods dependencies
         script: |
           cd ios/App && pod install
