@@ -8272,24 +8272,33 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap,
       </div>
 
       {/* v1.17: YouTube video post — renders an inline iframe at 16:9
-          in place of the photo carousel. Tap the iframe to use YouTube's
-          native fullscreen controls.
+          in place of the photo carousel.
           
-          IMPORTANT: do NOT add `playsinline=1` to the URL without also
-          adding `enablejsapi=1` + a matching `origin` param. The three
-          go together — playsinline implicitly requires the JS API,
-          which requires origin verification. Setting one or two of the
-          three produces "Error 153: Video player configuration error"
-          inside a WKWebView. Bare embed URL works everywhere; the
-          rel=0 param hiding related videos is still allowed. */}
+          Critical for WKWebView: must use youtube-nocookie.com (the
+          privacy-enhanced domain) AND must explicitly set
+          referrerPolicy="origin". Inside Capacitor the parent frame's
+          origin is capacitor://localhost — a non-http scheme. The
+          default policy strict-origin-when-cross-origin treats that
+          as an origin downgrade and strips the Referer header
+          entirely, which YouTube's player needs to validate the
+          embedding context. No Referer = Error 153 ("Video player
+          configuration error"). Setting referrerPolicy="origin"
+          forces the Referer to be sent regardless of scheme — just
+          the origin part, not the full URL — which is enough for
+          YouTube's check.
+          
+          Also: do NOT add playsinline=1 — that param requires
+          enablejsapi=1 + matching origin, and setting it alone
+          produces the same Error 153. YouTube's iframe player respects
+          its container bounds by default. */}
       {post.youtubeId ? (
         <div style={{ width: '100%', aspectRatio: '16 / 9', background: '#000', position: 'relative' }}>
           <iframe
-            src={`https://www.youtube.com/embed/${post.youtubeId}?rel=0&modestbranding=1`}
+            src={`https://www.youtube-nocookie.com/embed/${post.youtubeId}?rel=0&modestbranding=1`}
             title="YouTube video"
             allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
             allowFullScreen
-            referrerPolicy="strict-origin-when-cross-origin"
+            referrerPolicy="origin"
             style={{
               position: 'absolute',
               inset: 0,
