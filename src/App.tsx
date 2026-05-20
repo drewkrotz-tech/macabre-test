@@ -8271,44 +8271,12 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap,
         >⋯</button>
       </div>
 
-      {/* v1.17: YouTube video post — renders an inline iframe at 16:9
-          in place of the photo carousel.
-          
-          Critical for WKWebView: must use youtube-nocookie.com (the
-          privacy-enhanced domain) AND must explicitly set
-          referrerPolicy="origin". Inside Capacitor the parent frame's
-          origin is capacitor://localhost — a non-http scheme. The
-          default policy strict-origin-when-cross-origin treats that
-          as an origin downgrade and strips the Referer header
-          entirely, which YouTube's player needs to validate the
-          embedding context. No Referer = Error 153 ("Video player
-          configuration error"). Setting referrerPolicy="origin"
-          forces the Referer to be sent regardless of scheme — just
-          the origin part, not the full URL — which is enough for
-          YouTube's check.
-          
-          Also: do NOT add playsinline=1 — that param requires
-          enablejsapi=1 + matching origin, and setting it alone
-          produces the same Error 153. YouTube's iframe player respects
-          its container bounds by default. */}
+      {/* v1.17: YouTube video post — inline iframe with scroll-pause.
+          See YouTubeEmbed component for the full behavior + WKWebView
+          fix notes. Pause-on-scroll-out matches the native video post
+          behavior so audio doesn't bleed across feed cards. */}
       {post.youtubeId ? (
-        <div style={{ width: '100%', aspectRatio: '16 / 9', background: '#000', position: 'relative' }}>
-          <iframe
-            src={`https://www.youtube-nocookie.com/embed/${post.youtubeId}?rel=0&modestbranding=1`}
-            title="YouTube video"
-            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
-            allowFullScreen
-            referrerPolicy="origin"
-            style={{
-              position: 'absolute',
-              inset: 0,
-              width: '100%',
-              height: '100%',
-              border: 'none',
-              display: 'block',
-            }}
-          />
-        </div>
+        <YouTubeEmbed youtubeId={post.youtubeId} />
       ) : (
         /* Photo(s) — single-photo posts render one image edge-to-edge;
            multi-photo posts (v1.12 carousels) render a horizontal snap-
@@ -9094,6 +9062,222 @@ function PollComposerSheet({ handle, deviceId, onClose, onPosted }: {
     document.body
   );
 }
+
+// ---------- YouTubeEmbed ----------
+// Renders a YouTube video post inline. Uses YouTube's iframe API (via
+// enablejsapi=1 + origin + postMessage) so we can pause the player when
+// the iframe scrolls out of view. Without that, scrolling past a playing
+// video lets it keep playing and bleed audio over other posts — exactly
+// the IG/TikTok auto-pause behavior people expect from a feed.
+//
+// Behavior:
+//   - Iframe enters viewport (>=25% visible): no auto-play (YouTube
+//     blocks autoplay-with-sound anyway; user taps the player to start).
+//   - Iframe leaves viewport (<25% visible): we postMessage 'pauseVideo'
+//     to halt playback. User can re-enter and tap to resume.
+//
+// WKWebView fix bundled in: youtube-nocookie.com domain + referrerPolicy
+// "origin" so the Referer survives the capacitor:// → https: scheme
+// transition. Without these, YouTube returns Error 153.
+//
+// DIAGNOSTIC PANEL: a tappable green overlay shows live environment info
+// (protocol, origin, document.referrer, iframe URL, iframe load status,
+// and YouTube postMessage events). Helps debug Error 153 in the live
+// app without DevTools. Tap "▾ DIAG" red button to collapse. Tap the
+// panel itself to copy all contents to clipboard. Remove this panel
+// once iOS playback is confirmed working.
+function YouTubeEmbed({ youtubeId }: { youtubeId: string }) {
+  const iframeRef = useRef<HTMLIFrameElement | null>(null);
+  const [expanded, setExpanded] = useState(true);
+  const [messages, setMessages] = useState<string[]>([]);
+  const [iframeStatus, setIframeStatus] = useState<'pending' | 'loaded' | 'error'>('pending');
+
+  // Capture environment info once at mount. These are the fields most
+  // likely to matter for Error 153 diagnosis:
+  //   - location.protocol: capacitor: / https: / http: / file:
+  //   - document.referrer: what's currently being sent
+  //   - navigator.userAgent: WKWebView UA (iOS version + capacitor build)
+  const env = useMemo(() => ({
+    protocol: window.location.protocol,
+    href: window.location.href,
+    origin: window.location.origin,
+    referrer: document.referrer || '(empty)',
+    ua: navigator.userAgent,
+  }), []);
+
+  // Build the iframe URL. enablejsapi=1 + origin are REQUIRED for the
+  // postMessage control plane to work (and on iOS WKWebView, omitting
+  // them breaks the embed entirely).
+  const iframeUrl = useMemo(
+    () => `https://www.youtube-nocookie.com/embed/${youtubeId}?rel=0&modestbranding=1&enablejsapi=1&origin=${encodeURIComponent(window.location.origin)}`,
+    [youtubeId]
+  );
+
+  // Pause the player by posting a JSON command to the iframe's window.
+  // YouTube's iframe API listens for {event:'command', func:'pauseVideo'}
+  // (and 'playVideo', 'stopVideo', 'mute', etc).
+  const pauseIframe = () => {
+    const el = iframeRef.current;
+    if (!el || !el.contentWindow) return;
+    try {
+      el.contentWindow.postMessage(
+        JSON.stringify({ event: 'command', func: 'pauseVideo', args: [] }),
+        '*'
+      );
+    } catch { /* silent */ }
+  };
+
+  // Listen for postMessage events from the YouTube iframe. The player
+  // posts JSON-stringified messages on init + on errors. Error messages
+  // include an `info` field with the actual reason — "Embedding disabled
+  // by request", a numeric code, etc. These tell us exactly what's
+  // failing on iOS without DevTools.
+  useEffect(() => {
+    const onMsg = (e: MessageEvent) => {
+      const origin = String(e.origin || '');
+      if (!/^https:\/\/(www\.)?(youtube\.com|youtube-nocookie\.com)$/.test(origin)) {
+        return;
+      }
+      let data: any = e.data;
+      let line: string;
+      try {
+        if (typeof data === 'string') {
+          try { data = JSON.parse(data); } catch { /* leave as string */ }
+        }
+        line = typeof data === 'string' ? data : JSON.stringify(data);
+      } catch {
+        line = String(data);
+      }
+      setMessages((prev) => {
+        const next = [...prev, `${origin}: ${line}`];
+        return next.slice(-20);
+      });
+    };
+    window.addEventListener('message', onMsg);
+    return () => window.removeEventListener('message', onMsg);
+  }, []);
+
+  // IntersectionObserver — same threshold as the native video posts so
+  // pause behavior feels consistent across photo/video/YouTube posts.
+  useEffect(() => {
+    const el = iframeRef.current;
+    if (!el || typeof IntersectionObserver === 'undefined') return;
+    const io = new IntersectionObserver(
+      (entries) => {
+        for (const ent of entries) {
+          if (!ent.isIntersecting) {
+            pauseIframe();
+          }
+        }
+      },
+      { threshold: 0.25 }
+    );
+    io.observe(el);
+    return () => io.disconnect();
+  }, []);
+
+  // Copy helper — uses execCommand fallback because clipboard API needs
+  // user gesture + HTTPS, and capacitor:// origins fail the HTTPS check.
+  const copy = (text: string) => {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.left = '-9999px';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+    } catch { /* silent */ }
+  };
+
+  const panelText = [
+    `PROTOCOL: ${env.protocol}`,
+    `ORIGIN: ${env.origin}`,
+    `HREF: ${env.href}`,
+    `REFERRER: ${env.referrer}`,
+    `IFRAME URL: ${iframeUrl}`,
+    `IFRAME STATUS: ${iframeStatus}`,
+    `MESSAGES (${messages.length}):`,
+    ...messages.map((m, i) => `[${i}] ${m}`),
+    `UA: ${env.ua}`,
+  ].join('\n');
+
+  return (
+    <div style={{ width: '100%', aspectRatio: '16 / 9', background: '#000', position: 'relative' }}>
+      <iframe
+        ref={iframeRef}
+        src={iframeUrl}
+        title="YouTube video"
+        allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+        allowFullScreen
+        referrerPolicy="origin"
+        onLoad={() => setIframeStatus('loaded')}
+        onError={() => setIframeStatus('error')}
+        style={{
+          position: 'absolute',
+          inset: 0,
+          width: '100%',
+          height: '100%',
+          border: 'none',
+          display: 'block',
+        }}
+      />
+
+      {/* Diagnostic toggle — small red badge in bottom-left. */}
+      <button
+        onClick={(e) => { e.stopPropagation(); setExpanded(!expanded); }}
+        style={{
+          position: 'absolute',
+          bottom: 4,
+          left: 4,
+          padding: '4px 8px',
+          background: 'rgba(255,0,0,0.85)',
+          color: '#fff',
+          border: 'none',
+          borderRadius: 4,
+          fontSize: 11,
+          fontFamily: 'monospace',
+          zIndex: 2,
+          cursor: 'pointer',
+        }}
+      >
+        {expanded ? '▾ DIAG' : '▸ DIAG'}
+      </button>
+
+      {expanded && (
+        <div
+          onClick={(e) => { e.stopPropagation(); copy(panelText); }}
+          style={{
+            position: 'absolute',
+            top: 4,
+            left: 4,
+            right: 4,
+            maxHeight: '85%',
+            overflowY: 'auto',
+            background: 'rgba(0,0,0,0.92)',
+            color: '#0f0',
+            border: '1px solid #0f0',
+            borderRadius: 4,
+            padding: 6,
+            fontSize: 10,
+            fontFamily: 'monospace',
+            lineHeight: 1.3,
+            whiteSpace: 'pre-wrap',
+            wordBreak: 'break-all',
+            zIndex: 1,
+            cursor: 'pointer',
+          }}
+        >
+          {panelText}
+          {'\n\n'}
+          [tap panel to copy all]
+        </div>
+      )}
+    </div>
+  );
+}
+
 
 // ---------- YouTubeComposerSheet ----------
 // Full-screen sheet for posting a YouTube video to DreadFeed. Reached
