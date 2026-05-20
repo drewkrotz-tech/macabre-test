@@ -8273,15 +8273,21 @@ function SocialPostCard({ post, currentHandle, deviceId, onSiteTap, onHandleTap,
 
       {/* v1.17: YouTube video post — renders an inline iframe at 16:9
           in place of the photo carousel. Tap the iframe to use YouTube's
-          native fullscreen controls. playsinline=1 keeps it embedded
-          on iOS instead of launching the system player; rel=0 hides
-          related-video suggestions when paused. */}
+          native fullscreen controls.
+          
+          IMPORTANT: do NOT add `playsinline=1` to the URL without also
+          adding `enablejsapi=1` + a matching `origin` param. The three
+          go together — playsinline implicitly requires the JS API,
+          which requires origin verification. Setting one or two of the
+          three produces "Error 153: Video player configuration error"
+          inside a WKWebView. Bare embed URL works everywhere; the
+          rel=0 param hiding related videos is still allowed. */}
       {post.youtubeId ? (
         <div style={{ width: '100%', aspectRatio: '16 / 9', background: '#000', position: 'relative' }}>
           <iframe
-            src={`https://www.youtube.com/embed/${post.youtubeId}?playsinline=1&rel=0&modestbranding=1`}
+            src={`https://www.youtube.com/embed/${post.youtubeId}?rel=0&modestbranding=1`}
             title="YouTube video"
-            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; fullscreen"
+            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
             allowFullScreen
             referrerPolicy="strict-origin-when-cross-origin"
             style={{
