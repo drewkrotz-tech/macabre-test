@@ -7319,6 +7319,14 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
   onPosted: () => void;
 }) {
   const fileRef = useRef<HTMLInputElement>(null);
+  // Separate input for the camera path. On Android, an <input> with
+  // accept="image/*,video/*" and NO capture attribute opens the gallery
+  // only — it never surfaces a "take photo/video" option (unlike iOS,
+  // where the system picker offers both). So we keep a second input with
+  // capture="environment" that opens the camera directly. Both feed the
+  // same onPhotoChange handler. iOS users get both options too; this is
+  // purely additive.
+  const cameraRef = useRef<HTMLInputElement>(null);
   const [photoFile, setPhotoFile] = useState<File | null>(null);
   const [photoPreview, setPhotoPreview] = useState<string | null>(null);
   // v1.12 multi-photo support. The first picked photo (photoFile) is
@@ -7383,6 +7391,7 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
       // onChange. Without this iOS won't re-fire onChange for an
       // identical pick.
       if (fileRef.current) fileRef.current.value = '';
+      if (cameraRef.current) cameraRef.current.value = '';
       return;
     }
 
@@ -7422,6 +7431,14 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
   const openPicker = () => {
     if (submitting) return;
     fileRef.current?.click();
+  };
+
+  // Opens the camera directly (capture="environment"). This is the path
+  // that fixes Android, where the library input never offers a camera
+  // option. Works on iOS too.
+  const openCamera = () => {
+    if (submitting) return;
+    cameraRef.current?.click();
   };
 
   const onNext = () => {
@@ -7515,6 +7532,18 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
         style={{ display: 'none' }}
         onChange={onPhotoChange}
       />
+      {/* Camera input — capture="environment" forces the device camera.
+          This is what gives Android a "take photo/video" path, since the
+          library input above only opens the gallery on Android. Not
+          multiple (camera captures one shot at a time). */}
+      <input
+        ref={cameraRef}
+        type="file"
+        accept="image/*,video/*"
+        capture="environment"
+        style={{ display: 'none' }}
+        onChange={onPhotoChange}
+      />
 
       {stage === 'pick' && (
         <>
@@ -7593,20 +7622,34 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
               )}
             </div>
           ) : (
-            <button
-              type="button"
-              onClick={openPicker}
-              style={S.igPickPrompt}
-            >
+            <div style={S.igPickPrompt}>
               {/* Subtle camera glyph + prompt. IG's empty state is more
                   elaborate (gallery grid) but this captures the same
-                  intent without needing the photo library plugin. */}
+                  intent without needing the photo library plugin. Two
+                  explicit buttons: camera vs library. On Android the
+                  library input can't open the camera, so the camera
+                  button is the only way to capture there. */}
               <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#666" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
                 <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" />
                 <circle cx="12" cy="13" r="4" />
               </svg>
-              <div style={S.igPickPromptLabel}>Tap to choose a photo or video</div>
-              <div style={S.igPickPromptHint}>From your camera or library</div>
+              <div style={S.igPickPromptLabel}>Add a photo or video</div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12, width: '100%', maxWidth: 280, marginTop: 18 }}>
+                <button
+                  type="button"
+                  onClick={openCamera}
+                  style={S.igPickActionBtn}
+                >
+                  Take Photo or Video
+                </button>
+                <button
+                  type="button"
+                  onClick={openPicker}
+                  style={S.igPickActionBtnSecondary}
+                >
+                  Choose from Library
+                </button>
+              </div>
               {/* Limits notice — keeps users from wondering why a huge
                   video silently fails to upload. Only the 40MB file
                   size is actually enforced (server + client); duration
@@ -7614,7 +7657,7 @@ function ExposurePostSheet({ handle, deviceId, onClose, onPosted }: {
               <div style={S.igPickPromptHintSmall}>
                 Videos: max 40MB
               </div>
-            </button>
+            </div>
           )}
         </>
       )}
@@ -13099,26 +13142,22 @@ function AboutView({ onBack }: { onBack: () => void }) {
         </p>
 
         <div style={S.aboutDonateBlock}>
-          <div style={S.aboutDonateHeader}>Please consider donating</div>
+          <div style={S.aboutDonateHeader}>Part of the Sinister world</div>
           <p style={S.aboutDonatePara}>
-            The Dread Directory was built by one person and is offered completely free —
-            no ads, no paywalls, no subscriptions. Every site, every story, every feature
-            is here because I love this stuff and wanted to put it in your pocket.
+            The Dread Directory is free and ad-free. Come find the rest:
           </p>
-          <p style={S.aboutDonatePara}>
-            If the app brings you a moment of dread, a fun night out, or a story you didn't
-            know was buried in your own neighborhood, a small donation helps keep the
-            servers running, the map updated, and new locations rolling in. Every dollar
-            goes back into the app.
-          </p>
-          <a
-            href="https://www.paypal.com/donate/?hosted_button_id=S2MWGSUQNR5YS"
-            target="_blank"
-            rel="noopener noreferrer"
-            style={S.aboutDonateBtn}
+          <button
+            style={{ ...S.aboutLinkBtn, border: `2px solid ${WHITE}`, color: WHITE }}
+            onClick={() => { playForward(); window.open(INSTAGRAM_URL, '_blank', 'noopener,noreferrer'); }}
           >
-            Donate via PayPal
-          </a>
+            📷 Follow on Instagram
+          </button>
+          <button
+            style={{ ...S.aboutLinkBtn, border: `2px solid ${WHITE}`, color: WHITE, marginTop: 12 }}
+            onClick={() => { playForward(); window.open(YOUTUBE_URL, '_blank', 'noopener,noreferrer'); }}
+          >
+            ▶️ Subscribe on YouTube
+          </button>
         </div>
 
         <p style={S.aboutPara}>
@@ -13245,21 +13284,6 @@ function AboutView({ onBack }: { onBack: () => void }) {
         <p style={S.aboutPara}>
           Part of the Sinister family — alongside Sinister Trivia and the Sinister Vids YouTube channel.
         </p>
-
-        <div style={{ marginTop: 24 }}>
-          <button
-            style={{ ...S.aboutLinkBtn, border: `2px solid ${WHITE}`, color: WHITE }}
-            onClick={() => { playForward(); window.open(INSTAGRAM_URL, '_blank', 'noopener,noreferrer'); }}
-          >
-            📷 Follow on Instagram
-          </button>
-          <button
-            style={{ ...S.aboutLinkBtn, border: `2px solid ${WHITE}`, color: WHITE, marginTop: 12 }}
-            onClick={() => { playForward(); window.open(YOUTUBE_URL, '_blank', 'noopener,noreferrer'); }}
-          >
-            ▶️ Subscribe on YouTube
-          </button>
-        </div>
       </div>
     </div>
   );
@@ -19064,6 +19088,37 @@ const S: Record<string, React.CSSProperties> = {
     color: '#666',
     marginTop: 8,
     fontStyle: 'italic' as const,
+  },
+  // Primary action button in the empty pick state — "Take Photo or
+  // Video". Red accent to match the app's horror palette and read as
+  // the primary CTA.
+  igPickActionBtn: {
+    width: '100%',
+    backgroundColor: '#FF3B5C',
+    color: '#FFF',
+    border: 'none',
+    borderRadius: 12,
+    padding: '14px 18px',
+    fontSize: 15,
+    fontWeight: 700,
+    cursor: 'pointer',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    WebkitTapHighlightColor: 'transparent' as any,
+  },
+  // Secondary action — "Choose from Library". Outlined / muted so it
+  // reads below the camera CTA.
+  igPickActionBtnSecondary: {
+    width: '100%',
+    backgroundColor: 'transparent',
+    color: '#F0EBE0',
+    border: '1px solid rgba(255,255,255,0.25)',
+    borderRadius: 12,
+    padding: '14px 18px',
+    fontSize: 15,
+    fontWeight: 600,
+    cursor: 'pointer',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    WebkitTapHighlightColor: 'transparent' as any,
   },
   igPickPreviewWrap: {
     flex: 1,
