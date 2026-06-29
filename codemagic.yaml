@@ -526,8 +526,6 @@ workflows:
               ('android.permission.WAKE_LOCK', None),
               ('android.permission.CAMERA', None),
               ('android.permission.RECORD_AUDIO', None),
-              ('android.permission.READ_MEDIA_IMAGES', None),
-              ('android.permission.READ_MEDIA_VIDEO', None),
               ('android.permission.READ_EXTERNAL_STORAGE', '32'),  # maxSdkVersion 32
               ('android.permission.WRITE_EXTERNAL_STORAGE', '28'), # maxSdkVersion 28
               ('android.permission.INTERNET', None),
@@ -879,8 +877,6 @@ workflows:
               ('android.permission.WAKE_LOCK', None),
               ('android.permission.CAMERA', None),
               ('android.permission.RECORD_AUDIO', None),
-              ('android.permission.READ_MEDIA_IMAGES', None),
-              ('android.permission.READ_MEDIA_VIDEO', None),
               ('android.permission.READ_EXTERNAL_STORAGE', '32'),
               ('android.permission.WRITE_EXTERNAL_STORAGE', '28'),
               ('android.permission.INTERNET', None),
