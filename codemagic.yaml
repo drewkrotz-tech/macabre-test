@@ -374,7 +374,7 @@ workflows:
           LATEST_BUILD_NUMBER=$(app-store-connect get-latest-build-number "$APP_STORE_APP_ID" || echo "1")
           NEXT_BUILD=$((LATEST_BUILD_NUMBER + 1))
           if [ "$NEXT_BUILD" -lt 41 ]; then NEXT_BUILD=41; fi
-          agvtool new-marketing-version 1.10 && agvtool new-version -all "$NEXT_BUILD"
+          agvtool new-marketing-version 1.11 && agvtool new-version -all "$NEXT_BUILD"
       - name: Build signed .ipa for App Store
         script: |
           cd ios/App
@@ -959,7 +959,7 @@ workflows:
       - name: Set version code and version name
         script: |
           set -e
-          # Match the iOS marketing version (1.10). Version code increments
+          # Match the iOS marketing version (1.11). Version code increments
           # from a floor of 41 to stay above any earlier internal builds,
           # using the Codemagic build number as the source of truth.
           VERSION_CODE=$(($BUILD_NUMBER + 40))
@@ -972,7 +972,7 @@ workflows:
           with open(path, "r") as f:
               s = f.read()
           s = re.sub(r'versionCode\s+\d+', f'versionCode {version_code}', s)
-          s = re.sub(r'versionName\s+"[^"]*"', 'versionName "1.10"', s)
+          s = re.sub(r'versionName\s+"[^"]*"', 'versionName "1.11"', s)
           with open(path, "w") as f:
               f.write(s)
           print("--- versionCode/versionName patched ---")
