@@ -13311,7 +13311,7 @@ function AboutView({ onBack }: { onBack: () => void }) {
 // shipping to production, generate a long-term token (up to 365 days) at
 // developer.apple.com → Maps → Tokens, with a domain restriction set to
 // sinistertrivia.com.
-const MAPKIT_JS_TOKEN = 'eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IkdYTFVDNUJKNlMifQ.eyJpc3MiOiI4SzZUOTc3N1I5IiwiaWF0IjoxNzc4NDI1Mzc5LCJleHAiOjE3OTM5NzczNzksIm9yaWdpbiI6IioiLCJtYXBJZCI6Im1hcHMuY29tLnNpbmlzdGVydHJpdmlhLmxvY2F0aW9ucyJ9.vasaEZU_W43UpH3sgfyTv2_Ed-UM9CXYS10GkPY9_IL6HZ7yMvTODRproN3cbIjFxJPLLf0ZgwvZtZ933C8F9A';
+const MAPKIT_JS_TOKEN = 'eyJhbGciOiJFUzI1NiIsImtpZCI6IjhZWFFZNDU5ODgiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiI4SzZUOTc3N1I5IiwiaWF0IjoxNzk0NDQxOTM0LCJleHAiOjE5NTIxMjE2MDAsInNjb3BlIjoibWFwa2l0X2pzIn0.gb8zw566u0O28vFgryCx8m7pvwXvH7UQbfhbyLLVDqlzpMft9o5-aiJ9Kc081XTP0WMkG8eF48aHU0nf9ZfLjw'; // Key 8YXQY45988, expires 2031-11-11
 // Radius selector for NearbyView. The map view used to be locked at 20mi
 // but as the catalog grew and the home cells started routing here per-
 // category, users in less-dense areas needed a way to widen the search.
@@ -13875,6 +13875,12 @@ function NearbyView({ sites, currentLocation, onSelectSite, onBack, categoryFilt
     const lat = site.coords.lat;
     const lng = site.coords.lng;
     const label = encodeURIComponent(site.title);
+    // iOS: open Apple Maps directly (iOS doesn't handle geo: links, which
+    // is why this used to fall through to Google Maps).
+    if (isIOS()) {
+      try { window.location.href = `https://maps.apple.com/?daddr=${lat},${lng}&q=${label}&dirflg=d`; } catch { /* silent */ }
+      return;
+    }
     const geoUrl = `geo:${lat},${lng}?q=${lat},${lng}(${label})`;
     const webUrl = `https://www.google.com/maps/dir/?api=1&destination=${lat},${lng}`;
     try { window.location.href = geoUrl; } catch { /* fall through */ }
@@ -14568,6 +14574,12 @@ function DetailView({ site, currentLocation, handle, deviceId, alreadyVisited, o
     const lat = site.coords.lat;
     const lng = site.coords.lng;
     const label = encodeURIComponent(site.title);
+    // iOS: open Apple Maps directly (iOS doesn't handle geo: links, which
+    // is why this used to fall through to Google Maps).
+    if (isIOS()) {
+      try { window.location.href = `https://maps.apple.com/?daddr=${lat},${lng}&q=${label}&dirflg=d`; } catch { /* silent */ }
+      return;
+    }
     const geoUrl = `geo:${lat},${lng}?q=${lat},${lng}(${label})`;
     const webUrl = `https://www.google.com/maps/dir/?api=1&destination=${lat},${lng}`;
 
